@@ -53,6 +53,7 @@ impl Cli {
             respect_gitignore: self.respect_gitignore,
             hidden: self.hidden,
             excludes: self.exclude.clone(),
+            ignore_files: Vec::new(),
         }
     }
 

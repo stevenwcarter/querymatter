@@ -23,6 +23,9 @@ pub struct WalkOpts {
     /// Glob patterns (matched against both the absolute path and the path
     /// relative to `root`); any match excludes the file from the result.
     pub excludes: Vec<String>,
+    /// Gitignore-style ignore files to apply (earliest first), always honored
+    /// regardless of `respect_gitignore`. Resolved by `Cli::ignore_files`.
+    pub ignore_files: Vec<PathBuf>,
 }
 
 impl Default for WalkOpts {
@@ -32,6 +35,7 @@ impl Default for WalkOpts {
             respect_gitignore: false,
             hidden: false,
             excludes: Vec::new(),
+            ignore_files: Vec::new(),
         }
     }
 }
@@ -68,6 +72,15 @@ pub fn discover(root: &Path, opts: &WalkOpts) -> Vec<PathBuf> {
         .parents(opts.respect_gitignore)
         .hidden(!opts.hidden)
         .require_git(false);
+
+    for ignore_path in &opts.ignore_files {
+        // add_ignore applies a gitignore-style file as an explicit source,
+        // honored even with standard_filters(false)/ignore(false) (verified).
+        // Paths are pre-validated at the CLI boundary, so a load error here is
+        // not expected; ignore the returned Option<Error> rather than aborting
+        // discovery of everything else.
+        walker.add_ignore(ignore_path);
+    }
 
     let mut found: Vec<PathBuf> = walker
         .build()
@@ -206,5 +219,90 @@ mod tests {
             .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
             .collect();
         assert_eq!(names, vec!["keep.md"]);
+    }
+
+    #[test]
+    fn ignore_file_excludes_matches() {
+        let td = TempDir::new().unwrap();
+        touch(td.path(), ".querymatterignore", "drafts/\n");
+        touch(td.path(), "keep.md", "x");
+        touch(td.path(), "drafts/d.md", "x");
+        let opts = WalkOpts {
+            ignore_files: vec![td.path().join(".querymatterignore")],
+            ..Default::default()
+        };
+        let names: Vec<_> = discover(td.path(), &opts)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, vec!["keep.md"]); // drafts/d.md excluded
+    }
+
+    #[test]
+    fn ignore_file_negation_reincludes() {
+        let td = TempDir::new().unwrap();
+        touch(td.path(), ".qmi", "*.draft.md\n!keep.draft.md\n");
+        touch(td.path(), "a.draft.md", "x");
+        touch(td.path(), "keep.draft.md", "x");
+        touch(td.path(), "b.md", "x");
+        let opts = WalkOpts {
+            ignore_files: vec![td.path().join(".qmi")],
+            ..Default::default()
+        };
+        let names: Vec<_> = discover(td.path(), &opts)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, vec!["b.md", "keep.draft.md"]); // a.draft.md excluded, keep re-included
+    }
+
+    #[test]
+    fn ignore_file_applies_even_when_gitignore_off() {
+        // Load-bearing: always-on. respect_gitignore is false (default), yet the
+        // ignore file still excludes — this is what makes it NOT just .gitignore.
+        let td = TempDir::new().unwrap();
+        touch(td.path(), ".qmi", "secret.md\n");
+        touch(td.path(), "secret.md", "x");
+        touch(td.path(), "public.md", "x");
+        let opts = WalkOpts {
+            ignore_files: vec![td.path().join(".qmi")],
+            respect_gitignore: false,
+            ..Default::default()
+        };
+        let names: Vec<_> = discover(td.path(), &opts)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, vec!["public.md"]);
+    }
+
+    #[test]
+    fn ignore_file_nonanchored_pattern_matches_at_depth() {
+        // Characterization: a non-anchored gitignore pattern matches at ANY depth.
+        let td = TempDir::new().unwrap();
+        touch(td.path(), ".qmi", "templates/\n");
+        touch(td.path(), "a.md", "x");
+        touch(td.path(), "sub/templates/t.md", "x");
+        let opts = WalkOpts {
+            ignore_files: vec![td.path().join(".qmi")],
+            ..Default::default()
+        };
+        let names: Vec<_> = discover(td.path(), &opts)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, vec!["a.md"]); // sub/templates/t.md excluded at depth
+    }
+
+    #[test]
+    fn empty_ignore_file_is_noop() {
+        let td = TempDir::new().unwrap();
+        touch(td.path(), ".qmi", "# only a comment\n\n");
+        touch(td.path(), "a.md", "x");
+        let opts = WalkOpts {
+            ignore_files: vec![td.path().join(".qmi")],
+            ..Default::default()
+        };
+        assert_eq!(discover(td.path(), &opts).len(), 1);
     }
 }
