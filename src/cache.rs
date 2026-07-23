@@ -771,7 +771,10 @@ mod tests {
 
         let (refreshed, report, _changed) =
             refresh_against_cache(td.path(), &cached, &WalkOpts::default(), Freshness::PerFile);
-        assert_eq!(cached_status(&refreshed, "a.md"), Value::Str("final".into()));
+        assert_eq!(
+            cached_status(&refreshed, "a.md"),
+            Value::Str("final".into())
+        );
         assert_eq!(report.loaded, 1);
     }
 
@@ -835,7 +838,10 @@ mod tests {
 
         let (refreshed, _report, _changed) =
             refresh_against_cache(td.path(), &cached, &WalkOpts::default(), Freshness::Fast);
-        assert_eq!(cached_status(&refreshed, "a.md"), Value::Str("final".into()));
+        assert_eq!(
+            cached_status(&refreshed, "a.md"),
+            Value::Str("final".into())
+        );
     }
 
     #[test]
