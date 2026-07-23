@@ -1,0 +1,8 @@
+---
+source: src/render.rs
+expression: "render(&t, Output::Vertical, TableStyle::Ascii)"
+---
+*************************** 1. row ***************************
+       id: 1
+file.path: notes/a.md
+        s: draft
