@@ -226,6 +226,90 @@ fn querymatterignore_in_cwd_excludes_matches() {
 }
 
 #[test]
+fn init_creates_manifest() {
+    let td = tree();
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .arg("init")
+        .arg(td.path())
+        .assert()
+        .success();
+    assert!(
+        td.path().join(".querymatter/manifest.bin").is_file(),
+        "init must create <dir>/.querymatter/manifest.bin"
+    );
+}
+
+#[test]
+fn query_from_inside_vault_returns_rows() {
+    let td = tree();
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .arg("init")
+        .arg(td.path())
+        .assert()
+        .success();
+
+    // No positional dirs: the run auto-discovers the ancestor vault (cwd is
+    // the vault) and queries the whole cache.
+    let out = Command::cargo_bin("querymatter")
+        .unwrap()
+        .current_dir(td.path())
+        .args(["-e", "SELECT count(*) AS n", "--format", "csv"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    assert_eq!(s.lines().last().unwrap().trim(), "3", "got: {s:?}");
+}
+
+#[test]
+fn no_cache_live_scans_even_inside_a_vault() {
+    let td = tree();
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .arg("init")
+        .arg(td.path())
+        .assert()
+        .success();
+
+    // `--no-cache` bypasses vault discovery: it live-scans the positional dir.
+    let out = Command::cargo_bin("querymatter")
+        .unwrap()
+        .current_dir(td.path())
+        .args([
+            "-e",
+            "SELECT count(*) AS n",
+            "--format",
+            "csv",
+            "--no-cache",
+            ".",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    assert_eq!(s.lines().last().unwrap().trim(), "3", "got: {s:?}");
+}
+
+#[test]
+fn force_cache_without_a_vault_exits_nonzero() {
+    let td = tree();
+    // No `init`, so no vault exists anywhere above `td`.
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .current_dir(td.path())
+        .args(["-e", "SELECT count(*) AS n", "--force-cache"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("force-cache"));
+}
+
+#[test]
 fn missing_ignore_file_flag_exits_nonzero() {
     let td = TempDir::new().unwrap();
     fs::write(td.path().join("a.md"), "---\nstatus: draft\n---\n").unwrap();

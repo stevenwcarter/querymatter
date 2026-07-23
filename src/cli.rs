@@ -1,6 +1,13 @@
 //! The `querymatter` command-line interface: argument parsing plus the
 //! translation from raw flags into a canonical set of scan roots and the
 //! [`WalkOpts`] that drive discovery.
+//!
+//! The surface is an optional subcommand ([`Command`]) layered over the
+//! existing query args: with no subcommand the flags on [`Cli`] drive a query
+//! run; `querymatter init` builds a `.querymatter` cache instead. The six
+//! walk-controlling flags live on a single [`WalkFlags`] struct
+//! `#[command(flatten)]`ed into both, so query mode and `init` share one
+//! definition rather than duplicating it.
 
 use std::env;
 use std::fs;
@@ -8,27 +15,22 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::Context;
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use globset::Glob;
 
+use crate::cache::Freshness;
 use crate::discover::WalkOpts;
 use crate::render::Format;
 
-/// Query Markdown YAML frontmatter with a SQL subset.
-#[derive(Debug, Parser)]
-#[command(name = "querymatter", version, about)]
-pub struct Cli {
-    /// Directories to scan recursively. Empty means the current directory.
-    pub dirs: Vec<PathBuf>,
-
-    /// Run a single query and exit; `-` reads the query text from stdin.
-    #[arg(short = 'e', long = "query")]
-    pub query: Option<String>,
-
-    /// Output format for results.
-    #[arg(long, default_value = "table")]
-    pub format: Format,
-
+/// The six flags that shape a directory walk, shared verbatim between query
+/// mode and `querymatter init` via `#[command(flatten)]`.
+///
+/// Grouping them here keeps [`walk_opts`](WalkFlags::walk_opts),
+/// [`validate_excludes`](WalkFlags::validate_excludes), and
+/// [`ignore_files`](WalkFlags::ignore_files) — which only ever read these six
+/// fields — off [`Cli`], so `init` reuses the exact same discovery semantics.
+#[derive(Debug, Args)]
+pub struct WalkFlags {
     /// File extensions (without the leading dot) to include.
     #[arg(long, value_delimiter = ',', default_value = "md,markdown")]
     pub ext: Vec<String>,
@@ -56,8 +58,9 @@ pub struct Cli {
     pub no_ignore_file: bool,
 }
 
-impl Cli {
-    /// Builds the [`WalkOpts`] described by these flags.
+impl WalkFlags {
+    /// Builds the [`WalkOpts`] described by these flags (with an empty
+    /// `ignore_files`; the caller fills it from [`Self::ignore_files`]).
     pub fn walk_opts(&self) -> WalkOpts {
         WalkOpts {
             exts: self.ext.clone(),
@@ -68,6 +71,110 @@ impl Cli {
         }
     }
 
+    /// Rejects any `--exclude` glob that `globset` cannot compile, naming the
+    /// bad pattern, so invalid input surfaces up front instead of being
+    /// silently ignored deeper in discovery.
+    pub fn validate_excludes(&self) -> anyhow::Result<()> {
+        for pat in &self.exclude {
+            Glob::new(pat).with_context(|| format!("invalid --exclude glob {pat:?}"))?;
+        }
+        Ok(())
+    }
+
+    /// Ordered list of gitignore-style ignore files to apply, earliest first:
+    /// the cwd `.querymatterignore` (unless `--no-ignore-file`) followed by each
+    /// `--ignore-file` in order. This is the single seam the `.querymatter`
+    /// vault extends (prepending the vault-parent file).
+    pub fn ignore_files(&self) -> anyhow::Result<Vec<PathBuf>> {
+        let cwd = env::current_dir().context("failed to determine the current directory")?;
+        self.resolve_ignore_files(&cwd)
+    }
+
+    fn resolve_ignore_files(&self, cwd: &Path) -> anyhow::Result<Vec<PathBuf>> {
+        let mut files = Vec::new();
+        if !self.no_ignore_file {
+            let candidate = cwd.join(".querymatterignore");
+            if candidate.is_file() {
+                files.push(candidate);
+            }
+        }
+        for f in &self.ignore_file {
+            anyhow::ensure!(f.is_file(), "cannot read --ignore-file {}", f.display());
+            files.push(f.clone());
+        }
+        Ok(files)
+    }
+}
+
+/// Query Markdown YAML frontmatter with a SQL subset.
+#[derive(Debug, Parser)]
+#[command(name = "querymatter", version, about)]
+pub struct Cli {
+    /// Directories to scan recursively. Empty means the current directory.
+    pub dirs: Vec<PathBuf>,
+
+    /// Run a single query and exit; `-` reads the query text from stdin.
+    #[arg(short = 'e', long = "query")]
+    pub query: Option<String>,
+
+    /// Output format for results.
+    #[arg(long, default_value = "table")]
+    pub format: Format,
+
+    /// Flags shared with `querymatter init` that shape the directory walk.
+    #[command(flatten)]
+    pub walk: WalkFlags,
+
+    /// Ignore any `.querymatter` cache and always live-scan (today's behavior).
+    #[arg(long)]
+    pub no_cache: bool,
+
+    /// Trust the `.querymatter` cache verbatim with no filesystem access;
+    /// errors when no cache is found.
+    #[arg(long)]
+    pub force_cache: bool,
+
+    /// Use the dir-mtime + TTL hybrid freshness check instead of per-file.
+    #[arg(long)]
+    pub fast: bool,
+
+    /// Force a re-scan of PATH's subtree before querying; repeatable.
+    #[arg(long, value_name = "PATH")]
+    pub refresh: Vec<PathBuf>,
+
+    /// Force a re-scan of the whole vault before querying.
+    #[arg(long)]
+    pub refresh_all: bool,
+
+    /// Subcommand to run instead of a query; `None` means query mode.
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+/// The `querymatter` subcommands. Absent (`Cli::command == None`) means query
+/// mode, driven by the query flags directly on [`Cli`].
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Build a `.querymatter` cache over a directory tree for faster queries.
+    Init(InitArgs),
+}
+
+/// Arguments for `querymatter init [DIR]`.
+#[derive(Debug, Args)]
+pub struct InitArgs {
+    /// Directory to build the cache under; defaults to the current directory.
+    pub dir: Option<PathBuf>,
+
+    /// TTL, in seconds, stored in the cache and consulted only by `--fast`.
+    #[arg(long, default_value_t = 300)]
+    pub ttl: u64,
+
+    /// Walk flags shared with query mode.
+    #[command(flatten)]
+    pub walk: WalkFlags,
+}
+
+impl Cli {
     /// Resolves the scan roots: the positional `dirs`, or the current
     /// directory when none were given.
     ///
@@ -99,46 +206,56 @@ impl Cli {
         Ok(roots)
     }
 
-    /// Rejects any `--exclude` glob that `globset` cannot compile, naming the
-    /// bad pattern, so invalid input surfaces up front instead of being
-    /// silently ignored deeper in discovery.
-    pub fn validate_excludes(&self) -> anyhow::Result<()> {
-        for pat in &self.exclude {
-            Glob::new(pat).with_context(|| format!("invalid --exclude glob {pat:?}"))?;
+    /// Maps the freshness flags to a [`Freshness`] mode: `--force-cache` wins,
+    /// then `--fast`, otherwise the accurate per-file default. Mutually
+    /// exclusive combinations are rejected by [`Self::validate`] before this is
+    /// consulted, so the precedence here only picks among individually valid
+    /// inputs.
+    pub fn freshness(&self) -> Freshness {
+        if self.force_cache {
+            Freshness::ForceCache
+        } else if self.fast {
+            Freshness::Fast
+        } else {
+            Freshness::PerFile
         }
+    }
+
+    /// Rejects contradictory combinations of the cache flags, with a clear
+    /// message naming the offending pair. Called in `main` before any cache
+    /// work so a bad combination fails fast with a non-zero exit rather than
+    /// silently picking one interpretation.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let wants_refresh = self.refresh_all || !self.refresh.is_empty();
+        anyhow::ensure!(
+            !(self.force_cache && wants_refresh),
+            "--force-cache cannot be combined with --refresh/--refresh-all: \
+             force-cache never touches the filesystem, so there is nothing to refresh"
+        );
+        anyhow::ensure!(
+            !(self.no_cache && self.force_cache),
+            "--no-cache cannot be combined with --force-cache"
+        );
+        anyhow::ensure!(
+            !(self.no_cache && wants_refresh),
+            "--no-cache cannot be combined with --refresh/--refresh-all: \
+             a refresh needs a cache, which --no-cache disables"
+        );
+        anyhow::ensure!(
+            !(self.force_cache && self.fast),
+            "--force-cache cannot be combined with --fast"
+        );
         Ok(())
-    }
-
-    /// Ordered list of gitignore-style ignore files to apply, earliest first:
-    /// the cwd `.querymatterignore` (unless `--no-ignore-file`) followed by each
-    /// `--ignore-file` in order. This is the single seam a future `.querymatter`
-    /// vault extends (prepending the vault-parent file).
-    pub fn ignore_files(&self) -> anyhow::Result<Vec<PathBuf>> {
-        let cwd = env::current_dir().context("failed to determine the current directory")?;
-        self.resolve_ignore_files(&cwd)
-    }
-
-    fn resolve_ignore_files(&self, cwd: &Path) -> anyhow::Result<Vec<PathBuf>> {
-        let mut files = Vec::new();
-        if !self.no_ignore_file {
-            let candidate = cwd.join(".querymatterignore");
-            if candidate.is_file() {
-                files.push(candidate);
-            }
-        }
-        for f in &self.ignore_file {
-            anyhow::ensure!(f.is_file(), "cannot read --ignore-file {}", f.display());
-            files.push(f.clone());
-        }
-        Ok(files)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Cli;
+    use super::{Cli, Command};
+    use crate::cache::Freshness;
     use clap::Parser;
     use std::fs;
+    use std::path::Path;
     use tempfile::tempdir;
 
     #[test]
@@ -158,7 +275,7 @@ mod tests {
         fs::write(td.path().join(".querymatterignore"), "x\n").unwrap();
         let cli = Cli::parse_from(["querymatter"]);
         assert_eq!(
-            cli.resolve_ignore_files(td.path()).unwrap(),
+            cli.walk.resolve_ignore_files(td.path()).unwrap(),
             vec![td.path().join(".querymatterignore")]
         );
     }
@@ -168,7 +285,7 @@ mod tests {
         let td = tempdir().unwrap();
         fs::write(td.path().join(".querymatterignore"), "x\n").unwrap();
         let cli = Cli::parse_from(["querymatter", "--no-ignore-file"]);
-        assert!(cli.resolve_ignore_files(td.path()).unwrap().is_empty());
+        assert!(cli.walk.resolve_ignore_files(td.path()).unwrap().is_empty());
     }
 
     #[test]
@@ -186,7 +303,10 @@ mod tests {
             "--ignore-file",
             b.to_str().unwrap(),
         ]);
-        assert_eq!(cli.resolve_ignore_files(td.path()).unwrap(), vec![a, b]);
+        assert_eq!(
+            cli.walk.resolve_ignore_files(td.path()).unwrap(),
+            vec![a, b]
+        );
     }
 
     #[test]
@@ -197,7 +317,7 @@ mod tests {
         fs::write(&extra, "y\n").unwrap();
         let cli = Cli::parse_from(["querymatter", "--ignore-file", extra.to_str().unwrap()]);
         assert_eq!(
-            cli.resolve_ignore_files(td.path()).unwrap(),
+            cli.walk.resolve_ignore_files(td.path()).unwrap(),
             vec![td.path().join(".querymatterignore"), extra]
         );
     }
@@ -207,13 +327,129 @@ mod tests {
         let td = tempdir().unwrap();
         let missing = td.path().join("nope.ignore");
         let cli = Cli::parse_from(["querymatter", "--ignore-file", missing.to_str().unwrap()]);
-        assert!(cli.resolve_ignore_files(td.path()).is_err());
+        assert!(cli.walk.resolve_ignore_files(td.path()).is_err());
     }
 
     #[test]
     fn absent_cwd_file_is_not_error() {
         let td = tempdir().unwrap(); // no .querymatterignore
         let cli = Cli::parse_from(["querymatter"]);
-        assert!(cli.resolve_ignore_files(td.path()).unwrap().is_empty());
+        assert!(cli.walk.resolve_ignore_files(td.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn freshness_force_cache_wins_over_fast() {
+        // `--force-cache` and `--fast` are individually valid; `freshness()`
+        // is the pure mapping (validation of the conflict lives in `validate`).
+        let cli = Cli::parse_from(["querymatter", "--force-cache", "--fast"]);
+        assert_eq!(cli.freshness(), Freshness::ForceCache);
+    }
+
+    #[test]
+    fn freshness_fast_when_only_fast() {
+        let cli = Cli::parse_from(["querymatter", "--fast"]);
+        assert_eq!(cli.freshness(), Freshness::Fast);
+    }
+
+    #[test]
+    fn freshness_defaults_to_per_file() {
+        let cli = Cli::parse_from(["querymatter"]);
+        assert_eq!(cli.freshness(), Freshness::PerFile);
+    }
+
+    #[test]
+    fn force_cache_conflicts_with_refresh() {
+        let cli = Cli::parse_from(["querymatter", "--force-cache", "--refresh", "sub"]);
+        assert!(cli.validate().is_err());
+    }
+
+    #[test]
+    fn force_cache_conflicts_with_refresh_all() {
+        let cli = Cli::parse_from(["querymatter", "--force-cache", "--refresh-all"]);
+        assert!(cli.validate().is_err());
+    }
+
+    #[test]
+    fn no_cache_conflicts_with_force_cache() {
+        let cli = Cli::parse_from(["querymatter", "--no-cache", "--force-cache"]);
+        assert!(cli.validate().is_err());
+    }
+
+    #[test]
+    fn no_cache_conflicts_with_refresh() {
+        let cli = Cli::parse_from(["querymatter", "--no-cache", "--refresh", "sub"]);
+        assert!(cli.validate().is_err());
+    }
+
+    #[test]
+    fn no_cache_conflicts_with_refresh_all() {
+        let cli = Cli::parse_from(["querymatter", "--no-cache", "--refresh-all"]);
+        assert!(cli.validate().is_err());
+    }
+
+    #[test]
+    fn force_cache_conflicts_with_fast() {
+        let cli = Cli::parse_from(["querymatter", "--force-cache", "--fast"]);
+        assert!(cli.validate().is_err());
+    }
+
+    #[test]
+    fn compatible_flags_pass_validation() {
+        assert!(Cli::parse_from(["querymatter"]).validate().is_ok());
+        assert!(
+            Cli::parse_from(["querymatter", "--fast"])
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            Cli::parse_from(["querymatter", "--refresh", "a", "--refresh", "b"])
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            Cli::parse_from(["querymatter", "--no-cache"])
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn init_subcommand_parses_dir_and_ttl() {
+        let cli = Cli::parse_from(["querymatter", "init", "somedir", "--ttl", "42"]);
+        match cli.command {
+            Some(Command::Init(args)) => {
+                assert_eq!(args.dir.as_deref(), Some(Path::new("somedir")));
+                assert_eq!(args.ttl, 42);
+            }
+            other => panic!("expected an Init subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn init_ttl_defaults_to_300() {
+        let cli = Cli::parse_from(["querymatter", "init"]);
+        match cli.command {
+            Some(Command::Init(args)) => assert_eq!(args.ttl, 300),
+            other => panic!("expected an Init subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn walk_flags_still_parse_identically_after_flatten() {
+        // `flatten` is transparent on the command line: the six walk flags
+        // parse exactly as before, now landing on the nested `walk` struct.
+        let cli = Cli::parse_from([
+            "querymatter",
+            "--hidden",
+            "--respect-gitignore",
+            "--ext",
+            "md,txt",
+            "--exclude",
+            "**/x/**",
+        ]);
+        assert!(cli.walk.hidden);
+        assert!(cli.walk.respect_gitignore);
+        assert_eq!(cli.walk.ext, vec!["md".to_string(), "txt".to_string()]);
+        assert_eq!(cli.walk.exclude, vec!["**/x/**".to_string()]);
     }
 }

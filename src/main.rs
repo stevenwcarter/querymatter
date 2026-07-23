@@ -1,4 +1,6 @@
-//! `querymatter` entry point: parse the CLI, load the record store, and
+//! `querymatter` entry point: parse the CLI, then either build a
+//! `.querymatter` cache (`init`) or run a query — loading the record store
+//! from an ancestor cache when one is found, or live-scanning otherwise — and
 //! dispatch to one-shot, batch, or interactive mode.
 //!
 //! Output discipline: **stdout carries query results only.** Every
@@ -16,23 +18,99 @@ mod repl;
 mod session;
 pub mod store;
 
+use std::env;
+use std::fs;
 use std::io::{self, IsTerminal, Read};
 
 use anyhow::Context;
 use clap::Parser;
 
-use crate::cli::Cli;
+use crate::cli::{Cli, Command, InitArgs};
 use crate::session::{Session, split_statements};
 use crate::store::InMemoryStore;
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    cli.validate_excludes()?;
-    let roots = cli.resolved_roots()?;
-    let mut walk_opts = cli.walk_opts();
-    walk_opts.ignore_files = cli.ignore_files()?;
+    match &cli.command {
+        Some(Command::Init(args)) => run_init(args),
+        None => run_query(&cli),
+    }
+}
 
-    let (store, report) = InMemoryStore::load(roots, walk_opts);
+/// Builds a `.querymatter` cache under the requested directory (or the cwd),
+/// honoring the shared walk flags, and prints a one-line summary to stderr.
+///
+/// All summary output goes to stderr; `init` produces no stdout so it composes
+/// cleanly in scripts.
+fn run_init(args: &InitArgs) -> anyhow::Result<()> {
+    args.walk.validate_excludes()?;
+
+    let cwd = env::current_dir().context("failed to determine the current directory")?;
+    let target = args.dir.clone().unwrap_or(cwd);
+    let base = fs::canonicalize(&target)
+        .with_context(|| format!("cannot access directory {}", target.display()))?;
+
+    let mut opts = args.walk.walk_opts();
+    opts.ignore_files = args.walk.ignore_files()?;
+
+    let report = cache::build_vault(&base, &opts, args.ttl)?;
+
+    // TODO(Task 7): when `init` runs inside a git working tree and stdin is a
+    // TTY, offer to add `.querymatter/` to the repo's top-level `.gitignore`
+    // (design spec §7). Left as a marked call site; not implemented here.
+
+    eprintln!(
+        "querymatter: cached {} file(s) under {} ({} skipped)",
+        report.loaded,
+        base.display(),
+        report.skipped
+    );
+    Ok(())
+}
+
+/// Runs a query: loads the store from an ancestor `.querymatter` cache when one
+/// is found (unless `--no-cache`), or live-scans the resolved roots otherwise,
+/// then dispatches to one-shot, batch, or interactive mode.
+fn run_query(cli: &Cli) -> anyhow::Result<()> {
+    cli.validate()?;
+    cli.walk.validate_excludes()?;
+
+    let mut opts = cli.walk.walk_opts();
+    opts.ignore_files = cli.walk.ignore_files()?;
+
+    let cwd = env::current_dir().context("failed to determine the current directory")?;
+    let vault = if cli.no_cache {
+        None
+    } else {
+        cache::find_vault(&cwd)
+    };
+
+    let (store, report) = match vault {
+        Some(vault) => {
+            let (mut store, mut report) = InMemoryStore::from_cache(&vault, opts, cli.freshness());
+            // A forced refresh runs against the just-loaded cache; only its
+            // warnings need surfacing (the counts are informational and the
+            // store already reflects the refreshed records).
+            if cli.refresh_all {
+                report.warnings.extend(store.refresh(&vault, None).warnings);
+            } else {
+                for path in &cli.refresh {
+                    report
+                        .warnings
+                        .extend(store.refresh(&vault, Some(path)).warnings);
+                }
+            }
+            (store, report)
+        }
+        None => {
+            anyhow::ensure!(
+                !cli.force_cache,
+                "--force-cache: no .querymatter cache found (run `querymatter init` first)"
+            );
+            InMemoryStore::load(cli.resolved_roots()?, opts)
+        }
+    };
+
     for warning in &report.warnings {
         eprintln!("querymatter: {warning}");
     }
