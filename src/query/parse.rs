@@ -1,16 +1,23 @@
 //! Lowering from a SQL string to the querymatter [`Query`] AST.
 //!
-//! Parsing is a two-step pipeline. First, an optional **quoted** `FROM` glob
-//! (`FROM 'plans/**'`) is extracted with a regex and stripped, because it is
-//! not valid SQL for `sqlparser` to consume. The remainder is then handed to
-//! `sqlparser` under the [`GenericDialect`], and the resulting parse tree is
-//! lowered node-by-node into the [`Query`] AST. A **bare** `FROM plans` is left
-//! for `sqlparser` and read back from the table name.
+//! Parsing is **parse-first, regex-fallback**. The original SQL is handed to
+//! `sqlparser` (under the [`GenericDialect`]) untouched, and the resulting
+//! parse tree is lowered node-by-node into the [`Query`] AST. `FROM` is
+//! optional: sqlparser accepts both a bare identifier (`FROM plans`) and a
+//! quoted glob (`FROM 'plans/**'`, parsed as a quoted-identifier table), and
+//! either form is read back from the table name.
+//!
+//! Handing the raw SQL to sqlparser first is deliberate: a regex pre-strip of
+//! `FROM '<glob>'` would corrupt string literals that merely *contain* the
+//! word `from` followed by a quote (e.g. `WHERE title = 'imported from "x"'`).
+//! The [`FROM_GLOB`] regex is used only as a fallback, when the initial parse
+//! fails and stripping the first quoted `FROM` lets the remainder parse.
 //!
 //! Anything outside the supported subset — joins, subqueries, `HAVING`,
-//! whole-query `DISTINCT`, set operations, multiple statements, or any node
-//! kind the lowering does not translate — is rejected with a [`ParseError`]
-//! rather than silently ignored.
+//! whole-query `DISTINCT`, set operations, multiple statements, any clause that
+//! sqlparser parses but querymatter does not translate, or any node kind the
+//! lowering does not understand — is rejected with a [`ParseError`] rather than
+//! silently ignored.
 
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -41,63 +48,71 @@ pub enum ParseError {
 }
 
 /// Matches an optional quoted `FROM` glob. Group 1 is the whole quoted token;
-/// groups 2 and 3 are the single- and double-quoted inner contents. Only the
-/// quoted-glob form is matched here; a bare-identifier `FROM` is left for
-/// `sqlparser`.
+/// groups 2 and 3 are the single- and double-quoted inner contents.
 static FROM_GLOB: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"(?i)\bfrom\s+('([^']*)'|"([^"]*)")"#).expect("valid FROM regex"));
 
 /// Parses `sql` into a [`Query`], rejecting anything outside the supported
 /// subset with a descriptive [`ParseError`].
+///
+/// The original SQL is parsed first, untouched, so string literals are never
+/// corrupted. Only if that parse fails do we fall back to stripping the first
+/// quoted `FROM '<glob>'` and re-parsing the remainder — this recovers any
+/// quoted-glob form a future dialect might reject at the table position,
+/// without ever running the regex over SQL that already parses.
 pub fn parse(sql: &str) -> Result<Query, ParseError> {
-    let (rest, quoted_glob) = extract_quoted_from(sql);
+    match Parser::parse_sql(&GenericDialect, sql) {
+        Ok(statements) => lower_parsed(&statements, None),
+        Err(first_err) => {
+            if let Some((rest, glob)) = strip_first_quoted_from(sql)
+                && let Ok(statements) = Parser::parse_sql(&GenericDialect, &rest)
+            {
+                return lower_parsed(&statements, Some(glob));
+            }
+            Err(ParseError::Sql(first_err.to_string()))
+        }
+    }
+}
 
-    let statements =
-        Parser::parse_sql(&GenericDialect, &rest).map_err(|e| ParseError::Sql(e.to_string()))?;
-
-    let [statement] = statements.as_slice() else {
-        return Err(ParseError::Unsupported(
-            "expected exactly one SQL statement".to_string(),
-        ));
+/// Validates that `statements` is exactly one `SELECT` query and lowers it.
+///
+/// `quoted_glob`, when `Some`, is a glob recovered by the regex fallback and
+/// takes precedence over any table name in the parsed `FROM`.
+fn lower_parsed(
+    statements: &[sql::Statement],
+    quoted_glob: Option<String>,
+) -> Result<Query, ParseError> {
+    let [statement] = statements else {
+        return Err(unsupported("expected exactly one SQL statement"));
     };
     let sql::Statement::Query(query) = statement else {
-        return Err(ParseError::Unsupported(
-            "only SELECT queries are supported".to_string(),
-        ));
+        return Err(unsupported("only SELECT queries are supported"));
     };
-
     lower_query(query, quoted_glob)
 }
 
-/// Splits off an optional quoted `FROM '<glob>'` clause, returning the SQL with
-/// that clause replaced by a space and the captured glob (if any).
-fn extract_quoted_from(sql: &str) -> (String, Option<String>) {
-    let Some(caps) = FROM_GLOB.captures(sql) else {
-        return (sql.to_string(), None);
-    };
-    let glob = caps
-        .get(2)
-        .or_else(|| caps.get(3))
-        .map(|m| m.as_str().to_string());
-    let whole = caps.get(0).expect("group 0 always present");
+/// Strips the first quoted `FROM '<glob>'` clause, returning the remaining SQL
+/// (with that clause replaced by a space) and the captured glob. Returns `None`
+/// when no quoted `FROM` is present. The first match is the real `FROM`, since
+/// `FROM` precedes `WHERE`.
+fn strip_first_quoted_from(sql: &str) -> Option<(String, String)> {
+    let caps = FROM_GLOB.captures(sql)?;
+    let glob = caps.get(2).or_else(|| caps.get(3))?.as_str().to_string();
+    let whole = caps.get(0)?;
     let mut rest = String::with_capacity(sql.len());
     rest.push_str(&sql[..whole.start()]);
     rest.push(' ');
     rest.push_str(&sql[whole.end()..]);
-    (rest, glob)
+    Some((rest, glob))
 }
 
 /// Lowers a `sqlparser` query into the querymatter [`Query`] AST.
 ///
-/// `quoted_glob` is the glob captured by [`extract_quoted_from`]; when present
-/// it takes precedence over any table name in the parsed `FROM`.
+/// `quoted_glob` is the glob recovered by [`strip_first_quoted_from`] in the
+/// fallback path; when present it takes precedence over any table name in the
+/// parsed `FROM`.
 fn lower_query(query: &sql::Query, quoted_glob: Option<String>) -> Result<Query, ParseError> {
-    if query.with.is_some() {
-        return Err(unsupported("WITH / common table expressions"));
-    }
-    if !query.locks.is_empty() {
-        return Err(unsupported("FOR UPDATE / FOR SHARE locking clauses"));
-    }
+    reject_unsupported_query_clauses(query)?;
 
     let select = match query.body.as_ref() {
         sql::SetExpr::Select(select) => select.as_ref(),
@@ -107,12 +122,7 @@ fn lower_query(query: &sql::Query, quoted_glob: Option<String>) -> Result<Query,
         other => return Err(unsupported(format!("query body: {other:?}"))),
     };
 
-    if select.distinct.is_some() {
-        return Err(unsupported("DISTINCT on the whole SELECT"));
-    }
-    if select.having.is_some() {
-        return Err(unsupported("HAVING clause"));
-    }
+    reject_unsupported_select_clauses(select)?;
 
     let from_glob = match quoted_glob {
         Some(glob) => Some(glob),
@@ -145,7 +155,62 @@ fn lower_query(query: &sql::Query, quoted_glob: Option<String>) -> Result<Query,
     })
 }
 
-/// Resolves a parsed `FROM` clause (bare identifier form only) to a glob.
+/// Rejects `Query`-level clauses that sqlparser parses but querymatter does not
+/// translate, so none can be silently discarded.
+fn reject_unsupported_query_clauses(query: &sql::Query) -> Result<(), ParseError> {
+    let clauses = [
+        ("WITH / common table expressions", query.with.is_some()),
+        ("FETCH clause", query.fetch.is_some()),
+        (
+            "FOR UPDATE / FOR SHARE locking clause",
+            !query.locks.is_empty(),
+        ),
+        ("FOR XML / FOR JSON clause", query.for_clause.is_some()),
+        ("SETTINGS clause", query.settings.is_some()),
+        ("FORMAT clause", query.format_clause.is_some()),
+        ("pipe operators (|>)", !query.pipe_operators.is_empty()),
+    ];
+    reject_first(&clauses)
+}
+
+/// Rejects `Select`-level clauses that sqlparser parses but querymatter does
+/// not translate. sqlparser 0.62 populates these fields unconditionally, so
+/// each must be inspected explicitly or it would be parsed and dropped.
+fn reject_unsupported_select_clauses(select: &sql::Select) -> Result<(), ParseError> {
+    let clauses = [
+        ("DISTINCT on the whole SELECT", select.distinct.is_some()),
+        ("HAVING clause", select.having.is_some()),
+        ("SELECT INTO", select.into.is_some()),
+        ("PREWHERE clause", select.prewhere.is_some()),
+        ("QUALIFY clause", select.qualify.is_some()),
+        ("TOP clause", select.top.is_some()),
+        (
+            "named window (WINDOW) clause",
+            !select.named_window.is_empty(),
+        ),
+        ("CLUSTER BY clause", !select.cluster_by.is_empty()),
+        ("DISTRIBUTE BY clause", !select.distribute_by.is_empty()),
+        ("SORT BY clause", !select.sort_by.is_empty()),
+        (
+            "CONNECT BY / START WITH clause",
+            !select.connect_by.is_empty(),
+        ),
+        ("LATERAL VIEW clause", !select.lateral_views.is_empty()),
+    ];
+    reject_first(&clauses)
+}
+
+/// Returns [`ParseError::Unsupported`] for the first `(name, present)` pair whose
+/// `present` flag is set.
+fn reject_first(clauses: &[(&str, bool)]) -> Result<(), ParseError> {
+    match clauses.iter().find(|&&(_, present)| present) {
+        Some(&(name, _)) => Err(unsupported(name)),
+        None => Ok(()),
+    }
+}
+
+/// Resolves a parsed `FROM` clause (bare identifier or quoted-identifier glob)
+/// to a glob string.
 fn lower_from(from: &[sql::TableWithJoins]) -> Result<Option<String>, ParseError> {
     match from {
         [] => Ok(None),
@@ -598,9 +663,59 @@ mod tests {
     }
     #[test]
     fn in_like_isnull() {
-        assert!(parse("SELECT jira WHERE status IN ('a','b')").is_ok());
-        assert!(parse("SELECT jira WHERE slice LIKE 'mobile%'").is_ok());
-        assert!(parse("SELECT jira WHERE epic IS NOT NULL").is_ok());
+        // IN and NOT IN carry the column, the literal list, and the negation flag.
+        assert_eq!(
+            parse("SELECT jira WHERE status IN ('a','b')")
+                .unwrap()
+                .filter,
+            Some(Predicate::In(
+                ColRef::Field("status".into()),
+                vec![Literal::Str("a".into()), Literal::Str("b".into())],
+                false
+            ))
+        );
+        assert_eq!(
+            parse("SELECT jira WHERE status NOT IN ('a','b')")
+                .unwrap()
+                .filter,
+            Some(Predicate::In(
+                ColRef::Field("status".into()),
+                vec![Literal::Str("a".into()), Literal::Str("b".into())],
+                true
+            ))
+        );
+
+        // LIKE and NOT LIKE carry the pattern and the negation flag.
+        assert_eq!(
+            parse("SELECT jira WHERE slice LIKE 'mobile%'")
+                .unwrap()
+                .filter,
+            Some(Predicate::Like(
+                ColRef::Field("slice".into()),
+                "mobile%".into(),
+                false
+            ))
+        );
+        assert_eq!(
+            parse("SELECT jira WHERE slice NOT LIKE 'mobile%'")
+                .unwrap()
+                .filter,
+            Some(Predicate::Like(
+                ColRef::Field("slice".into()),
+                "mobile%".into(),
+                true
+            ))
+        );
+
+        // IS NULL / IS NOT NULL carry the negation flag.
+        assert_eq!(
+            parse("SELECT jira WHERE epic IS NULL").unwrap().filter,
+            Some(Predicate::IsNull(ColRef::Field("epic".into()), false))
+        );
+        assert_eq!(
+            parse("SELECT jira WHERE epic IS NOT NULL").unwrap().filter,
+            Some(Predicate::IsNull(ColRef::Field("epic".into()), true))
+        );
     }
     #[test]
     fn order_and_limit() {
@@ -635,12 +750,33 @@ mod tests {
     }
     #[test]
     fn aggregates_all_kinds() {
-        assert!(
-            parse(
-                "SELECT min(prd), max(prd), sum(prd), avg(prd), group_concat(jira), count(distinct status) GROUP BY epic"
-            )
-            .is_ok()
+        let q = parse(
+            "SELECT min(prd), max(prd), sum(prd), avg(prd), group_concat(jira), count(distinct status) GROUP BY epic",
+        )
+        .unwrap();
+        let prd = ColRef::Field("prd".into());
+        assert_eq!(
+            q.select[0].expr,
+            SelectExpr::Agg(Aggregate::Min(prd.clone()))
         );
+        assert_eq!(
+            q.select[1].expr,
+            SelectExpr::Agg(Aggregate::Max(prd.clone()))
+        );
+        assert_eq!(
+            q.select[2].expr,
+            SelectExpr::Agg(Aggregate::Sum(prd.clone()))
+        );
+        assert_eq!(q.select[3].expr, SelectExpr::Agg(Aggregate::Avg(prd)));
+        assert_eq!(
+            q.select[4].expr,
+            SelectExpr::Agg(Aggregate::GroupConcat(ColRef::Field("jira".into())))
+        );
+        assert_eq!(
+            q.select[5].expr,
+            SelectExpr::Agg(Aggregate::Count(ColRef::Field("status".into()), true))
+        );
+        assert_eq!(q.group_by, vec![ColRef::Field("epic".into())]);
     }
     #[test]
     fn unsupported_join_errors() {
@@ -652,5 +788,121 @@ mod tests {
     #[test]
     fn garbage_errors() {
         assert!(parse("SELCT nonsense").is_err());
+    }
+
+    #[test]
+    fn header_derivation() {
+        let header = |sql: &str| parse(sql).unwrap().select[0].header();
+        assert_eq!(header("SELECT status AS S"), "S"); // alias wins
+        assert_eq!(header("SELECT status"), "status"); // field name
+        assert_eq!(header("SELECT file.folder"), "file.folder"); // file pseudo-column
+        assert_eq!(header("SELECT *"), "*"); // star
+        assert_eq!(header("SELECT count(*)"), "count(*)"); // aggregate
+        assert_eq!(
+            header("SELECT count(distinct status)"),
+            "count(distinct status)"
+        );
+    }
+
+    #[test]
+    fn where_literal_with_from_lookalike_is_not_corrupted() {
+        // Parse-first must not let the FROM-glob regex mangle a string literal
+        // that merely contains `from "..."`.
+        let q = parse("SELECT jira WHERE title = 'imported from \"archive\"'").unwrap();
+        assert_eq!(q.from_glob, None);
+        assert_eq!(
+            q.filter,
+            Some(Predicate::Compare(
+                ColRef::Field("title".into()),
+                CmpOp::Eq,
+                Literal::Str("imported from \"archive\"".into())
+            ))
+        );
+    }
+
+    #[test]
+    fn strip_first_quoted_from_captures_first_match() {
+        // The regex fallback strips the first quoted FROM (which precedes WHERE)
+        // and captures its glob, single- or double-quoted.
+        let (rest, glob) = strip_first_quoted_from("SELECT jira FROM 'plans/**' WHERE x = 'y'")
+            .expect("quoted FROM present");
+        assert_eq!(glob, "plans/**");
+        assert!(!rest.contains("plans/**"));
+        assert!(rest.contains("WHERE x = 'y'"));
+
+        let (_, glob) =
+            strip_first_quoted_from("select a from \"docs/*\"").expect("quoted FROM present");
+        assert_eq!(glob, "docs/*");
+
+        assert!(strip_first_quoted_from("SELECT jira FROM plans").is_none());
+    }
+
+    #[test]
+    fn rejects_having() {
+        assert!(matches!(
+            parse("SELECT status GROUP BY status HAVING count(*) > 1"),
+            Err(ParseError::Unsupported(_))
+        ));
+    }
+    #[test]
+    fn rejects_whole_query_distinct() {
+        assert!(matches!(
+            parse("SELECT DISTINCT jira"),
+            Err(ParseError::Unsupported(_))
+        ));
+    }
+    #[test]
+    fn rejects_set_operation() {
+        assert!(matches!(
+            parse("SELECT a UNION SELECT b"),
+            Err(ParseError::Unsupported(_))
+        ));
+    }
+    #[test]
+    fn rejects_derived_table_from() {
+        assert!(matches!(
+            parse("SELECT x FROM (SELECT 1)"),
+            Err(ParseError::Unsupported(_))
+        ));
+    }
+    #[test]
+    fn rejects_multiple_statements() {
+        assert!(matches!(
+            parse("SELECT a; SELECT b"),
+            Err(ParseError::Unsupported(_))
+        ));
+    }
+
+    // Clauses that GenericDialect *parses* but querymatter does not translate
+    // must surface as Unsupported rather than being silently dropped.
+    #[test]
+    fn rejects_sort_by() {
+        assert!(matches!(
+            parse("SELECT jira SORT BY prd"),
+            Err(ParseError::Unsupported(_))
+        ));
+    }
+    #[test]
+    fn rejects_cluster_by() {
+        assert!(matches!(
+            parse("SELECT jira CLUSTER BY prd"),
+            Err(ParseError::Unsupported(_))
+        ));
+    }
+    #[test]
+    fn rejects_distribute_by() {
+        assert!(matches!(
+            parse("SELECT jira DISTRIBUTE BY prd"),
+            Err(ParseError::Unsupported(_))
+        ));
+    }
+
+    // PREWHERE and QUALIFY are not accepted by GenericDialect at all, so they
+    // are rejected earlier as a syntax error; the defensive guards for those
+    // fields remain for a future dialect that would populate them.
+    #[test]
+    fn prewhere_and_qualify_are_rejected() {
+        assert!(parse("SELECT jira PREWHERE status = 'x'").is_err());
+        assert!(parse("SELECT jira QUALIFY prd = 1").is_err());
     }
 }
