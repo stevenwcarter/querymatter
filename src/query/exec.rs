@@ -1,11 +1,11 @@
-//! The query executor: filter / project / order / limit.
+//! The query executor: filter / project / order / limit, plus `GROUP BY` and
+//! aggregate functions.
 //!
 //! [`execute`] evaluates a parsed [`Query`] against a set of [`Record`]s and
-//! produces a [`ResultTable`]. This module implements the **non-grouped**
-//! path only — queries with no `GROUP BY` and no aggregate `SELECT` items.
-//! Queries that need grouping or aggregation are rejected with
-//! [`ExecError::NotYetSupported`] until Task 8 fills in that branch; see
-//! [`is_grouped_or_aggregate`] for the dispatch check.
+//! produces a [`ResultTable`]. It dispatches between two pipelines: the
+//! **non-grouped** path (no `GROUP BY`, no aggregate `SELECT` items) and the
+//! **grouped/aggregate** path (a `GROUP BY` clause and/or an aggregate
+//! `SELECT` item); see [`is_grouped_or_aggregate`] for the dispatch check.
 
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
@@ -16,16 +16,17 @@ use regex::Regex;
 use crate::model::{FileAttr, Record, Value, compare_values};
 use crate::query::ResultTable;
 use crate::query::ast::{
-    CmpOp, ColRef, Literal, OrderKey, OrderTarget, Predicate, Query, SelectExpr,
+    Aggregate, CmpOp, ColRef, Literal, OrderKey, OrderTarget, Predicate, Query, SelectExpr,
+    SelectItem,
 };
 
 /// An error that can occur while executing a parsed [`Query`].
 #[derive(Debug, thiserror::Error)]
 pub enum ExecError {
-    /// The query has a `GROUP BY` clause or an aggregate `SELECT` item;
-    /// executing those is Task 8's job.
-    #[error("GROUP BY and aggregate queries are not supported yet")]
-    NotYetSupported,
+    /// A non-aggregate `SELECT` item referenced a column that isn't in
+    /// `GROUP BY`, e.g. `SELECT status, prd, count(*) GROUP BY status`.
+    #[error("column `{0}` must appear in GROUP BY or be an aggregate")]
+    NonGroupedColumn(String),
     /// The `FROM '<glob>'` pattern failed to compile.
     #[error("invalid FROM glob `{glob}`: {source}")]
     InvalidGlob {
@@ -41,14 +42,14 @@ pub enum ExecError {
 /// Executes `q` against `records`, returning the projected, filtered,
 /// ordered, and limited result.
 ///
-/// This dispatches on whether `q` is grouped/aggregate (Task 8) or not (this
-/// task); see [`is_grouped_or_aggregate`].
+/// Dispatches on whether `q` is grouped/aggregate; see
+/// [`is_grouped_or_aggregate`].
 pub fn execute<'a>(
     q: &Query,
     records: impl Iterator<Item = &'a Record>,
 ) -> Result<ResultTable, ExecError> {
     if is_grouped_or_aggregate(q) {
-        return Err(ExecError::NotYetSupported);
+        return execute_grouped(q, records);
     }
     execute_ungrouped(q, records)
 }
@@ -62,21 +63,29 @@ fn is_grouped_or_aggregate(q: &Query) -> bool {
             .any(|item| matches!(item.expr, SelectExpr::Agg(_)))
 }
 
-/// The filter / project / order / limit pipeline for a non-grouped query.
-fn execute_ungrouped<'a>(
+/// Applies the `FROM` glob and `WHERE` predicate — the filtering step shared
+/// by both the non-grouped and grouped/aggregate pipelines.
+fn filter_records<'a>(
     q: &Query,
     records: impl Iterator<Item = &'a Record>,
-) -> Result<ResultTable, ExecError> {
+) -> Result<Vec<&'a Record>, ExecError> {
     let candidates = filter_by_glob(records.collect(), q.from_glob.as_deref())?;
-    let filtered: Vec<&Record> = candidates
+    Ok(candidates
         .into_iter()
         .filter(|record| match &q.filter {
             Some(pred) => eval_predicate(record, pred),
             None => true,
         })
-        .collect();
+        .collect())
+}
 
-    let columns = expand_select(q, &filtered)?;
+/// The filter / project / order / limit pipeline for a non-grouped query.
+fn execute_ungrouped<'a>(
+    q: &Query,
+    records: impl Iterator<Item = &'a Record>,
+) -> Result<ResultTable, ExecError> {
+    let filtered = filter_records(q, records)?;
+    let columns = expand_select(q, &filtered);
     let headers: Vec<String> = columns.iter().map(|(header, _)| header.clone()).collect();
     let mut rows: Vec<(&Record, Vec<Value>)> = filtered
         .into_iter()
@@ -113,6 +122,263 @@ fn execute_ungrouped<'a>(
     Ok(ResultTable { headers, rows })
 }
 
+/// The filter / group / aggregate / order / limit pipeline for a query with
+/// a `GROUP BY` clause and/or aggregate `SELECT` items.
+///
+/// With aggregates but no `GROUP BY`, every filtered row is treated as one
+/// group (see [`group_rows`]). Group order is made deterministic by sorting
+/// on the key tuple before `ORDER BY` is applied, so results are stable even
+/// when the query has no explicit ordering.
+fn execute_grouped<'a>(
+    q: &Query,
+    records: impl Iterator<Item = &'a Record>,
+) -> Result<ResultTable, ExecError> {
+    let filtered = filter_records(q, records)?;
+
+    let items = validate_grouped_select(q)?;
+    let headers: Vec<String> = q.select.iter().map(|item| item.header()).collect();
+
+    let mut groups = group_rows(&filtered, &q.group_by);
+    groups.sort_by(|a, b| compare_key_tuple(&a.key, &b.key));
+
+    let mut rows: Vec<(Vec<Value>, Vec<Value>)> = groups
+        .into_iter()
+        .map(|group| {
+            let row = project_group(&group, &items);
+            (group.key, row)
+        })
+        .collect();
+
+    let order = resolve_group_order_targets(&q.order_by, &headers, &q.group_by)?;
+    rows.sort_by(|(ka, rowa), (kb, rowb)| {
+        order
+            .iter()
+            .map(|(target, desc)| {
+                let va = group_order_key_value(target, ka, rowa);
+                let vb = group_order_key_value(target, kb, rowb);
+                order_cmp(&va, &vb, *desc)
+            })
+            .find(|ord| *ord != Ordering::Equal)
+            .unwrap_or(Ordering::Equal)
+    });
+
+    let offset = q.offset.unwrap_or(0);
+    let rows: Vec<Vec<Value>> = rows
+        .into_iter()
+        .map(|(_, row)| row)
+        .skip(offset)
+        .take(q.limit.unwrap_or(usize::MAX))
+        .collect();
+
+    Ok(ResultTable { headers, rows })
+}
+
+/// A validated grouped `SELECT` item: SQL only allows projecting a grouping
+/// key or an aggregate once `GROUP BY` (or a bare aggregate) is in play.
+enum GroupedSelectItem {
+    /// Index into `group_by` (and thus into a group's key tuple).
+    Key(usize),
+    /// An aggregate to compute over the group's rows.
+    Agg(Aggregate),
+}
+
+/// Validates `q.select` for the grouped path: every non-aggregate item must
+/// be a `ColRef` that also appears in `q.group_by`; anything else — a column
+/// outside the grouping keys, or `*` — is rejected, since neither reduces to
+/// a single value per group.
+fn validate_grouped_select(q: &Query) -> Result<Vec<GroupedSelectItem>, ExecError> {
+    q.select
+        .iter()
+        .map(|item| match &item.expr {
+            SelectExpr::Agg(agg) => Ok(GroupedSelectItem::Agg(agg.clone())),
+            SelectExpr::Col(col) => q
+                .group_by
+                .iter()
+                .position(|key| key == col)
+                .map(GroupedSelectItem::Key)
+                .ok_or_else(|| ExecError::NonGroupedColumn(item.header())),
+            SelectExpr::Star => Err(ExecError::NonGroupedColumn(item.header())),
+        })
+        .collect()
+}
+
+/// One `GROUP BY` bucket: its key tuple (the `group_by` columns' shared
+/// values) plus every record that produced that key.
+struct Group<'a> {
+    key: Vec<Value>,
+    rows: Vec<&'a Record>,
+}
+
+/// Buckets `records` by the tuple of `group_by` column values, in
+/// first-appearance order (the caller sorts for determinism afterward).
+///
+/// An empty `group_by` means "aggregate over everything": every record —
+/// including none at all — falls into the single group keyed by `[]`, so a
+/// bare `count(*)` still returns one row for an empty input, matching SQL.
+fn group_rows<'a>(records: &[&'a Record], group_by: &[ColRef]) -> Vec<Group<'a>> {
+    if group_by.is_empty() {
+        return vec![Group {
+            key: Vec::new(),
+            rows: records.to_vec(),
+        }];
+    }
+    let mut groups: Vec<Group<'a>> = Vec::new();
+    for &record in records {
+        let key: Vec<Value> = group_by
+            .iter()
+            .map(|col| resolve_col(record, col))
+            .collect();
+        match groups.iter_mut().find(|group| group.key == key) {
+            Some(group) => group.rows.push(record),
+            None => groups.push(Group {
+                key,
+                rows: vec![record],
+            }),
+        }
+    }
+    groups
+}
+
+/// Orders two group-key tuples element-wise via [`order_cmp`] (always
+/// ascending, `NULL` last), used only to make group order deterministic
+/// before an explicit `ORDER BY` is applied.
+fn compare_key_tuple(a: &[Value], b: &[Value]) -> Ordering {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| order_cmp(x, y, false))
+        .find(|ord| *ord != Ordering::Equal)
+        .unwrap_or(Ordering::Equal)
+}
+
+/// Projects one group's row: a grouping key becomes its key-tuple value, an
+/// aggregate is computed over the group's records.
+fn project_group(group: &Group<'_>, items: &[GroupedSelectItem]) -> Vec<Value> {
+    items
+        .iter()
+        .map(|item| match item {
+            GroupedSelectItem::Key(idx) => group.key[*idx].clone(),
+            GroupedSelectItem::Agg(agg) => compute_aggregate(agg, &group.rows),
+        })
+        .collect()
+}
+
+/// Computes one aggregate function's value over a group's rows.
+fn compute_aggregate(agg: &Aggregate, rows: &[&Record]) -> Value {
+    match agg {
+        Aggregate::CountStar => Value::Int(rows.len() as i64),
+        Aggregate::Count(col, false) => Value::Int(non_null_values(rows, col).count() as i64),
+        Aggregate::Count(col, true) => {
+            let distinct: BTreeSet<String> = non_null_values(rows, col)
+                .map(|v| v.to_cmp_string())
+                .collect();
+            Value::Int(distinct.len() as i64)
+        }
+        Aggregate::Sum(col) => Value::Float(numeric_values(rows, col).sum()),
+        Aggregate::Avg(col) => {
+            let nums: Vec<f64> = numeric_values(rows, col).collect();
+            if nums.is_empty() {
+                Value::Null
+            } else {
+                Value::Float(nums.iter().sum::<f64>() / nums.len() as f64)
+            }
+        }
+        Aggregate::Min(col) => extreme_value(rows, col, Ordering::Less),
+        Aggregate::Max(col) => extreme_value(rows, col, Ordering::Greater),
+        Aggregate::GroupConcat(col) => Value::Str(
+            non_null_values(rows, col)
+                .map(|v| v.display())
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+    }
+}
+
+/// The non-null values of `col` across `rows`, in row order.
+fn non_null_values<'a>(rows: &'a [&Record], col: &'a ColRef) -> impl Iterator<Item = Value> + 'a {
+    rows.iter()
+        .map(move |record| resolve_col(record, col))
+        .filter(|v| !v.is_null())
+}
+
+/// The numeric-coercible values of `col` across `rows`; `NULL` and
+/// non-numeric values are both skipped (mirroring `Value::as_number`, which
+/// already returns `None` for both).
+fn numeric_values<'a>(rows: &'a [&Record], col: &'a ColRef) -> impl Iterator<Item = f64> + 'a {
+    rows.iter()
+        .filter_map(move |record| resolve_col(record, col).as_number())
+}
+
+/// `MIN`/`MAX` over `col`'s non-null values via [`compare_values`], `Null`
+/// when there are none. `want` is the ordering that means "this value
+/// replaces the running extreme" (`Less` for `MIN`, `Greater` for `MAX`).
+fn extreme_value(rows: &[&Record], col: &ColRef, want: Ordering) -> Value {
+    non_null_values(rows, col).fold(Value::Null, |acc, v| match compare_values(&v, &acc) {
+        Some(ord) if ord == want => v,
+        Some(_) => acc,
+        // `acc` is still `Null` (no extreme picked yet): take `v`.
+        None => v,
+    })
+}
+
+/// An `ORDER BY` target for the grouped path, resolved once against the
+/// projection and the `GROUP BY` keys.
+enum ResolvedGroupOrderTarget {
+    /// An index into the projected row (a `SELECT ... AS alias` match, same
+    /// alias rule as the non-grouped path).
+    Row(usize),
+    /// An index into the group key tuple (a bare `ORDER BY` column, which is
+    /// only meaningful when it's one of the `GROUP BY` keys).
+    GroupKey(usize),
+}
+
+/// Resolves each `ORDER BY` key's target for the grouped path: an explicit
+/// alias resolves against `headers`, exactly like the non-grouped path; a
+/// bare column must be one of `group_by`'s keys — referencing anything else
+/// is as invalid as selecting it, so it's rejected the same way.
+fn resolve_group_order_targets(
+    order_by: &[OrderKey],
+    headers: &[String],
+    group_by: &[ColRef],
+) -> Result<Vec<(ResolvedGroupOrderTarget, bool)>, ExecError> {
+    order_by
+        .iter()
+        .map(|key| {
+            let target = match &key.target {
+                OrderTarget::Alias(name) => headers
+                    .iter()
+                    .position(|h| h == name)
+                    .map(ResolvedGroupOrderTarget::Row)
+                    .ok_or_else(|| ExecError::UnknownAlias(name.clone()))?,
+                OrderTarget::Col(col) => group_by
+                    .iter()
+                    .position(|g| g == col)
+                    .map(ResolvedGroupOrderTarget::GroupKey)
+                    .ok_or_else(|| ExecError::NonGroupedColumn(col_header(col)))?,
+            };
+            Ok((target, key.desc))
+        })
+        .collect()
+}
+
+/// Renders a bare `ColRef` the way it would appear as a default `SELECT`
+/// header, for a `NonGroupedColumn` message about an `ORDER BY` column.
+fn col_header(col: &ColRef) -> String {
+    SelectItem {
+        expr: SelectExpr::Col(col.clone()),
+        alias: None,
+    }
+    .header()
+}
+
+/// Reads the sort key's value for one grouped row, given its key tuple and
+/// already-projected row.
+fn group_order_key_value(target: &ResolvedGroupOrderTarget, key: &[Value], row: &[Value]) -> Value {
+    match target {
+        ResolvedGroupOrderTarget::Row(idx) => row[*idx].clone(),
+        ResolvedGroupOrderTarget::GroupKey(idx) => key[*idx].clone(),
+    }
+}
+
 /// Keeps only the records whose `file.path` matches `glob`, if given.
 fn filter_by_glob<'a>(
     records: Vec<&'a Record>,
@@ -138,7 +404,7 @@ fn filter_by_glob<'a>(
 ///
 /// Aggregate select items cannot appear here: [`execute`] routes queries
 /// containing one to the grouped path before this function runs.
-fn expand_select(q: &Query, filtered: &[&Record]) -> Result<Vec<(String, ColRef)>, ExecError> {
+fn expand_select(q: &Query, filtered: &[&Record]) -> Vec<(String, ColRef)> {
     let mut columns = Vec::with_capacity(q.select.len());
     for item in &q.select {
         match &item.expr {
@@ -148,10 +414,12 @@ fn expand_select(q: &Query, filtered: &[&Record]) -> Result<Vec<(String, ColRef)
                 }
             }
             SelectExpr::Col(col) => columns.push((item.header(), col.clone())),
-            SelectExpr::Agg(_) => return Err(ExecError::NotYetSupported),
+            SelectExpr::Agg(_) => {
+                unreachable!("execute() routes aggregate SELECT items to execute_grouped")
+            }
         }
     }
-    Ok(columns)
+    columns
 }
 
 /// The sorted union of every field name across `records`.
@@ -378,5 +646,90 @@ mod tests {
         assert_eq!(execute(&q, recs().iter()).unwrap().rows.len(), 2);
         let q2 = parse("SELECT status WHERE prd IN ('011')").unwrap();
         assert_eq!(execute(&q2, recs().iter()).unwrap().rows.len(), 1);
+    }
+    #[test]
+    fn null_field_sorts_last_asc_and_desc() {
+        // One record is missing `status` entirely, so ORDER BY status must
+        // resolve it to Value::Null and place it last regardless of
+        // direction (pins order_cmp's null-handling for both the
+        // non-grouped and grouped paths).
+        let with_null = rec("s", "s/plans/d.md", &[("prd", Value::Str("012".into()))]);
+        let mut all = recs();
+        all.push(with_null);
+
+        let asc = parse("SELECT status, file.name ORDER BY status ASC").unwrap();
+        let t_asc = execute(&asc, all.iter()).unwrap();
+        assert_eq!(t_asc.rows.last().unwrap()[0], Value::Null);
+
+        let desc = parse("SELECT status, file.name ORDER BY status DESC").unwrap();
+        let t_desc = execute(&desc, all.iter()).unwrap();
+        assert_eq!(t_desc.rows.last().unwrap()[0], Value::Null);
+    }
+}
+
+#[cfg(test)]
+mod agg_tests {
+    use super::*;
+    use crate::model::{Record, Value};
+    use crate::query::parse::parse;
+    use indexmap::IndexMap;
+    use std::path::Path;
+
+    fn rec(path: &str, status: &str, prd: &str) -> Record {
+        let mut m = IndexMap::new();
+        m.insert("status".into(), Value::Str(status.into()));
+        m.insert("prd".into(), Value::Str(prd.into()));
+        Record::new(Path::new("s"), Path::new(path), m)
+    }
+    fn recs() -> Vec<Record> {
+        vec![
+            rec("s/a.md", "draft", "010"),
+            rec("s/b.md", "synced", "010"),
+            rec("s/c.md", "synced", "011"),
+        ]
+    }
+
+    #[test]
+    fn count_per_status_renamed_ordered() {
+        let q =
+            parse("SELECT status, count(*) AS Count GROUP BY status ORDER BY Count DESC").unwrap();
+        let t = execute(&q, recs().iter()).unwrap();
+        assert_eq!(t.headers, vec!["status", "Count"]);
+        assert_eq!(
+            t.rows,
+            vec![
+                vec![Value::Str("synced".into()), Value::Int(2)],
+                vec![Value::Str("draft".into()), Value::Int(1)],
+            ]
+        );
+    }
+    #[test]
+    fn bare_count_star_single_group() {
+        let q = parse("SELECT count(*) AS n").unwrap();
+        let t = execute(&q, recs().iter()).unwrap();
+        assert_eq!(t.rows, vec![vec![Value::Int(3)]]);
+    }
+    #[test]
+    fn count_distinct() {
+        let q = parse("SELECT count(distinct status) AS d").unwrap();
+        let t = execute(&q, recs().iter()).unwrap();
+        assert_eq!(t.rows, vec![vec![Value::Int(2)]]);
+    }
+    #[test]
+    fn group_concat() {
+        let q = parse("SELECT prd, group_concat(status) AS ss GROUP BY prd ORDER BY prd").unwrap();
+        let t = execute(&q, recs().iter()).unwrap();
+        assert_eq!(
+            t.rows[0],
+            vec![Value::Str("010".into()), Value::Str("draft, synced".into())]
+        );
+    }
+    #[test]
+    fn non_grouped_column_errors() {
+        let q = parse("SELECT status, prd, count(*) GROUP BY status").unwrap();
+        assert!(matches!(
+            execute(&q, recs().iter()),
+            Err(ExecError::NonGroupedColumn(_))
+        ));
     }
 }
