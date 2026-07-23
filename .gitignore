@@ -6,3 +6,4 @@ samples/
 
 # Editor/OS cruft
 *.orig
+.querymatter*
