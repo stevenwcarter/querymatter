@@ -241,6 +241,29 @@ fn init_creates_manifest() {
 }
 
 #[test]
+fn init_in_git_repo_non_tty_succeeds_and_summarizes() {
+    // The git-ignore offer runs after a successful cache build; in a non-TTY
+    // run it prints a hint rather than prompting. Even so, that step must never
+    // fail the command: init succeeds (exit 0), writes the manifest, and still
+    // prints the "cached N file(s)" summary to stderr (FIX 3 — the offer is
+    // best-effort, downgraded to a warning rather than propagated).
+    let td = tree();
+    fs::create_dir_all(td.path().join(".git")).unwrap();
+
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .arg("init")
+        .arg(td.path())
+        // A piped (non-terminal) stdin forces the non-TTY hint branch
+        // deterministically, so the test never blocks on an interactive prompt.
+        .write_stdin("")
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("cached"));
+    assert!(td.path().join(".querymatter/manifest.bin").is_file());
+}
+
+#[test]
 fn query_from_inside_vault_returns_rows() {
     let td = tree();
     Command::cargo_bin("querymatter")
@@ -263,6 +286,47 @@ fn query_from_inside_vault_returns_rows() {
         .clone();
     let s = String::from_utf8(out).unwrap();
     assert_eq!(s.lines().last().unwrap().trim(), "3", "got: {s:?}");
+}
+
+#[test]
+fn positional_dir_restricts_vault_query_to_that_subtree() {
+    // Spec §5: with a vault in use, a positional [DIRS] restricts the query to
+    // records under that subtree. The fixture has plans/a.md {status: draft}
+    // and product/b.md {status: synced}; querying with positional `plans` from
+    // inside the vault must return only the plans record, not product's.
+    let td = TempDir::new().unwrap();
+    for (p, s) in [
+        ("plans/a.md", "---\nstatus: draft\n---\n"),
+        ("product/b.md", "---\nstatus: synced\n---\n"),
+    ] {
+        let f = td.path().join(p);
+        fs::create_dir_all(f.parent().unwrap()).unwrap();
+        fs::write(f, s).unwrap();
+    }
+
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .arg("init")
+        .arg(td.path())
+        .assert()
+        .success();
+
+    let out = Command::cargo_bin("querymatter")
+        .unwrap()
+        .current_dir(td.path())
+        .args(["-e", "SELECT status", "--format", "csv", "plans"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    let statuses: Vec<&str> = s.lines().skip(1).map(str::trim).collect();
+    assert_eq!(
+        statuses,
+        vec!["draft"],
+        "positional `plans` must restrict the vault query to plans/, excluding product/; got: {s:?}"
+    );
 }
 
 #[test]

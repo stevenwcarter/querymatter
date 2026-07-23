@@ -57,7 +57,12 @@ fn run_init(args: &InitArgs) -> anyhow::Result<()> {
 
     let report = cache::build_vault(&base, &opts, args.ttl)?;
 
-    offer_gitignore(&base)?;
+    // The cache build already succeeded; a prompt hiccup (e.g. a stdin read
+    // error) must not fail the command, so the git-ignore offer is
+    // best-effort — downgraded to a warning rather than propagated.
+    if let Err(err) = offer_gitignore(&base) {
+        eprintln!("querymatter: warning: {err:#}");
+    }
 
     eprintln!(
         "querymatter: cached {} file(s) under {} ({} skipped)",
@@ -92,8 +97,8 @@ fn offer_gitignore(base: &Path) -> anyhow::Result<()> {
 /// Prompts on stderr and reads one line of stdin; on an affirmative
 /// `y`/`yes` answer (case-insensitive, trimmed), appends `.querymatter/` to
 /// `root`'s `.gitignore` and confirms on stderr. Any other answer leaves
-/// `.gitignore` untouched; a stdin read failure propagates as an error,
-/// aborting `init`.
+/// `.gitignore` untouched; a stdin read failure propagates as an error, which
+/// [`run_init`] downgrades to a non-fatal warning (the cache is already built).
 fn prompt_add_gitignore(root: &Path) -> anyhow::Result<()> {
     eprint!("Add .querymatter/ to .gitignore? [y/N] ");
     io::stderr()
@@ -142,11 +147,19 @@ fn run_query(cli: &Cli) -> anyhow::Result<()> {
                 report.warnings.extend(store.refresh(&vault, None).warnings);
             } else {
                 for path in &cli.refresh {
-                    let target = resolve_refresh_target(path, &vault)?;
+                    let target = cache::resolve_refresh_target(path, &vault)?;
                     report
                         .warnings
                         .extend(store.refresh(&vault, Some(&target)).warnings);
                 }
+            }
+            // Spec §5: positional `[DIRS]` restrict a vault query to the named
+            // subtrees. The vault is loaded whole above, then narrowed here at
+            // slice granularity. A dir entirely outside the vault matches no
+            // slice (its records are absent) — v1 does not live-scan
+            // outside-vault dirs, a known limitation.
+            if !cli.dirs.is_empty() {
+                store.retain_under(&canonicalize_dirs(&cli.dirs)?);
             }
             (store, report, Some(vault))
         }
@@ -176,26 +189,18 @@ fn run_query(cli: &Cli) -> anyhow::Result<()> {
     }
 }
 
-/// Resolves a `--refresh <PATH>` argument to an absolute path under `vault`.
-///
-/// The user-typed path may be relative — it is canonicalized against the cwd,
-/// mirroring [`Cli::resolved_roots`], and must exist. This is load-bearing:
-/// [`cache::refresh_subtree`] filters the vault's *absolute* discovery results
-/// with `starts_with(subtree)`, so a raw relative path (`plans`, `./plans`)
-/// would prefix-match nothing and silently refresh zero files — running the
-/// query against the stale cache (design spec §10). A target that resolves
-/// outside the vault is rejected: nothing under the loaded cache could be
-/// refreshed by it.
-fn resolve_refresh_target(path: &Path, vault: &Path) -> anyhow::Result<PathBuf> {
-    let canonical = fs::canonicalize(path)
-        .with_context(|| format!("cannot access --refresh path {}", path.display()))?;
-    anyhow::ensure!(
-        canonical.starts_with(vault),
-        "--refresh path {} is outside the vault {}",
-        canonical.display(),
-        vault.display()
-    );
-    Ok(canonical)
+/// Canonicalizes each positional `[DIRS]` entry (resolving symlinks and
+/// absolutizing) so they can restrict a vault query via
+/// [`InMemoryStore::retain_under`]. A missing or inaccessible directory is a
+/// hard error naming the offending path, matching [`Cli::resolved_roots`]'s
+/// live-scan behavior.
+fn canonicalize_dirs(dirs: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
+    dirs.iter()
+        .map(|dir| {
+            fs::canonicalize(dir)
+                .with_context(|| format!("cannot access directory {}", dir.display()))
+        })
+        .collect()
 }
 
 /// Runs every top-level `;`-separated statement in `input`, printing each

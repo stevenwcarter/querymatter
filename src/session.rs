@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
+use crate::cache;
 use crate::query::{self, ResultTable};
 use crate::render::{self, Format};
 use crate::store::{LoadReport, RecordStore};
@@ -72,11 +73,31 @@ impl Session {
     /// session has nothing to persist to, so it falls back to an in-memory
     /// [`reload_all`](RecordStore::reload_all); `subtree` is ignored in that
     /// case, matching `.reload`'s existing whole-store semantics.
+    ///
+    /// A vault-backed `subtree` is resolved through
+    /// [`cache::resolve_refresh_target`] — the SAME canonicalize-and-validate
+    /// the CLI's `--refresh` uses — so a relative REPL path (`.refresh plans`)
+    /// re-parses that subtree instead of silently no-op-ing against the stale
+    /// cache (design spec §10). An unresolvable or outside-vault path is not a
+    /// silent no-op either: the refresh is skipped and the returned report
+    /// carries a warning naming the problem, which the REPL prints to stderr.
     pub fn refresh(&mut self, subtree: Option<&Path>) -> LoadReport {
-        match &self.vault {
-            Some(vault) => self.store.refresh(vault, subtree),
-            None => self.store.reload_all(),
-        }
+        let Some(vault) = &self.vault else {
+            return self.store.reload_all();
+        };
+        let resolved = match subtree {
+            Some(path) => match cache::resolve_refresh_target(path, vault) {
+                Ok(target) => Some(target),
+                Err(err) => {
+                    return LoadReport {
+                        warnings: vec![format!("{err:#}")],
+                        ..LoadReport::default()
+                    };
+                }
+            },
+            None => None,
+        };
+        self.store.refresh(vault, resolved.as_deref())
     }
 
     /// The current schema: the sorted union of frontmatter field names.
@@ -136,6 +157,7 @@ mod tests {
     use crate::model::Value;
     use crate::store::InMemoryStore;
     use std::fs;
+    use std::fs::File;
     use tempfile::TempDir;
 
     #[test]
@@ -224,5 +246,78 @@ mod tests {
             cache::load_cache(td.path()).is_none(),
             "a vault-less session's refresh must never write a .querymatter cache"
         );
+    }
+
+    /// A vault-backed `Session::refresh(Some(subtree))` must canonicalize and
+    /// validate the subtree the same way the CLI's `--refresh` does, then
+    /// force a re-parse of it (spec §10) — not silently no-op against the
+    /// stale cache the way a raw relative path fed straight to
+    /// `store.refresh` would.
+    #[test]
+    fn refresh_subtree_with_vault_reparses_that_subtree() {
+        let td = TempDir::new().unwrap();
+        let vault = fs::canonicalize(td.path()).unwrap();
+        let a = vault.join("plans/a.md");
+        fs::create_dir_all(a.parent().unwrap()).unwrap();
+        fs::write(&a, "---\nstatus: draft\n---\n").unwrap();
+        let original_mtime = fs::metadata(&a).unwrap().modified().unwrap();
+        cache::build_vault(&vault, &WalkOpts::default(), 300).unwrap();
+
+        let (store, _report) =
+            InMemoryStore::from_cache(&vault, WalkOpts::default(), Freshness::PerFile);
+        let mut session = Session::new(Box::new(store), Format::Table, Some(vault.clone()));
+
+        // Equal byte length ("draft" -> "fresh") plus a restored mtime: the
+        // default per-file freshness check would REUSE the stale cached value,
+        // so only a forced subtree re-parse can surface the edit.
+        fs::write(&a, "---\nstatus: fresh\n---\n").unwrap();
+        File::open(&a)
+            .unwrap()
+            .set_modified(original_mtime)
+            .unwrap();
+
+        let report = session.refresh(Some(&vault.join("plans")));
+        assert_eq!(report.skipped, 0);
+        assert!(
+            report.warnings.is_empty(),
+            "warnings: {:?}",
+            report.warnings
+        );
+
+        let table = session.run("SELECT status").unwrap();
+        assert_eq!(
+            table.rows[0][0],
+            Value::Str("fresh".into()),
+            "a vault-backed subtree refresh must force a re-parse, not reuse the stale cache"
+        );
+    }
+
+    /// An unresolvable (or outside-vault) `.refresh <path>` must not silently
+    /// no-op or crash: the refresh is skipped and a warning naming the problem
+    /// is returned for the REPL to print, leaving the store queryable.
+    #[test]
+    fn refresh_subtree_unresolvable_path_warns_and_does_not_crash() {
+        let td = TempDir::new().unwrap();
+        let vault = fs::canonicalize(td.path()).unwrap();
+        fs::write(vault.join("a.md"), "---\nstatus: draft\n---\n").unwrap();
+        cache::build_vault(&vault, &WalkOpts::default(), 300).unwrap();
+
+        let (store, _report) =
+            InMemoryStore::from_cache(&vault, WalkOpts::default(), Freshness::PerFile);
+        let mut session = Session::new(Box::new(store), Format::Table, Some(vault.clone()));
+
+        let report = session.refresh(Some(Path::new("definitely-not-here")));
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("definitely-not-here")),
+            "an unresolvable .refresh path must surface a warning, got: {:?}",
+            report.warnings
+        );
+
+        // The store is untouched and still queryable.
+        let table = session.run("SELECT status").unwrap();
+        assert_eq!(table.rows[0][0], Value::Str("draft".into()));
     }
 }

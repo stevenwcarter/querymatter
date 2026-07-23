@@ -135,6 +135,26 @@ impl InMemoryStore {
         (InMemoryStore { slices, opts }, report)
     }
 
+    /// Restricts the store to the slices whose `root` lies at or under at
+    /// least one path in `dirs`, dropping the rest. Honors positional
+    /// `[DIRS]` on a vault-backed query (design spec §5): the vault is loaded
+    /// whole, then narrowed to the named subtrees at slice (directory)
+    /// granularity.
+    ///
+    /// `dirs` must be absolute/canonical (the caller canonicalizes them). An
+    /// empty `dirs` is a no-op — the whole vault is kept. A `dirs` entry that
+    /// lies entirely outside the vault matches no slice, so its records are
+    /// simply absent: v1 does not live-scan outside-vault directories (a
+    /// known limitation — such a dir contributes nothing rather than being
+    /// scanned fresh).
+    pub fn retain_under(&mut self, dirs: &[PathBuf]) {
+        if dirs.is_empty() {
+            return;
+        }
+        self.slices
+            .retain(|slice| dirs.iter().any(|dir| slice.root.starts_with(dir)));
+    }
+
     /// Reconstructs a fine-grained `Vec<CachedDir>` — one entry per
     /// immediate parent directory, the same granularity
     /// [`cache::refresh_subtree`] computes internally — from this store's

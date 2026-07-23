@@ -269,6 +269,34 @@ pub fn find_vault(start: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Resolves a `--refresh`/`.refresh <PATH>` argument to an absolute path
+/// under `vault`.
+///
+/// The user-typed path may be relative — it is canonicalized against the cwd,
+/// mirroring [`crate::cli::Cli::resolved_roots`], and must exist. This is
+/// load-bearing: [`refresh_subtree`] filters the vault's *absolute* discovery
+/// results with `starts_with(subtree)`, so a raw relative path (`plans`,
+/// `./plans`) would prefix-match nothing and silently refresh zero files —
+/// running the query against the stale cache (design spec §10). A target that
+/// resolves outside the vault is rejected: nothing under the loaded cache
+/// could be refreshed by it.
+///
+/// Shared by the CLI's `--refresh` path ([`crate::main`]) and the REPL's
+/// `.refresh` ([`crate::session::Session::refresh`]) so the two behave
+/// identically — a relative REPL path is no more a silent no-op than a
+/// relative CLI one.
+pub(crate) fn resolve_refresh_target(path: &Path, vault: &Path) -> anyhow::Result<PathBuf> {
+    let canonical = fs::canonicalize(path)
+        .with_context(|| format!("cannot access refresh path {}", path.display()))?;
+    anyhow::ensure!(
+        canonical.starts_with(vault),
+        "refresh path {} is outside the vault {}",
+        canonical.display(),
+        vault.display()
+    );
+    Ok(canonical)
+}
+
 /// Selects how [`refresh_against_cache`] decides whether a cached file is
 /// still trustworthy against the live filesystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

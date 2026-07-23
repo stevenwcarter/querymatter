@@ -245,8 +245,12 @@ fn print_help() {
     println!("  .schema            list frontmatter fields, file.* columns, and the record count");
     println!("  .format [fmt]      show, or set, the output format (table, json, csv, tsv, md)");
     println!("  .reload            rescan every tracked directory (in-memory only)");
-    println!("  .refresh [path]    force a re-scan of path (or the whole vault) and persist it");
-    println!("  .refresh-all       force a re-scan of the whole vault and persist it");
+    println!(
+        "  .refresh [path]    re-scan path (or all); updates the .querymatter cache, else in memory"
+    );
+    println!(
+        "  .refresh-all       re-scan the whole vault; updates the cache, or in memory with no vault"
+    );
     println!("  .quit / .exit      leave the REPL");
     println!();
     println!("End a statement with ';' to run it; statements may span multiple lines.");
