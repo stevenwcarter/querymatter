@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+clap = { version = "4.6.4", features = ["derive"] }
 comfy-table = "7.2.2"
 csv = "1.4.0"
 globset = "0.4.19"
@@ -23,5 +24,7 @@ lto = "thin"
 opt-level = 3
 
 [dev-dependencies]
+assert_cmd = "2.2.2"
 insta = "1.48.0"
+predicates = "3.1.4"
 tempfile = "3.27.0"
