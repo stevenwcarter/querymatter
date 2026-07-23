@@ -29,7 +29,7 @@ use clap::Parser;
 
 use crate::cli::{Cli, Command, InitArgs};
 use crate::session::{Session, split_statements};
-use crate::store::InMemoryStore;
+use crate::store::{InMemoryStore, RecordStore};
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -132,7 +132,7 @@ fn run_query(cli: &Cli) -> anyhow::Result<()> {
         cache::find_vault(&cwd)
     };
 
-    let (store, report) = match vault {
+    let (store, report, session_vault) = match vault {
         Some(vault) => {
             let (mut store, mut report) = InMemoryStore::from_cache(&vault, opts, cli.freshness());
             // A forced refresh runs against the just-loaded cache; only its
@@ -148,21 +148,22 @@ fn run_query(cli: &Cli) -> anyhow::Result<()> {
                         .extend(store.refresh(&vault, Some(&target)).warnings);
                 }
             }
-            (store, report)
+            (store, report, Some(vault))
         }
         None => {
             anyhow::ensure!(
                 !cli.force_cache,
                 "--force-cache: no .querymatter cache found (run `querymatter init` first)"
             );
-            InMemoryStore::load(cli.resolved_roots()?, opts)
+            let (store, report) = InMemoryStore::load(cli.resolved_roots()?, opts);
+            (store, report, None)
         }
     };
 
     for warning in &report.warnings {
         eprintln!("querymatter: {warning}");
     }
-    let session = Session::new(Box::new(store), cli.format);
+    let session = Session::new(Box::new(store), cli.format, session_vault);
 
     match cli.query.as_deref() {
         // `-e -`: read the query text from stdin, then run it.

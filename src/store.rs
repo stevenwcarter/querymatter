@@ -30,7 +30,7 @@ impl LoadReport {
 }
 
 /// TTL (seconds) assumed when [`InMemoryStore::from_cache`] or
-/// [`InMemoryStore::refresh`] finds no on-disk `.querymatter` manifest to
+/// [`RecordStore::refresh`] finds no on-disk `.querymatter` manifest to
 /// read a real `ttl_secs` from. Matches the default used elsewhere for a
 /// fresh vault (design spec §3); only ever consulted by [`Freshness::Fast`].
 const DEFAULT_TTL_SECS: u64 = 300;
@@ -67,6 +67,12 @@ pub trait RecordStore {
     fn reload_all(&mut self) -> LoadReport;
     /// The roots currently tracked, in slice order.
     fn roots(&self) -> Vec<PathBuf>;
+    /// Forces a fresh read of `subtree` (or the whole vault, when `None`)
+    /// against live storage, updating in place and persisting when the
+    /// implementation is backed by an on-disk cache. Callable through
+    /// `Box<dyn RecordStore>`, this is what the REPL's `.refresh`/
+    /// `.refresh-all` and the CLI's `--refresh`/`--refresh-all` dispatch to.
+    fn refresh(&mut self, vault: &Path, subtree: Option<&Path>) -> LoadReport;
 }
 
 /// A [`RecordStore`] that keeps every loaded record in memory, partitioned
@@ -129,53 +135,11 @@ impl InMemoryStore {
         (InMemoryStore { slices, opts }, report)
     }
 
-    /// Forces a fresh read of `subtree` (or the whole vault, when `None`)
-    /// against the live filesystem, updates the in-memory slices to match,
-    /// and persists the result — used by the REPL `.refresh` and the
-    /// `--refresh` flags.
-    ///
-    /// The starting point is the on-disk cache ([`cache::load_cache`]) when
-    /// one exists; otherwise it's rebuilt from the store's own current
-    /// slices ([`Self::cached_dirs_from_slices`]) so that directories outside
-    /// `subtree` aren't silently dropped. A `subtree` forces a full re-parse
-    /// of just that directory tree ([`cache::refresh_subtree`], ignoring any
-    /// cached shortcut); `None` instead does a whole-vault incremental
-    /// refresh ([`Freshness::PerFile`]), reusing cached fields for files
-    /// whose `(mtime, size)` haven't changed.
-    pub fn refresh(&mut self, vault: &Path, subtree: Option<&Path>) -> LoadReport {
-        let (mut cached, ttl_secs) = match cache::load_cache(vault) {
-            Some((body, dirs)) => (dirs, body.ttl_secs),
-            None => (self.cached_dirs_from_slices(), DEFAULT_TTL_SECS),
-        };
-
-        let mut report = match subtree {
-            Some(subtree) => cache::refresh_subtree(vault, &mut cached, subtree, &self.opts),
-            None => {
-                let (fresh, report, _changed) = cache::refresh_against_cache(
-                    vault,
-                    &cached,
-                    &self.opts,
-                    Freshness::PerFile,
-                    ttl_secs,
-                );
-                cached = fresh;
-                report
-            }
-        };
-
-        if let Err(err) = cache::save_cache(vault, &cached, ttl_secs) {
-            report.warnings.push(format!("saving cache: {err}"));
-        }
-
-        self.slices = slices_from_cached(vault, &cached);
-        report
-    }
-
     /// Reconstructs a fine-grained `Vec<CachedDir>` — one entry per
     /// immediate parent directory, the same granularity
     /// [`cache::refresh_subtree`] computes internally — from this store's
-    /// current in-memory slices. Used by [`Self::refresh`] as a fallback
-    /// when no on-disk cache exists yet, so a directory outside the
+    /// current in-memory slices. Used by [`RecordStore::refresh`] as a
+    /// fallback when no on-disk cache exists yet, so a directory outside the
     /// requested subtree is carried forward untouched rather than dropped.
     ///
     /// The `mtime`/`size`/`scanned_at`/`dir_mtime` fields are placeholders
@@ -225,7 +189,7 @@ impl InMemoryStore {
 
 /// Builds one [`DirSlice`] per cached directory in `dirs` via
 /// [`cache::records_from`], stamping each with the current time. Shared by
-/// [`InMemoryStore::from_cache`] and [`InMemoryStore::refresh`], both of
+/// [`InMemoryStore::from_cache`] and [`RecordStore::refresh`], both of
 /// which rebuild the store's slices from a freshly refreshed `Vec<CachedDir>`.
 fn slices_from_cached(vault: &Path, dirs: &[CachedDir]) -> Vec<DirSlice> {
     let now = SystemTime::now();
@@ -277,6 +241,44 @@ impl RecordStore for InMemoryStore {
 
     fn roots(&self) -> Vec<PathBuf> {
         self.slices.iter().map(|slice| slice.root.clone()).collect()
+    }
+
+    /// The starting point is the on-disk cache ([`cache::load_cache`]) when
+    /// one exists; otherwise it's rebuilt from the store's own current
+    /// slices ([`InMemoryStore::cached_dirs_from_slices`]) so that
+    /// directories outside `subtree` aren't silently dropped. A `subtree`
+    /// forces a full re-parse of just that directory tree
+    /// ([`cache::refresh_subtree`], ignoring any cached shortcut); `None`
+    /// instead does a whole-vault incremental refresh
+    /// ([`Freshness::PerFile`]), reusing cached fields for files whose
+    /// `(mtime, size)` haven't changed.
+    fn refresh(&mut self, vault: &Path, subtree: Option<&Path>) -> LoadReport {
+        let (mut cached, ttl_secs) = match cache::load_cache(vault) {
+            Some((body, dirs)) => (dirs, body.ttl_secs),
+            None => (self.cached_dirs_from_slices(), DEFAULT_TTL_SECS),
+        };
+
+        let mut report = match subtree {
+            Some(subtree) => cache::refresh_subtree(vault, &mut cached, subtree, &self.opts),
+            None => {
+                let (fresh, report, _changed) = cache::refresh_against_cache(
+                    vault,
+                    &cached,
+                    &self.opts,
+                    Freshness::PerFile,
+                    ttl_secs,
+                );
+                cached = fresh;
+                report
+            }
+        };
+
+        if let Err(err) = cache::save_cache(vault, &cached, ttl_secs) {
+            report.warnings.push(format!("saving cache: {err}"));
+        }
+
+        self.slices = slices_from_cached(vault, &cached);
+        report
     }
 }
 

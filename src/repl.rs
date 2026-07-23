@@ -18,6 +18,7 @@ use rustyline::error::ReadlineError;
 use crate::model::Value;
 use crate::render::Format;
 use crate::session::Session;
+use crate::store::LoadReport;
 
 /// Prompt shown while waiting for a new statement or dot-command.
 const PROMPT: &str = "querymatter> ";
@@ -51,8 +52,16 @@ pub enum DotCommand {
     Schema,
     /// `.format [fmt]` — set (`Some`) or report (`None`) the output format.
     Format(Option<Format>),
-    /// `.reload` — rescan every tracked directory.
+    /// `.reload` — rescan every tracked directory (in-memory only; never
+    /// touches a `.querymatter` cache).
     Reload,
+    /// `.refresh [path]` — force a re-scan of `path`'s subtree, or the
+    /// whole vault when omitted, persisting the update when a
+    /// `.querymatter` cache backs the session.
+    Refresh(Option<String>),
+    /// `.refresh-all` — force a re-scan of the whole vault, persisting the
+    /// update; an explicit alias for `.refresh` with no path.
+    RefreshAll,
     /// `.quit` / `.exit` — leave the REPL.
     Quit,
     /// `.format <name>` where `<name>` is not a known [`Format`], carrying the
@@ -127,6 +136,8 @@ pub fn parse_dot(line: &str) -> DotCommand {
         "help" => DotCommand::Help,
         "schema" => DotCommand::Schema,
         "reload" => DotCommand::Reload,
+        "refresh" => DotCommand::Refresh(words.next().map(str::to_string)),
+        "refresh-all" => DotCommand::RefreshAll,
         "quit" | "exit" => DotCommand::Quit,
         "format" => match words.next() {
             None => DotCommand::Format(None),
@@ -203,9 +214,10 @@ pub fn run(mut session: Session) -> anyhow::Result<()> {
 /// should exit (`.quit`/`.exit`).
 ///
 /// stdout/stderr policy: reference/inspection output (`.help`, `.schema`, and
-/// `.format`'s report of the current format) goes to stdout; the `.reload`
-/// report and all error messages (unknown command, bad format) go to stderr,
-/// keeping stdout clean for piping.
+/// `.format`'s report of the current format) goes to stdout; the
+/// `.reload`/`.refresh`/`.refresh-all` reports and all error messages
+/// (unknown command, bad format) go to stderr, keeping stdout clean for
+/// piping.
 fn dispatch_dot(cmd: DotCommand, session: &mut Session) -> bool {
     match cmd {
         DotCommand::Help => print_help(),
@@ -213,6 +225,8 @@ fn dispatch_dot(cmd: DotCommand, session: &mut Session) -> bool {
         DotCommand::Format(Some(fmt)) => session.set_format(fmt),
         DotCommand::Format(None) => println!("format: {}", format_name(session.format)),
         DotCommand::Reload => report_reload(session),
+        DotCommand::Refresh(path) => report_refresh(session, path.as_deref().map(Path::new)),
+        DotCommand::RefreshAll => report_refresh(session, None),
         DotCommand::Quit => return true,
         DotCommand::BadFormat(name) => {
             eprintln!("querymatter: unknown format '{name}' (try: table, json, csv, tsv, md)");
@@ -230,7 +244,9 @@ fn print_help() {
     println!("  .help              show this message");
     println!("  .schema            list frontmatter fields, file.* columns, and the record count");
     println!("  .format [fmt]      show, or set, the output format (table, json, csv, tsv, md)");
-    println!("  .reload            rescan every tracked directory");
+    println!("  .reload            rescan every tracked directory (in-memory only)");
+    println!("  .refresh [path]    force a re-scan of path (or the whole vault) and persist it");
+    println!("  .refresh-all       force a re-scan of the whole vault and persist it");
     println!("  .quit / .exit      leave the REPL");
     println!();
     println!("End a statement with ';' to run it; statements may span multiple lines.");
@@ -264,9 +280,20 @@ fn record_count(session: &Session) -> i64 {
 
 /// Reloads every tracked root and reports the outcome to stderr.
 fn report_reload(session: &mut Session) {
-    let report = session.reload();
+    report_summary("reloaded", &session.reload());
+}
+
+/// Forces a re-scan of `subtree` (or the whole vault, when `None`) and
+/// reports the outcome to stderr.
+fn report_refresh(session: &mut Session, subtree: Option<&Path>) {
+    report_summary("refreshed", &session.refresh(subtree));
+}
+
+/// Prints a [`LoadReport`] summary to stderr in the shared `.reload`/
+/// `.refresh`/`.refresh-all` format, differing only in `verb`.
+fn report_summary(verb: &str, report: &LoadReport) {
     eprintln!(
-        "querymatter: reloaded {} record(s), skipped {}",
+        "querymatter: {verb} {} record(s), skipped {}",
         report.loaded, report.skipped
     );
     for warning in &report.warnings {
@@ -404,5 +431,14 @@ mod tests {
     fn dot_line_detected_by_buffer() {
         let mut b = LineBuffer::new();
         assert!(matches!(b.push(".schema"), Line::Dot(DotCommand::Schema)));
+    }
+    #[test]
+    fn refresh_commands_parse() {
+        assert_eq!(parse_dot(".refresh"), DotCommand::Refresh(None));
+        assert_eq!(
+            parse_dot(".refresh plans"),
+            DotCommand::Refresh(Some("plans".to_string()))
+        );
+        assert!(matches!(parse_dot(".refresh-all"), DotCommand::RefreshAll));
     }
 }
