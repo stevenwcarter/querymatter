@@ -688,6 +688,14 @@ mod agg_tests {
             rec("s/c.md", "synced", "011"),
         ]
     }
+    /// Builds a record with a `status` field and one extra numeric-ish field
+    /// `n`, for the `sum`/`avg`/`min`/`max`/plain-`count` tests below.
+    fn rec_n(path: &str, status: &str, n: Value) -> Record {
+        let mut m = IndexMap::new();
+        m.insert("status".into(), Value::Str(status.into()));
+        m.insert("n".into(), n);
+        Record::new(Path::new("s"), Path::new(path), m)
+    }
 
     #[test]
     fn count_per_status_renamed_ordered() {
@@ -731,5 +739,89 @@ mod agg_tests {
             execute(&q, recs().iter()),
             Err(ExecError::NonGroupedColumn(_))
         ));
+    }
+    #[test]
+    fn sum_and_avg_over_numeric_column() {
+        let rows = [
+            rec_n("s/a.md", "draft", Value::Int(2)),
+            rec_n("s/b.md", "draft", Value::Int(4)),
+        ];
+        let q = parse("SELECT sum(n) AS total, avg(n) AS mean").unwrap();
+        let t = execute(&q, rows.iter()).unwrap();
+        assert_eq!(t.rows, vec![vec![Value::Float(6.0), Value::Float(3.0)]]);
+    }
+    #[test]
+    fn sum_and_avg_skip_non_numeric_values() {
+        let rows = [
+            rec_n("s/a.md", "draft", Value::Int(2)),
+            rec_n("s/b.md", "draft", Value::Str("n/a".into())),
+            rec_n("s/c.md", "draft", Value::Int(4)),
+        ];
+        let q = parse("SELECT sum(n) AS total, avg(n) AS mean").unwrap();
+        let t = execute(&q, rows.iter()).unwrap();
+        // The non-numeric "n/a" is skipped, so only 2 and 4 count.
+        assert_eq!(t.rows, vec![vec![Value::Float(6.0), Value::Float(3.0)]]);
+    }
+    #[test]
+    fn avg_of_no_numeric_values_is_null_and_sum_is_zero() {
+        let rows = [
+            rec_n("s/a.md", "draft", Value::Str("n/a".into())),
+            rec_n("s/b.md", "draft", Value::Null),
+        ];
+        let q = parse("SELECT sum(n) AS total, avg(n) AS mean").unwrap();
+        let t = execute(&q, rows.iter()).unwrap();
+        // `avg` over zero numeric values is Null; `sum` is the identity 0.0.
+        assert_eq!(t.rows, vec![vec![Value::Float(0.0), Value::Null]]);
+    }
+    #[test]
+    fn min_and_max_over_column() {
+        let rows = [
+            rec_n("s/a.md", "draft", Value::Int(5)),
+            rec_n("s/b.md", "draft", Value::Int(1)),
+            rec_n("s/c.md", "draft", Value::Int(3)),
+        ];
+        let q = parse("SELECT min(n) AS lo, max(n) AS hi").unwrap();
+        let t = execute(&q, rows.iter()).unwrap();
+        assert_eq!(t.rows, vec![vec![Value::Int(1), Value::Int(5)]]);
+    }
+    #[test]
+    fn min_and_max_of_all_null_column_is_null() {
+        let rows = [
+            rec_n("s/a.md", "draft", Value::Null),
+            rec_n("s/b.md", "draft", Value::Null),
+        ];
+        let q = parse("SELECT min(n) AS lo, max(n) AS hi").unwrap();
+        let t = execute(&q, rows.iter()).unwrap();
+        assert_eq!(t.rows, vec![vec![Value::Null, Value::Null]]);
+    }
+    #[test]
+    fn count_col_counts_non_null_only() {
+        // Contrast with `count(*)` (row count) and `count(distinct ...)`
+        // (already pinned by `count_distinct` above): plain `count(col)`
+        // counts only the non-null values of that column.
+        let rows = [
+            rec_n("s/a.md", "draft", Value::Int(1)),
+            rec_n("s/b.md", "draft", Value::Null),
+            rec_n("s/c.md", "draft", Value::Int(3)),
+        ];
+        let q = parse("SELECT count(*) AS rows, count(n) AS non_null").unwrap();
+        let t = execute(&q, rows.iter()).unwrap();
+        assert_eq!(t.rows, vec![vec![Value::Int(3), Value::Int(2)]]);
+    }
+    #[test]
+    fn order_by_ungrouped_column_errors() {
+        // `prd` isn't a GROUP BY key here, so ordering by it is exactly as
+        // invalid as selecting it would be.
+        let q = parse("SELECT status, count(*) GROUP BY status ORDER BY prd").unwrap();
+        assert!(matches!(
+            execute(&q, recs().iter()),
+            Err(ExecError::NonGroupedColumn(_))
+        ));
+    }
+    #[test]
+    fn aggregate_with_no_group_by_over_zero_rows_is_one_row_of_zero() {
+        let q = parse("SELECT count(*) AS n WHERE status = 'nope'").unwrap();
+        let t = execute(&q, recs().iter()).unwrap();
+        assert_eq!(t.rows, vec![vec![Value::Int(0)]]);
     }
 }
