@@ -777,6 +777,12 @@ fn oneshot_vertical_g_prints_row_blocks() {
     let td = tree();
     Command::cargo_bin("querymatter")
         .unwrap()
+        // \G forces Output::Vertical, which render() dispatches independent
+        // of TableStyle — so this assertion can't actually flip on an
+        // ambient QUERYMATTER_TABLE_STYLE today, but removing it keeps the
+        // test from silently growing a dependency on that if vertical
+        // rendering ever starts consulting the style.
+        .env_remove("QUERYMATTER_TABLE_STYLE")
         .args(["-e", "SELECT status, prd WHERE prd = '011'\\G"])
         .arg(td.path())
         .assert()
@@ -787,11 +793,15 @@ fn oneshot_vertical_g_prints_row_blocks() {
 }
 
 /// One piped script, two terminators: each statement renders its own way.
+/// The env-var removal matters here exactly as in `table_style_defaults_to_ascii`:
+/// without it, a developer with QUERYMATTER_TABLE_STYLE=unicode exported sees
+/// the `;` statement grow unicode borders and the `+--` assertion fails.
 #[test]
 fn batch_mode_mixes_terminators() {
     let td = tree();
     let out = Command::cargo_bin("querymatter")
         .unwrap()
+        .env_remove("QUERYMATTER_TABLE_STYLE")
         .arg(td.path())
         .write_stdin("SELECT count(*) AS n;\nSELECT status WHERE prd = '011'\\G\n")
         .assert()

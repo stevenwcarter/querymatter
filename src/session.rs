@@ -290,12 +290,49 @@ mod tests {
         );
     }
 
-    /// Any other backslash sequence is ordinary statement text.
+    /// A backslash inside a quoted literal is handled by the quote-mode match
+    /// arm, which never inspects backslashes at all — it is just more quoted
+    /// text. This does NOT exercise the top-level `'\\' => match chars.peek()`
+    /// fallback; see the `split_statements_backslash_*` tests below for that.
     #[test]
-    fn split_statements_leaves_other_backslashes_alone() {
+    fn split_statements_ignores_backslashes_inside_quotes() {
         assert_eq!(
             split_statements("SELECT status WHERE p = 'a\\b'"),
             vec![semi("SELECT status WHERE p = 'a\\b'")]
+        );
+    }
+
+    /// At the top level (outside any quote), a backslash not followed by `g`
+    /// or `G` is retained verbatim and the following character is preserved
+    /// untouched — the peek must not consume it.
+    #[test]
+    fn split_statements_backslash_before_letter_preserves_next_char() {
+        assert_eq!(
+            split_statements("a\\zb;"),
+            vec![semi("a\\zb")],
+            "a top-level backslash before an ordinary letter must keep both \
+             the backslash and the letter"
+        );
+    }
+
+    /// A trailing backslash at end of input (nothing left to peek) must not
+    /// panic, and the backslash is retained in the final statement.
+    #[test]
+    fn split_statements_trailing_backslash_does_not_panic() {
+        assert_eq!(split_statements("SELECT 1\\"), vec![semi("SELECT 1\\")]);
+    }
+
+    /// A backslash immediately before a quote character is retained as
+    /// literal text, and the quote genuinely opens a string — this crate
+    /// implements no backslash-escaping of quotes, so the quote character
+    /// still flips the quote-mode state machine on its own.
+    #[test]
+    fn split_statements_backslash_before_quote_opens_a_string() {
+        assert_eq!(
+            split_statements("a\\'b';"),
+            vec![semi("a\\'b'")],
+            "the backslash stays literal and 'b' is still a real quoted \
+             literal, not an escaped quote"
         );
     }
 
