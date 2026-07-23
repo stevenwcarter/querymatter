@@ -112,10 +112,13 @@ fn to_json(value: &Value) -> JsonValue {
 
 /// Renders `table` as `delimiter`-separated text with a header row.
 fn render_delimited(table: &ResultTable, delimiter: u8) -> String {
-    // A `ResultTable` guarantees each row has exactly one cell per header,
-    // so `write_record`'s field-count check can never fail here; the only
-    // realistic failure mode left is an OOM writing to the in-memory buffer.
-    write_delimited(table, delimiter).unwrap_or_default()
+    // A `ResultTable` guarantees each row has exactly one cell per header
+    // (see `query::ResultTable`'s doc comment), so `write_record`'s
+    // field-count check can never fail here; the only realistic failure mode
+    // left is an OOM writing to the in-memory buffer. Fail loudly rather than
+    // silently producing blank output indistinguishable from "zero rows".
+    write_delimited(table, delimiter)
+        .expect("ResultTable guarantees one cell per header (query::ResultTable)")
 }
 
 fn write_delimited(table: &ResultTable, delimiter: u8) -> csv::Result<String> {
@@ -129,7 +132,15 @@ fn write_delimited(table: &ResultTable, delimiter: u8) -> csv::Result<String> {
     let bytes = writer
         .into_inner()
         .map_err(csv::IntoInnerError::into_error)?;
-    Ok(String::from_utf8_lossy(&bytes).trim_end().to_string())
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    // Strip only the writer's final record terminator, not `trim_end()`,
+    // which would also eat real trailing whitespace from the last cell's
+    // `Value::display()` content (data loss).
+    let trimmed = text
+        .strip_suffix("\r\n")
+        .or_else(|| text.strip_suffix('\n'))
+        .unwrap_or(&text);
+    Ok(trimmed.to_string())
 }
 
 #[cfg(test)]
@@ -178,5 +189,65 @@ mod tests {
     #[test]
     fn md_snapshot() {
         insta::assert_snapshot!(render(&table(), Format::Md));
+    }
+
+    /// Regression for a data-loss bug: the delimited-render path used to
+    /// `trim_end()` the whole rendered buffer to drop the writer's trailing
+    /// record terminator, which also silently stripped real trailing
+    /// whitespace from the last cell of the last row.
+    #[test]
+    fn csv_preserves_trailing_whitespace_in_last_cell() {
+        let t = ResultTable {
+            headers: vec!["status".into(), "Count".into()],
+            rows: vec![
+                vec![Value::Str("synced".into()), Value::Int(2)],
+                vec![Value::Str("draft".into()), Value::Str("x  ".into())],
+            ],
+        };
+        let s = render(&t, Format::Csv);
+        assert!(
+            s.lines().last().unwrap().ends_with("x  "),
+            "trailing whitespace in the last cell must survive rendering, got: {s:?}"
+        );
+    }
+
+    fn variant_table() -> ResultTable {
+        ResultTable {
+            headers: vec!["n".into(), "b".into(), "f".into(), "l".into()],
+            rows: vec![vec![
+                Value::Null,
+                Value::Bool(true),
+                Value::Float(1.5),
+                Value::List(vec![Value::Str("a".into()), Value::Str("b".into())]),
+            ]],
+        }
+    }
+
+    #[test]
+    fn json_renders_null_bool_float_list() {
+        let s = render(&variant_table(), Format::Json);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v[0]["n"], serde_json::Value::Null);
+        assert_eq!(v[0]["b"], serde_json::json!(true));
+        assert_eq!(v[0]["f"], serde_json::json!(1.5));
+        assert_eq!(v[0]["l"], serde_json::json!(["a", "b"]));
+    }
+
+    #[test]
+    fn csv_renders_null_bool_float_list() {
+        let s = render(&variant_table(), Format::Csv);
+        let data_line = s.lines().nth(1).unwrap();
+        // Null -> empty cell; Bool/Float -> Value::display(); List -> its
+        // elements' display() joined ", " (and quoted by the csv writer
+        // since the joined text itself contains the delimiter).
+        assert_eq!(data_line, ",true,1.5,\"a, b\"");
+    }
+
+    #[test]
+    fn table_renders_null_bool_float_list() {
+        let s = render(&variant_table(), Format::Table);
+        assert!(s.contains("true"));
+        assert!(s.contains("1.5"));
+        assert!(s.contains("a, b"));
     }
 }
