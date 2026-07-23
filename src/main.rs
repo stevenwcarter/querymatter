@@ -21,6 +21,7 @@ pub mod store;
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read};
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use clap::Parser;
@@ -95,9 +96,10 @@ fn run_query(cli: &Cli) -> anyhow::Result<()> {
                 report.warnings.extend(store.refresh(&vault, None).warnings);
             } else {
                 for path in &cli.refresh {
+                    let target = resolve_refresh_target(path, &vault)?;
                     report
                         .warnings
-                        .extend(store.refresh(&vault, Some(path)).warnings);
+                        .extend(store.refresh(&vault, Some(&target)).warnings);
                 }
             }
             (store, report)
@@ -125,6 +127,28 @@ fn run_query(cli: &Cli) -> anyhow::Result<()> {
         None if !io::stdin().is_terminal() => run_statements(&session, &read_stdin()?),
         None => repl::run(session),
     }
+}
+
+/// Resolves a `--refresh <PATH>` argument to an absolute path under `vault`.
+///
+/// The user-typed path may be relative — it is canonicalized against the cwd,
+/// mirroring [`Cli::resolved_roots`], and must exist. This is load-bearing:
+/// [`cache::refresh_subtree`] filters the vault's *absolute* discovery results
+/// with `starts_with(subtree)`, so a raw relative path (`plans`, `./plans`)
+/// would prefix-match nothing and silently refresh zero files — running the
+/// query against the stale cache (design spec §10). A target that resolves
+/// outside the vault is rejected: nothing under the loaded cache could be
+/// refreshed by it.
+fn resolve_refresh_target(path: &Path, vault: &Path) -> anyhow::Result<PathBuf> {
+    let canonical = fs::canonicalize(path)
+        .with_context(|| format!("cannot access --refresh path {}", path.display()))?;
+    anyhow::ensure!(
+        canonical.starts_with(vault),
+        "--refresh path {} is outside the vault {}",
+        canonical.display(),
+        vault.display()
+    );
+    Ok(canonical)
 }
 
 /// Runs every top-level `;`-separated statement in `input`, printing each

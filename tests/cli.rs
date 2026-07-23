@@ -310,6 +310,105 @@ fn force_cache_without_a_vault_exits_nonzero() {
 }
 
 #[test]
+fn refresh_relative_path_reparses_and_defeats_stale_cache() {
+    use std::fs::File;
+    let td = TempDir::new().unwrap();
+    let plans = td.path().join("plans");
+    fs::create_dir_all(&plans).unwrap();
+    let a = plans.join("a.md");
+    fs::write(&a, "---\nstatus: draft\n---\n").unwrap();
+    let original_mtime = fs::metadata(&a).unwrap().modified().unwrap();
+
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .arg("init")
+        .arg(td.path())
+        .assert()
+        .success();
+
+    // Edit the content but keep the byte length equal ("draft" -> "fresh") and
+    // restore the original mtime, so the default per-file freshness check
+    // (mtime + size) would REUSE the stale cached value. Only a real
+    // `--refresh` (a forced re-parse) can surface the edit — so a `--refresh
+    // plans` that silently no-ops on a relative path leaves the output stale
+    // at `draft`. Asserting `fresh` proves the relative path actually fired.
+    fs::write(&a, "---\nstatus: fresh\n---\n").unwrap();
+    File::open(&a)
+        .unwrap()
+        .set_modified(original_mtime)
+        .unwrap();
+
+    let out = Command::cargo_bin("querymatter")
+        .unwrap()
+        .current_dir(td.path())
+        .args([
+            "-e",
+            "SELECT status",
+            "--format",
+            "csv",
+            "--refresh",
+            "plans",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    assert_eq!(
+        s.lines().last().unwrap().trim(),
+        "fresh",
+        "--refresh with a relative path must force a re-parse; got: {s:?}"
+    );
+}
+
+#[test]
+fn refresh_nonexistent_path_exits_nonzero() {
+    let td = tree();
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .arg("init")
+        .arg(td.path())
+        .assert()
+        .success();
+
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .current_dir(td.path())
+        .args([
+            "-e",
+            "SELECT count(*) AS n",
+            "--refresh",
+            "definitely-not-here",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("definitely-not-here"));
+}
+
+#[test]
+fn refresh_path_outside_vault_exits_nonzero() {
+    let vault = tree();
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .arg("init")
+        .arg(vault.path())
+        .assert()
+        .success();
+
+    // A real, existing directory that is NOT under the vault.
+    let outside = TempDir::new().unwrap();
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .current_dir(vault.path())
+        .args(["-e", "SELECT count(*) AS n", "--refresh"])
+        .arg(outside.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("outside the vault"));
+}
+
+#[test]
 fn missing_ignore_file_flag_exits_nonzero() {
     let td = TempDir::new().unwrap();
     fs::write(td.path().join("a.md"), "---\nstatus: draft\n---\n").unwrap();
