@@ -1,0 +1,8 @@
+---
+source: src/render.rs
+expression: "render(&table(), Format::Md)"
+---
+| status | Count |
+|--------|-------|
+| synced | 2     |
+| draft  | 1     |
