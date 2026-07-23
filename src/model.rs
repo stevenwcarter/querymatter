@@ -7,7 +7,7 @@ use std::path::Path;
 /// This is the common currency for query evaluation: frontmatter fields are
 /// parsed into `Value`s, and the query engine (comparisons, `ORDER BY`,
 /// `MIN`/`MAX`) operates on them without knowing the original YAML shape.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Value {
     Null,
     Bool(bool),

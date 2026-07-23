@@ -5,6 +5,7 @@
 //! diagnostic, warning, and prompt goes to stderr, so a pipeline like
 //! `querymatter -e '…' --format json | jq` sees pure JSON.
 
+pub mod cache;
 mod cli;
 pub mod discover;
 pub mod frontmatter;
