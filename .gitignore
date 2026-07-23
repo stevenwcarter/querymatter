@@ -1,1 +1,8 @@
+# Rust build artifacts
+/target
+
+# Local sample/scratch data (not part of the tool)
 samples/
+
+# Editor/OS cruft
+*.orig
