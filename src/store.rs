@@ -360,14 +360,17 @@ mod tests {
             Value::Str("draft".into())
         );
 
-        write(td.path(), "a.md", "---\nstatus: final\n---\n");
+        // Different byte length than "draft" (not just different content),
+        // so the refresh can't be satisfied by a size-unchanged coincidence
+        // if mtime resolution doesn't tick between the two writes.
+        write(td.path(), "a.md", "---\nstatus: in-progress\n---\n");
 
         let report = store.refresh(td.path(), None);
         assert_eq!(report.skipped, 0);
 
         assert_eq!(
             store.records().next().unwrap().field("status"),
-            Value::Str("final".into()),
+            Value::Str("in-progress".into()),
             "in-memory records must reflect the edit"
         );
 
@@ -380,8 +383,95 @@ mod tests {
             .expect("a.md not found in persisted cache");
         assert_eq!(
             persisted_status,
-            Value::Str("final".into()),
+            Value::Str("in-progress".into()),
             "refresh must persist the edit to disk"
+        );
+    }
+
+    #[test]
+    fn force_cache_mode_skips_persist_and_uses_stale_value() {
+        let td = TempDir::new().unwrap();
+        write(td.path(), "a.md", "---\nstatus: draft\n---\n");
+        cache::build_vault(td.path(), &WalkOpts::default(), 300).unwrap();
+
+        write(td.path(), "a.md", "---\nstatus: final\n---\n");
+
+        let (store, report) =
+            InMemoryStore::from_cache(td.path(), WalkOpts::default(), Freshness::ForceCache);
+        assert_eq!(report.skipped, 0);
+        assert_eq!(
+            store.records().next().unwrap().field("status"),
+            Value::Str("draft".into()),
+            "ForceCache must never re-read the changed file"
+        );
+
+        let (_body, loaded) = cache::load_cache(td.path()).unwrap();
+        let persisted_status = loaded
+            .iter()
+            .flat_map(|dir| &dir.files)
+            .find(|file| file.rel_path == "a.md")
+            .and_then(|file| file.fields.get("status").cloned())
+            .expect("a.md not found in persisted cache");
+        assert_eq!(
+            persisted_status,
+            Value::Str("draft".into()),
+            "ForceCache must never persist — the on-disk cache stays at the stale value"
+        );
+    }
+
+    #[test]
+    fn from_cache_with_no_existing_cache_builds_and_persists() {
+        let td = TempDir::new().unwrap();
+        write(td.path(), "plans/a.md", "---\nstatus: draft\n---\n");
+        write(td.path(), "product/b.md", "---\nstatus: shipped\n---\n");
+        // No cache::build_vault call: no .querymatter/manifest.bin exists yet.
+        assert!(cache::load_cache(td.path()).is_none());
+
+        let (cached_store, report) =
+            InMemoryStore::from_cache(td.path(), WalkOpts::default(), Freshness::PerFile);
+        assert_eq!(report.skipped, 0);
+
+        let (live_store, _report) =
+            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default());
+
+        let mut cached: Vec<&Record> = cached_store.records().collect();
+        let mut live: Vec<&Record> = live_store.records().collect();
+        cached.sort_by_key(|r| r.file_attr(FileAttr::Path).display());
+        live.sort_by_key(|r| r.file_attr(FileAttr::Path).display());
+        assert_eq!(
+            cached, live,
+            "from_cache with no prior cache must build correct records via a live scan"
+        );
+
+        let (_body, loaded) = cache::load_cache(td.path())
+            .expect("from_cache must persist a new cache when none existed");
+        assert_eq!(loaded.len(), 2, "one CachedDir per matched directory");
+    }
+
+    #[test]
+    fn refresh_reconstructs_cached_dirs_when_no_cache_exists() {
+        let td = TempDir::new().unwrap();
+        write(td.path(), "a.md", "---\nstatus: draft\n---\n");
+
+        // Built via InMemoryStore::load (a live scan), never InMemoryStore::from_cache,
+        // so no .querymatter/manifest.bin exists on disk. refresh's load_cache
+        // lookup below therefore falls back to cached_dirs_from_slices,
+        // reconstructing a starting point from this store's own in-memory
+        // slices rather than the (nonexistent) on-disk cache.
+        let (mut store, _report) =
+            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default());
+        assert!(cache::load_cache(td.path()).is_none());
+
+        write(td.path(), "a.md", "---\nstatus: in-progress\n---\n");
+
+        let report = store.refresh(td.path(), None);
+        assert_eq!(report.skipped, 0);
+
+        assert_eq!(
+            store.records().next().unwrap().field("status"),
+            Value::Str("in-progress".into()),
+            "refresh must pick up the edit even when cached_dirs_from_slices \
+             (not an on-disk cache) supplies the starting point"
         );
     }
 
