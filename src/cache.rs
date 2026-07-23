@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use std::{fs, io};
 
 use anyhow::Context;
@@ -277,9 +277,13 @@ pub enum Freshness {
     /// reuse the cached fields on a match, re-parse on any mismatch. The
     /// accurate default (design spec §4).
     PerFile,
-    /// Dir-mtime + TTL hybrid (Task 4): skip per-file stats for a directory
-    /// whose `dir_mtime` hasn't moved and whose cache is still within TTL.
-    /// Not yet implemented — falls back to [`Freshness::PerFile`] until then.
+    /// Dir-mtime + TTL hybrid: for a directory whose on-disk `dir_mtime`
+    /// still matches the cached value AND whose cache is still within TTL,
+    /// reuse the whole cached directory verbatim without stat-ing any of its
+    /// files; otherwise fall back to the [`Freshness::PerFile`] check for
+    /// that directory only. A content-only edit that leaves the directory's
+    /// mtime unmoved is intentionally NOT picked up within the TTL window
+    /// (design spec §4) — a documented tradeoff for speed on large vaults.
     Fast,
     /// Trust the cache verbatim; no filesystem access at all. Erroring when
     /// no cache exists is the caller's responsibility.
@@ -345,6 +349,9 @@ pub fn scan_file(dir: &Path, path: &Path) -> ScanResult {
 /// (re)loaded/skipped, and whether the result differs from `cached` (so the
 /// caller knows whether it's worth persisting via [`save_cache`]).
 ///
+/// `ttl_secs` is only consulted by [`Freshness::Fast`] (it's the manifest's
+/// per-DB TTL setting — design spec §3); `PerFile`/`ForceCache` ignore it.
+///
 /// Timestamp bookkeeping alone (each `CachedDir`'s `scanned_at`, which
 /// always advances on a `PerFile`/`Fast` refresh) doesn't count toward
 /// "changed" — only actual directory/file membership, stats, or fields do.
@@ -353,12 +360,12 @@ pub fn refresh_against_cache(
     cached: &[CachedDir],
     opts: &WalkOpts,
     mode: Freshness,
+    ttl_secs: u64,
 ) -> (Vec<CachedDir>, LoadReport, bool) {
     match mode {
         Freshness::ForceCache => (cached.to_vec(), LoadReport::default(), false),
-        // TODO(Task 4): dir-mtime + TTL hybrid. `PerFile` is a correct,
-        // merely non-optimal, fallback until that lands.
-        Freshness::Fast | Freshness::PerFile => refresh_per_file(vault, cached, opts),
+        Freshness::PerFile => refresh_per_file(vault, cached, opts),
+        Freshness::Fast => refresh_fast(vault, cached, opts, ttl_secs),
     }
 }
 
@@ -454,6 +461,76 @@ fn stat_dir_mtime(dir: &Path, report: &mut LoadReport) -> SystemTime {
         })
 }
 
+/// The `--fast` freshness hybrid (see [`Freshness::Fast`]): reuses a cached
+/// directory wholesale — no per-file stats at all — when its on-disk
+/// `dir_mtime` still matches the cached value and it's still within
+/// `ttl_secs` of its last scan; otherwise falls back to [`refresh_one_file`]
+/// (the same per-file check [`refresh_per_file`] uses) for that directory's
+/// files only.
+fn refresh_fast(
+    vault: &Path,
+    cached: &[CachedDir],
+    opts: &WalkOpts,
+    ttl_secs: u64,
+) -> (Vec<CachedDir>, LoadReport, bool) {
+    let cached_by_dir: BTreeMap<PathBuf, &CachedDir> =
+        cached.iter().map(|dir| (dir.dir.clone(), dir)).collect();
+    let cached_by_path: BTreeMap<PathBuf, &CachedFile> = cached
+        .iter()
+        .flat_map(|cached_dir| {
+            cached_dir
+                .files
+                .iter()
+                .map(move |file| (cached_dir.dir.join(&file.rel_path), file))
+        })
+        .collect();
+
+    let mut paths_by_dir: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
+    for path in discover::discover(vault, opts) {
+        let dir = path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| vault.to_path_buf());
+        paths_by_dir.entry(dir).or_default().push(path);
+    }
+
+    let now = SystemTime::now();
+    let ttl = Duration::from_secs(ttl_secs);
+    let mut report = LoadReport::default();
+    let dirs: Vec<CachedDir> = paths_by_dir
+        .into_iter()
+        .map(|(dir, paths)| {
+            let current_mtime = stat_dir_mtime(&dir, &mut report);
+            if let Some(previous) = cached_by_dir.get(&dir)
+                && current_mtime == previous.dir_mtime
+                && now
+                    .duration_since(previous.scanned_at)
+                    .is_ok_and(|age| age <= ttl)
+            {
+                report.loaded += previous.files.len();
+                return (*previous).clone();
+            }
+
+            let files: Vec<CachedFile> = paths
+                .iter()
+                .filter_map(|path| {
+                    let previous = cached_by_path.get(path).copied();
+                    refresh_one_file(&dir, path, previous, &mut report)
+                })
+                .collect();
+            CachedDir {
+                dir,
+                scanned_at: now,
+                dir_mtime: current_mtime,
+                files,
+            }
+        })
+        .collect();
+
+    let changed = !content_equal(&dirs, cached);
+    (dirs, report, changed)
+}
+
 /// True when `a` and `b` contain the same directories with the same
 /// `dir_mtime`/`files`, ignoring each `CachedDir`'s `scanned_at` (which
 /// always advances on a `PerFile` refresh and carries no information about
@@ -496,6 +573,78 @@ pub fn records_from(root: &Path, dirs: &[CachedDir]) -> Vec<(PathBuf, Vec<Record
             (cached_dir.dir.clone(), records)
         })
         .collect()
+}
+
+/// The `querymatter init` core: a full scan of `base` (there is no previous
+/// cache to reuse against, so every matched file is read and parsed),
+/// grouped into [`CachedDir`]s and persisted via [`save_cache`] with the
+/// given `ttl_secs`. Returns a [`LoadReport`] summarizing what was
+/// loaded/skipped, so the caller can print an `init` summary.
+pub fn build_vault(base: &Path, opts: &WalkOpts, ttl_secs: u64) -> anyhow::Result<LoadReport> {
+    let (dirs, report, _changed) =
+        refresh_against_cache(base, &[], opts, Freshness::PerFile, ttl_secs);
+    save_cache(base, &dirs, ttl_secs)?;
+    Ok(report)
+}
+
+/// Forces a full re-scan (read + parse every matched file, ignoring every
+/// freshness shortcut) of the directories at or under `subtree`, replacing
+/// those entries of `cached` in place: a directory whose files have all
+/// disappeared is dropped, and a directory newly found under `subtree` is
+/// appended. Directories outside `subtree` are left untouched. The caller
+/// persists the result via [`save_cache`].
+pub fn refresh_subtree(
+    vault: &Path,
+    cached: &mut Vec<CachedDir>,
+    subtree: &Path,
+    opts: &WalkOpts,
+) -> LoadReport {
+    let mut report = LoadReport::default();
+    let now = SystemTime::now();
+
+    let mut by_dir: BTreeMap<PathBuf, Vec<CachedFile>> = BTreeMap::new();
+    for path in discover::discover(vault, opts) {
+        if !path.starts_with(subtree) {
+            continue;
+        }
+        let dir = path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| vault.to_path_buf());
+        // `previous: None` forces `refresh_one_file` straight to `scan_file`
+        // for every file, ignoring any cached (mtime, size) shortcut.
+        if let Some(file) = refresh_one_file(&dir, &path, None, &mut report) {
+            by_dir.entry(dir).or_default().push(file);
+        }
+    }
+
+    let refreshed: BTreeMap<PathBuf, CachedDir> = by_dir
+        .into_iter()
+        .map(|(dir, files)| {
+            let dir_mtime = stat_dir_mtime(&dir, &mut report);
+            let cached_dir = CachedDir {
+                dir: dir.clone(),
+                scanned_at: now,
+                dir_mtime,
+                files,
+            };
+            (dir, cached_dir)
+        })
+        .collect();
+
+    cached.retain(|dir| !dir.dir.starts_with(subtree) || refreshed.contains_key(&dir.dir));
+    for dir in cached.iter_mut() {
+        if let Some(fresh) = refreshed.get(&dir.dir) {
+            *dir = fresh.clone();
+        }
+    }
+    for (path, fresh) in refreshed {
+        if !cached.iter().any(|dir| dir.dir == path) {
+            cached.push(fresh);
+        }
+    }
+
+    report
 }
 
 #[cfg(test)]
@@ -696,7 +845,7 @@ mod tests {
     /// [`refresh_against_cache`] under test rather than a separate helper.
     fn build_initial_cache(vault: &Path) -> Vec<CachedDir> {
         let (dirs, _report, _changed) =
-            refresh_against_cache(vault, &[], &WalkOpts::default(), Freshness::PerFile);
+            refresh_against_cache(vault, &[], &WalkOpts::default(), Freshness::PerFile, 300);
         dirs
     }
 
@@ -743,8 +892,13 @@ mod tests {
         write_file(td.path(), "a.md", content_b);
         set_mtime(&a_path, original_mtime);
 
-        let (refreshed, report, _changed) =
-            refresh_against_cache(td.path(), &cached, &WalkOpts::default(), Freshness::PerFile);
+        let (refreshed, report, _changed) = refresh_against_cache(
+            td.path(),
+            &cached,
+            &WalkOpts::default(),
+            Freshness::PerFile,
+            300,
+        );
         assert_eq!(
             cached_status(&refreshed, "a.md"),
             Value::Str("draft".into()),
@@ -769,8 +923,13 @@ mod tests {
         write_file(td.path(), "a.md", content_b);
         set_mtime(&a_path, original_mtime + Duration::from_secs(120));
 
-        let (refreshed, report, _changed) =
-            refresh_against_cache(td.path(), &cached, &WalkOpts::default(), Freshness::PerFile);
+        let (refreshed, report, _changed) = refresh_against_cache(
+            td.path(),
+            &cached,
+            &WalkOpts::default(),
+            Freshness::PerFile,
+            300,
+        );
         assert_eq!(
             cached_status(&refreshed, "a.md"),
             Value::Str("final".into())
@@ -788,8 +947,13 @@ mod tests {
         fs::remove_file(td.path().join("a.md")).unwrap();
         write_file(td.path(), "b.md", "---\nstatus: draft\n---\n");
 
-        let (refreshed, _report, changed) =
-            refresh_against_cache(td.path(), &cached, &WalkOpts::default(), Freshness::PerFile);
+        let (refreshed, _report, changed) = refresh_against_cache(
+            td.path(),
+            &cached,
+            &WalkOpts::default(),
+            Freshness::PerFile,
+            300,
+        );
         assert_eq!(all_rel_paths(&refreshed), vec!["b.md".to_string()]);
         assert!(changed, "adding/removing a file must count as changed");
     }
@@ -807,6 +971,7 @@ mod tests {
             &cached,
             &WalkOpts::default(),
             Freshness::ForceCache,
+            300,
         );
         assert_eq!(
             cached_status(&refreshed, "a.md"),
@@ -820,28 +985,129 @@ mod tests {
     }
 
     #[test]
-    fn fast_falls_back_to_per_file_for_now() {
-        // Pins today's documented behavior (Task 3): until Task 4 lands the
-        // dir-mtime + TTL hybrid, `Fast` must behave exactly like `PerFile`.
+    fn fast_skips_dir_with_unchanged_mtime_within_ttl() {
         let td = TempDir::new().unwrap();
-        let a_path = td.path().join("a.md");
-        let content_a = "---\nstatus: draft\n---\n";
-        write_file(td.path(), "a.md", content_a);
-        let original_mtime = fs::metadata(&a_path).unwrap().modified().unwrap();
+        write_file(td.path(), "a.md", "---\nstatus: draft\n---\n");
 
-        let cached = build_initial_cache(td.path());
+        let mut cached = build_initial_cache(td.path());
+        assert_eq!(cached_status(&cached, "a.md"), Value::Str("draft".into()));
 
-        let content_b = "---\nstatus: final\n---\n";
-        assert_eq!(content_a.len(), content_b.len());
-        write_file(td.path(), "a.md", content_b);
-        set_mtime(&a_path, original_mtime + Duration::from_secs(120));
+        // Edit the file's CONTENT only (write in place; nothing is added or
+        // removed). A content-only edit shouldn't move the *directory's*
+        // mtime, but rather than depend on that holding across every
+        // platform/filesystem, explicitly pin the cached `dir_mtime` to
+        // whatever the directory's real on-disk mtime is right now — that
+        // makes the "unchanged" branch deterministic regardless of whether
+        // this edit happened to bump it.
+        write_file(td.path(), "a.md", "---\nstatus: final\n---\n");
+        let dir_mtime_now = fs::metadata(td.path()).unwrap().modified().unwrap();
+        for dir in &mut cached {
+            dir.dir_mtime = dir_mtime_now;
+        }
 
-        let (refreshed, _report, _changed) =
-            refresh_against_cache(td.path(), &cached, &WalkOpts::default(), Freshness::Fast);
+        let (refreshed, report, changed) = refresh_against_cache(
+            td.path(),
+            &cached,
+            &WalkOpts::default(),
+            Freshness::Fast,
+            300,
+        );
+
         assert_eq!(
             cached_status(&refreshed, "a.md"),
-            Value::Str("final".into())
+            Value::Str("draft".into()),
+            "Fast must reuse the stale cached value within TTL, proving it skipped stat-ing files"
         );
+        assert_eq!(report.loaded, 1);
+        assert_eq!(report.skipped, 0);
+        assert!(
+            !changed,
+            "an unchanged dir_mtime within TTL must reuse the CachedDir verbatim"
+        );
+    }
+
+    #[test]
+    fn fast_rescans_dir_when_mtime_moved() {
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "a.md", "---\nstatus: draft\n---\n");
+        let cached = build_initial_cache(td.path());
+        assert_eq!(all_rel_paths(&cached), vec!["a.md".to_string()]);
+
+        // Adding a file reliably bumps the directory's mtime, so Fast must
+        // fall back to a per-file re-scan for this directory even though
+        // it's well within TTL.
+        write_file(td.path(), "b.md", "---\nstatus: draft\n---\n");
+
+        let (refreshed, report, changed) = refresh_against_cache(
+            td.path(),
+            &cached,
+            &WalkOpts::default(),
+            Freshness::Fast,
+            300,
+        );
+
+        assert_eq!(
+            all_rel_paths(&refreshed),
+            vec!["a.md".to_string(), "b.md".to_string()],
+            "Fast must pick up the new file once dir_mtime has moved"
+        );
+        assert_eq!(report.loaded, 2);
+        assert_eq!(report.skipped, 0);
+        assert!(changed, "a newly added file must count as changed");
+    }
+
+    #[test]
+    fn build_vault_writes_a_loadable_cache() {
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "plans/a.md", "---\nstatus: draft\n---\n");
+        write_file(td.path(), "product/b.md", "---\nstatus: shipped\n---\n");
+
+        let report = build_vault(td.path(), &WalkOpts::default(), 300).unwrap();
+        assert_eq!(report.loaded, 2);
+        assert_eq!(report.skipped, 0);
+
+        let (body, loaded) = load_cache(td.path()).unwrap();
+        assert_eq!(body.ttl_secs, 300);
+        assert_eq!(
+            all_rel_paths(&loaded),
+            vec!["a.md".to_string(), "b.md".to_string()]
+        );
+        assert_eq!(cached_status(&loaded, "a.md"), Value::Str("draft".into()));
+        assert_eq!(cached_status(&loaded, "b.md"), Value::Str("shipped".into()));
+    }
+
+    #[test]
+    fn refresh_subtree_reparses_only_that_subtree() {
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "plans/a.md", "---\nstatus: draft\n---\n");
+        write_file(td.path(), "product/b.md", "---\nstatus: draft\n---\n");
+
+        let mut cached = build_initial_cache(td.path());
+        assert_eq!(cached_status(&cached, "a.md"), Value::Str("draft".into()));
+        assert_eq!(cached_status(&cached, "b.md"), Value::Str("draft".into()));
+
+        write_file(td.path(), "plans/a.md", "---\nstatus: final\n---\n");
+        write_file(td.path(), "product/b.md", "---\nstatus: final\n---\n");
+
+        let report = refresh_subtree(
+            td.path(),
+            &mut cached,
+            &td.path().join("plans"),
+            &WalkOpts::default(),
+        );
+
+        assert_eq!(
+            cached_status(&cached, "a.md"),
+            Value::Str("final".into()),
+            "plans/ was refreshed"
+        );
+        assert_eq!(
+            cached_status(&cached, "b.md"),
+            Value::Str("draft".into()),
+            "product/ must be untouched by a refresh scoped to plans/"
+        );
+        assert_eq!(report.loaded, 1);
+        assert_eq!(report.skipped, 0);
     }
 
     #[test]
