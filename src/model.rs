@@ -145,7 +145,12 @@ impl Record {
         Value::Str(s.clone())
     }
 
-    /// The frontmatter field names, in their original (insertion) order.
+    /// The frontmatter field names for this record.
+    ///
+    /// Order follows the underlying `IndexMap`, i.e. the order `gray_matter`'s
+    /// YAML engine handed back the keys (effectively unordered — not
+    /// necessarily source order). Callers that need a deterministic column
+    /// order — `SELECT *` and `.schema` — sort the union themselves.
     pub fn field_names(&self) -> impl Iterator<Item = &str> {
         self.fields.keys().map(String::as_str)
     }

@@ -55,6 +55,9 @@ pub enum DotCommand {
     Reload,
     /// `.quit` / `.exit` — leave the REPL.
     Quit,
+    /// `.format <name>` where `<name>` is not a known [`Format`], carrying the
+    /// offending name so the error can name the format rather than the command.
+    BadFormat(String),
     /// Any other `.`-prefixed line, carried verbatim for the error message.
     Unknown(String),
 }
@@ -112,9 +115,10 @@ impl LineBuffer {
 
 /// Parses a `.`-prefixed line into a [`DotCommand`].
 ///
-/// An unrecognized command name, or a `.format` argument that isn't a known
-/// [`Format`], both fall back to [`DotCommand::Unknown`] carrying the whole
-/// original line.
+/// An unrecognized command name falls back to [`DotCommand::Unknown`] carrying
+/// the whole original line; a recognized `.format` with an unknown format name
+/// becomes [`DotCommand::BadFormat`] carrying just that name, so the error can
+/// name the format rather than imply `.format` itself is unknown.
 pub fn parse_dot(line: &str) -> DotCommand {
     let rest = line.strip_prefix('.').unwrap_or(line);
     let mut words = rest.split_whitespace();
@@ -128,7 +132,7 @@ pub fn parse_dot(line: &str) -> DotCommand {
             None => DotCommand::Format(None),
             Some(arg) => match arg.parse() {
                 Ok(fmt) => DotCommand::Format(Some(fmt)),
-                Err(_) => DotCommand::Unknown(line.to_string()),
+                Err(_) => DotCommand::BadFormat(arg.to_string()),
             },
         },
         _ => DotCommand::Unknown(line.to_string()),
@@ -197,6 +201,11 @@ pub fn run(mut session: Session) -> anyhow::Result<()> {
 
 /// Runs one dot-command against `session`, returning `true` when the REPL
 /// should exit (`.quit`/`.exit`).
+///
+/// stdout/stderr policy: reference/inspection output (`.help`, `.schema`, and
+/// `.format`'s report of the current format) goes to stdout; the `.reload`
+/// report and all error messages (unknown command, bad format) go to stderr,
+/// keeping stdout clean for piping.
 fn dispatch_dot(cmd: DotCommand, session: &mut Session) -> bool {
     match cmd {
         DotCommand::Help => print_help(),
@@ -205,6 +214,9 @@ fn dispatch_dot(cmd: DotCommand, session: &mut Session) -> bool {
         DotCommand::Format(None) => println!("format: {}", format_name(session.format)),
         DotCommand::Reload => report_reload(session),
         DotCommand::Quit => return true,
+        DotCommand::BadFormat(name) => {
+            eprintln!("querymatter: unknown format '{name}' (try: table, json, csv, tsv, md)");
+        }
         DotCommand::Unknown(raw) => {
             eprintln!("querymatter: unknown command {raw:?} (try .help)");
         }
@@ -334,6 +346,45 @@ mod tests {
     fn blank_line_is_blank() {
         let mut b = LineBuffer::new();
         assert!(matches!(b.push("   "), Line::Blank));
+    }
+    #[test]
+    fn dot_line_midstatement_is_statement_text_not_dot() {
+        // The `.`-prefix is only a dot-command with an EMPTY buffer; once a
+        // statement is accumulating, a `.`-line is ordinary statement text.
+        let mut b = LineBuffer::new();
+        assert!(matches!(b.push("SELECT status"), Line::More));
+        assert!(
+            matches!(b.push(".schema"), Line::More),
+            ".schema mid-statement must accumulate, not dispatch as Line::Dot"
+        );
+        match b.push(";") {
+            Line::Statement(s) => assert_eq!(s, "SELECT status\n.schema"),
+            other => panic!("expected the accumulated Statement, got {other:?}"),
+        }
+    }
+    #[test]
+    fn blank_line_midstatement_is_more_not_blank() {
+        // A blank/whitespace line only resets to Line::Blank with an empty
+        // buffer; mid-statement it keeps accumulating as Line::More.
+        let mut b = LineBuffer::new();
+        assert!(matches!(b.push("SELECT status"), Line::More));
+        assert!(
+            matches!(b.push("   "), Line::More),
+            "a blank line mid-statement must be Line::More, not Line::Blank"
+        );
+        match b.push("WHERE prd = '010';") {
+            Line::Statement(s) => assert_eq!(s, "SELECT status\n   \nWHERE prd = '010'"),
+            other => panic!("expected the accumulated Statement, got {other:?}"),
+        }
+    }
+    #[test]
+    fn bad_format_arg_is_bad_format_not_unknown_command() {
+        // A known `.format` with an unknown name is BadFormat (which the
+        // dispatcher reports as an unknown *format*), not an unknown command.
+        match parse_dot(".format bogus") {
+            DotCommand::BadFormat(name) => assert_eq!(name, "bogus"),
+            other => panic!("expected BadFormat, got {other:?}"),
+        }
     }
     #[test]
     fn dot_commands_parse() {

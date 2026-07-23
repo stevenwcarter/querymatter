@@ -49,7 +49,7 @@ SELECT cols [AS alias] [FROM 'glob'] [WHERE ...] [GROUP BY ...] [ORDER BY ... [A
 ```
 
 - **SELECT** — frontmatter field names, `file.*` pseudo-columns (below), `*`
-  (every frontmatter key seen, first-seen order), or an aggregate:
+  (every frontmatter key seen, in sorted (alphabetical) order), or an aggregate:
   `count(*)`, `count(col)`, `count(distinct col)`, `min`, `max`, `sum`, `avg`,
   `group_concat`. Any item may take `AS <alias>` to rename its output header.
 - **FROM** — optional; when present its value is a path glob applied within
@@ -130,6 +130,11 @@ runs it.
 - **Unquoted leading-zero YAML values parse as integers.** `prd: 010` loads
   as the integer `10`, not the string `"010"` — quote it (`prd: '010'`) if
   you need it to stay a string.
+- **Overlapping scan roots.** Exact-duplicate directory arguments are
+  de-duplicated after canonicalization, so `querymatter . .` scans once. A
+  root that *contains* another (e.g. `querymatter . ./plans`) is not yet
+  detected, so files under the nested root are scanned — and counted — twice;
+  pass non-overlapping roots to avoid it.
 
 ## Design & roadmap
 

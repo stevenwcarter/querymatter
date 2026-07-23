@@ -72,12 +72,19 @@ impl Cli {
         } else {
             self.dirs.clone()
         };
-        raw.into_iter()
-            .map(|dir| {
-                fs::canonicalize(&dir)
-                    .with_context(|| format!("cannot access directory {}", dir.display()))
-            })
-            .collect()
+        let mut roots = Vec::with_capacity(raw.len());
+        for dir in raw {
+            let canonical = fs::canonicalize(&dir)
+                .with_context(|| format!("cannot access directory {}", dir.display()))?;
+            // Dedup exact-equal canonical roots so `querymatter . ./plans`
+            // (both resolving to the same directory) doesn't scan it twice and
+            // double every count. Overlapping-but-unequal roots — a parent and
+            // its descendant — are left as-is (see the README caveat).
+            if !roots.contains(&canonical) {
+                roots.push(canonical);
+            }
+        }
+        Ok(roots)
     }
 
     /// Rejects any `--exclude` glob that `globset` cannot compile, naming the
@@ -88,5 +95,24 @@ impl Cli {
             Glob::new(pat).with_context(|| format!("invalid --exclude glob {pat:?}"))?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::Parser;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn resolved_roots_dedups_exact_duplicate_dirs() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        // The same directory passed twice must collapse to a single canonical
+        // root, so counts aren't doubled.
+        let cli = Cli::parse_from(["querymatter", path, path]);
+        let roots = cli.resolved_roots().unwrap();
+        assert_eq!(roots, vec![fs::canonicalize(dir.path()).unwrap()]);
     }
 }

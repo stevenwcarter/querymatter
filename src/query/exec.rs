@@ -73,7 +73,10 @@ fn filter_records<'a>(
     Ok(candidates
         .into_iter()
         .filter(|record| match &q.filter {
-            Some(pred) => eval_predicate(record, pred),
+            // SQL 3VL: a row is kept only when the predicate is definitely
+            // true; both `Some(false)` and `None` (unknown, i.e. a NULL was
+            // involved) exclude it.
+            Some(pred) => eval_predicate(record, pred) == Some(true),
             None => true,
         })
         .collect())
@@ -436,35 +439,91 @@ fn resolve_col(record: &Record, col: &ColRef) -> Value {
     }
 }
 
-/// Evaluates a `WHERE` predicate tree against a single record.
-fn eval_predicate(record: &Record, pred: &Predicate) -> bool {
+/// Evaluates a `WHERE` predicate tree against a single record under SQL
+/// three-valued logic (3VL): `Some(true)` / `Some(false)` / `None`, where
+/// `None` means "unknown" — a NULL field value was involved.
+///
+/// A `WHERE` keeps a row only when this is `Some(true)` (see
+/// [`filter_records`]); both `Some(false)` and `None` exclude it. Threading
+/// the unknown through negation is what makes `status NOT IN (...)`,
+/// `status NOT LIKE ...`, and `NOT (status = ...)` all EXCLUDE a NULL-`status`
+/// row — matching the plain-`Compare` path and the spec's "any comparison
+/// where a side is Null yields 'not true'" rule (§4). Only `IS NULL` /
+/// `IS NOT NULL` are ever determinate for a NULL field.
+fn eval_predicate(record: &Record, pred: &Predicate) -> Option<bool> {
     match pred {
         Predicate::Compare(col, op, lit) => eval_compare(&resolve_col(record, col), op, lit),
         Predicate::Like(col, pattern, negated) => {
             let value = resolve_col(record, col);
-            let matched = !value.is_null() && like_matches(&value.to_cmp_string(), pattern);
-            matched != *negated
+            if value.is_null() {
+                return None;
+            }
+            let base = Some(like_matches(&value.to_cmp_string(), pattern));
+            maybe_negate(base, *negated)
         }
         Predicate::In(col, literals, negated) => {
             let value = resolve_col(record, col);
-            let matched = literals
-                .iter()
-                .any(|lit| eval_compare(&value, &CmpOp::Eq, lit));
-            matched != *negated
+            if value.is_null() {
+                return None;
+            }
+            let base = Some(
+                literals
+                    .iter()
+                    .any(|lit| eval_compare(&value, &CmpOp::Eq, lit) == Some(true)),
+            );
+            maybe_negate(base, *negated)
         }
-        Predicate::IsNull(col, negated) => resolve_col(record, col).is_null() != *negated,
-        Predicate::And(a, b) => eval_predicate(record, a) && eval_predicate(record, b),
-        Predicate::Or(a, b) => eval_predicate(record, a) || eval_predicate(record, b),
-        Predicate::Not(inner) => !eval_predicate(record, inner),
+        // The only predicate that is determinate — and true — for a NULL field.
+        Predicate::IsNull(col, negated) => Some(resolve_col(record, col).is_null() != *negated),
+        Predicate::And(a, b) => {
+            three_valued_and(eval_predicate(record, a), eval_predicate(record, b))
+        }
+        Predicate::Or(a, b) => {
+            three_valued_or(eval_predicate(record, a), eval_predicate(record, b))
+        }
+        Predicate::Not(inner) => three_valued_not(eval_predicate(record, inner)),
     }
 }
 
-/// Compares `value` against a literal per the coercion rule: a string literal
-/// compares `to_cmp_string()`; a numeric literal requires `value` to also be
-/// numeric; a `Null` value (or `NULL` literal) never compares equal/ordered.
-fn eval_compare(value: &Value, op: &CmpOp, lit: &Literal) -> bool {
+/// Applies the 3VL `NOT` to `v` when `negated`, else returns it unchanged.
+fn maybe_negate(v: Option<bool>, negated: bool) -> Option<bool> {
+    if negated { three_valued_not(v) } else { v }
+}
+
+/// SQL 3VL `NOT`: `NOT unknown` stays unknown.
+fn three_valued_not(v: Option<bool>) -> Option<bool> {
+    v.map(|b| !b)
+}
+
+/// SQL 3VL `AND`: `false` dominates, then unknown, then `true`.
+fn three_valued_and(a: Option<bool>, b: Option<bool>) -> Option<bool> {
+    match (a, b) {
+        (Some(false), _) | (_, Some(false)) => Some(false),
+        (Some(true), Some(true)) => Some(true),
+        _ => None,
+    }
+}
+
+/// SQL 3VL `OR`: `true` dominates, then unknown, then `false`.
+fn three_valued_or(a: Option<bool>, b: Option<bool>) -> Option<bool> {
+    match (a, b) {
+        (Some(true), _) | (_, Some(true)) => Some(true),
+        (Some(false), Some(false)) => Some(false),
+        _ => None,
+    }
+}
+
+/// Compares `value` against a literal per the coercion rule, under 3VL.
+///
+/// A NULL `value` yields `None` (unknown) — the only source of unknown here.
+/// Otherwise the result is always `Some(_)`: a string literal compares
+/// `to_cmp_string()`; a numeric literal requires `value` to also be numeric;
+/// a non-null value that can't be coerced/ordered against the literal (a
+/// numeric literal vs a non-numeric value, or a `NULL` literal) fails the
+/// predicate as `Some(false)`, per the spec's "the row fails the predicate".
+fn eval_compare(value: &Value, op: &CmpOp, lit: &Literal) -> Option<bool> {
     if value.is_null() {
-        return false;
+        return None;
     }
     let ordering = match lit {
         Literal::Str(s) => Some(value.to_cmp_string().cmp(s)),
@@ -475,7 +534,7 @@ fn eval_compare(value: &Value, op: &CmpOp, lit: &Literal) -> bool {
         Literal::Bool(b) => compare_values(value, &Value::Bool(*b)),
         Literal::Null => None,
     };
-    ordering.is_some_and(|ord| apply_cmp(op, ord))
+    Some(ordering.is_some_and(|ord| apply_cmp(op, ord)))
 }
 
 /// The `f64` value of an `Int`/`Float` literal, or `None` for other kinds.
@@ -647,6 +706,94 @@ mod tests {
         let q2 = parse("SELECT status WHERE prd IN ('011')").unwrap();
         assert_eq!(execute(&q2, recs().iter()).unwrap().rows.len(), 1);
     }
+    /// Records for the 3VL / NULL-under-negation tests (Fix 1): two carry a
+    /// `status`, one has none — so `status` resolves to `Value::Null` on it.
+    fn recs_with_null_status() -> Vec<Record> {
+        vec![
+            rec("s", "s/a.md", &[("status", Value::Str("draft".into()))]),
+            rec("s", "s/b.md", &[("status", Value::Str("synced".into()))]),
+            rec("s", "s/c.md", &[("prd", Value::Str("011".into()))]),
+        ]
+    }
+
+    #[test]
+    fn not_in_excludes_null_field_row() {
+        // 'synced' passes; 'draft' fails; the status-less row is UNKNOWN under
+        // 3VL, so `NOT IN` must NOT resurrect it (the pre-3VL bug did).
+        let all = recs_with_null_status();
+        let q = parse("SELECT file.name WHERE status NOT IN ('draft')").unwrap();
+        let t = execute(&q, all.iter()).unwrap();
+        assert_eq!(t.rows, vec![vec![Value::Str("b.md".into())]]);
+    }
+    #[test]
+    fn not_like_excludes_null_field_row() {
+        let all = recs_with_null_status();
+        let q = parse("SELECT file.name WHERE status NOT LIKE 'dr%'").unwrap();
+        let t = execute(&q, all.iter()).unwrap();
+        assert_eq!(t.rows, vec![vec![Value::Str("b.md".into())]]);
+    }
+    #[test]
+    fn not_paren_compare_excludes_null_field_row() {
+        let all = recs_with_null_status();
+        let q = parse("SELECT file.name WHERE NOT (status = 'draft')").unwrap();
+        let t = execute(&q, all.iter()).unwrap();
+        assert_eq!(t.rows, vec![vec![Value::Str("b.md".into())]]);
+    }
+    #[test]
+    fn is_null_and_is_not_null_partition_on_null_field() {
+        let all = recs_with_null_status();
+        let is_null = parse("SELECT file.name WHERE status IS NULL").unwrap();
+        assert_eq!(
+            execute(&is_null, all.iter()).unwrap().rows,
+            vec![vec![Value::Str("c.md".into())]],
+            "IS NULL selects only the status-less row"
+        );
+        let not_null = parse("SELECT file.name WHERE status IS NOT NULL").unwrap();
+        assert_eq!(
+            execute(&not_null, all.iter()).unwrap().rows,
+            vec![
+                vec![Value::Str("a.md".into())],
+                vec![Value::Str("b.md".into())],
+            ],
+            "IS NOT NULL excludes the status-less row"
+        );
+    }
+    #[test]
+    fn ne_and_not_paren_agree_on_null_field() {
+        // `status != 'draft'` and `NOT (status = 'draft')` must agree under 3VL:
+        // both exclude the status-less (NULL) row and both keep 'synced'.
+        let all = recs_with_null_status();
+        let ne = execute(
+            &parse("SELECT file.name WHERE status != 'draft'").unwrap(),
+            all.iter(),
+        )
+        .unwrap();
+        let not_paren = execute(
+            &parse("SELECT file.name WHERE NOT (status = 'draft')").unwrap(),
+            all.iter(),
+        )
+        .unwrap();
+        assert_eq!(ne.rows, not_paren.rows);
+        assert_eq!(ne.rows, vec![vec![Value::Str("b.md".into())]]);
+    }
+    #[test]
+    fn where_numeric_compare_coerces_and_is_numeric() {
+        // Fix 2 / spec §10: pin the WHERE numeric-coercion funnel. `n > 2`
+        // compares numerically, and a numeric string ("5") coerces, so Int(3)
+        // and Str("5") pass while Int(1) fails.
+        let rows = [
+            rec("s", "s/a.md", &[("n", Value::Int(1))]),
+            rec("s", "s/b.md", &[("n", Value::Int(3))]),
+            rec("s", "s/c.md", &[("n", Value::Str("5".into()))]),
+        ];
+        let q = parse("SELECT n WHERE n > 2").unwrap();
+        let t = execute(&q, rows.iter()).unwrap();
+        assert_eq!(
+            t.rows,
+            vec![vec![Value::Int(3)], vec![Value::Str("5".into())]]
+        );
+    }
+
     #[test]
     fn null_field_sorts_last_asc_and_desc() {
         // One record is missing `status` entirely, so ORDER BY status must

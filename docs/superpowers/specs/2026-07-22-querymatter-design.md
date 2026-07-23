@@ -77,7 +77,8 @@ small hand-written interpreter. Supported clauses:
   - a frontmatter field name (`status`, `jira`, `prd`, …)
   - a `file.*` pseudo-column: `file.name`, `file.path`, `file.folder`, `file.ext` (see §4)
   - `*` — expands to the union of all frontmatter keys seen across the loaded
-    records, in first-seen order (does **not** include `file.*` pseudo-columns)
+    records, in sorted (alphabetical) order (does **not** include `file.*`
+    pseudo-columns)
   - an aggregate: `COUNT(*)`, `COUNT(<col>)`, `COUNT(DISTINCT <col>)`,
     `MIN(<col>)`, `MAX(<col>)`, `SUM(<col>)`, `AVG(<col>)`, `GROUP_CONCAT(<col>)`
   - `AS <alias>` sets the column header used in every output format.

@@ -1,17 +1,15 @@
 //! Lowering from a SQL string to the querymatter [`Query`] AST.
 //!
-//! Parsing is **parse-first, regex-fallback**. The original SQL is handed to
-//! `sqlparser` (under the [`GenericDialect`]) untouched, and the resulting
-//! parse tree is lowered node-by-node into the [`Query`] AST. `FROM` is
-//! optional: sqlparser accepts both a bare identifier (`FROM plans`) and a
+//! The SQL is handed to `sqlparser` (under the [`GenericDialect`]) and the
+//! resulting parse tree is lowered node-by-node into the [`Query`] AST. `FROM`
+//! is optional: sqlparser accepts both a bare identifier (`FROM plans`) and a
 //! quoted glob (`FROM 'plans/**'`, parsed as a quoted-identifier table), and
-//! either form is read back from the table name.
+//! either form is read straight back from the table name by [`lower_from`].
 //!
-//! Handing the raw SQL to sqlparser first is deliberate: a regex pre-strip of
-//! `FROM '<glob>'` would corrupt string literals that merely *contain* the
-//! word `from` followed by a quote (e.g. `WHERE title = 'imported from "x"'`).
-//! The [`FROM_GLOB`] regex is used only as a fallback, when the initial parse
-//! fails and stripping the first quoted `FROM` lets the remainder parse.
+//! The raw SQL is never pre-processed, so a string literal that merely
+//! *contains* the word `from` followed by a quote (e.g.
+//! `WHERE title = 'imported from "x"'`) is passed through the real parser
+//! untouched and never corrupted.
 //!
 //! Anything outside the supported subset — joins, subqueries, `HAVING`,
 //! whole-query `DISTINCT`, set operations, multiple statements, any clause that
@@ -19,8 +17,6 @@
 //! lowering does not understand — is rejected with a [`ParseError`] rather than
 //! silently ignored.
 
-use once_cell::sync::Lazy;
-use regex::Regex;
 use sqlparser::ast as sql;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -47,71 +43,27 @@ pub enum ParseError {
     BadColumn(String),
 }
 
-/// Matches an optional quoted `FROM` glob. Group 1 is the whole quoted token;
-/// groups 2 and 3 are the single- and double-quoted inner contents.
-static FROM_GLOB: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"(?i)\bfrom\s+('([^']*)'|"([^"]*)")"#).expect("valid FROM regex"));
-
 /// Parses `sql` into a [`Query`], rejecting anything outside the supported
 /// subset with a descriptive [`ParseError`].
-///
-/// The original SQL is parsed first, untouched, so string literals are never
-/// corrupted. Only if that parse fails do we fall back to stripping the first
-/// quoted `FROM '<glob>'` and re-parsing the remainder — this recovers any
-/// quoted-glob form a future dialect might reject at the table position,
-/// without ever running the regex over SQL that already parses.
 pub fn parse(sql: &str) -> Result<Query, ParseError> {
-    match Parser::parse_sql(&GenericDialect, sql) {
-        Ok(statements) => lower_parsed(&statements, None),
-        Err(first_err) => {
-            if let Some((rest, glob)) = strip_first_quoted_from(sql)
-                && let Ok(statements) = Parser::parse_sql(&GenericDialect, &rest)
-            {
-                return lower_parsed(&statements, Some(glob));
-            }
-            Err(ParseError::Sql(first_err.to_string()))
-        }
-    }
+    let statements =
+        Parser::parse_sql(&GenericDialect, sql).map_err(|err| ParseError::Sql(err.to_string()))?;
+    lower_parsed(&statements)
 }
 
 /// Validates that `statements` is exactly one `SELECT` query and lowers it.
-///
-/// `quoted_glob`, when `Some`, is a glob recovered by the regex fallback and
-/// takes precedence over any table name in the parsed `FROM`.
-fn lower_parsed(
-    statements: &[sql::Statement],
-    quoted_glob: Option<String>,
-) -> Result<Query, ParseError> {
+fn lower_parsed(statements: &[sql::Statement]) -> Result<Query, ParseError> {
     let [statement] = statements else {
         return Err(unsupported("expected exactly one SQL statement"));
     };
     let sql::Statement::Query(query) = statement else {
         return Err(unsupported("only SELECT queries are supported"));
     };
-    lower_query(query, quoted_glob)
-}
-
-/// Strips the first quoted `FROM '<glob>'` clause, returning the remaining SQL
-/// (with that clause replaced by a space) and the captured glob. Returns `None`
-/// when no quoted `FROM` is present. The first match is the real `FROM`, since
-/// `FROM` precedes `WHERE`.
-fn strip_first_quoted_from(sql: &str) -> Option<(String, String)> {
-    let caps = FROM_GLOB.captures(sql)?;
-    let glob = caps.get(2).or_else(|| caps.get(3))?.as_str().to_string();
-    let whole = caps.get(0)?;
-    let mut rest = String::with_capacity(sql.len());
-    rest.push_str(&sql[..whole.start()]);
-    rest.push(' ');
-    rest.push_str(&sql[whole.end()..]);
-    Some((rest, glob))
+    lower_query(query)
 }
 
 /// Lowers a `sqlparser` query into the querymatter [`Query`] AST.
-///
-/// `quoted_glob` is the glob recovered by [`strip_first_quoted_from`] in the
-/// fallback path; when present it takes precedence over any table name in the
-/// parsed `FROM`.
-fn lower_query(query: &sql::Query, quoted_glob: Option<String>) -> Result<Query, ParseError> {
+fn lower_query(query: &sql::Query) -> Result<Query, ParseError> {
     reject_unsupported_query_clauses(query)?;
 
     let select = match query.body.as_ref() {
@@ -124,10 +76,7 @@ fn lower_query(query: &sql::Query, quoted_glob: Option<String>) -> Result<Query,
 
     reject_unsupported_select_clauses(select)?;
 
-    let from_glob = match quoted_glob {
-        Some(glob) => Some(glob),
-        None => lower_from(&select.from)?,
-    };
+    let from_glob = lower_from(&select.from)?;
 
     let select_items = select
         .projection
@@ -806,8 +755,8 @@ mod tests {
 
     #[test]
     fn where_literal_with_from_lookalike_is_not_corrupted() {
-        // Parse-first must not let the FROM-glob regex mangle a string literal
-        // that merely contains `from "..."`.
+        // The real parser must not corrupt a string literal that merely
+        // contains `from "..."`; there is no raw-SQL pre-strip to fool.
         let q = parse("SELECT jira WHERE title = 'imported from \"archive\"'").unwrap();
         assert_eq!(q.from_glob, None);
         assert_eq!(
@@ -818,23 +767,6 @@ mod tests {
                 Literal::Str("imported from \"archive\"".into())
             ))
         );
-    }
-
-    #[test]
-    fn strip_first_quoted_from_captures_first_match() {
-        // The regex fallback strips the first quoted FROM (which precedes WHERE)
-        // and captures its glob, single- or double-quoted.
-        let (rest, glob) = strip_first_quoted_from("SELECT jira FROM 'plans/**' WHERE x = 'y'")
-            .expect("quoted FROM present");
-        assert_eq!(glob, "plans/**");
-        assert!(!rest.contains("plans/**"));
-        assert!(rest.contains("WHERE x = 'y'"));
-
-        let (_, glob) =
-            strip_first_quoted_from("select a from \"docs/*\"").expect("quoted FROM present");
-        assert_eq!(glob, "docs/*");
-
-        assert!(strip_first_quoted_from("SELECT jira FROM plans").is_none());
     }
 
     #[test]
