@@ -100,12 +100,14 @@ small hand-written interpreter. Supported clauses:
 - **LIMIT `<n>` [OFFSET `<m>`]**.
 
 ### FROM-less parsing note (implementation)
-`sqlparser` generally requires a `FROM` in a `SELECT`. The parse layer
-normalizes a user query that omits `FROM` (and one that supplies our glob form)
-before/at parse time — e.g. by injecting a synthetic single-table `FROM` token
-so the grammar accepts it, then discarding it during lowering. The synthetic
-table name is an internal detail and never surfaces to the user. This must be
-covered by a parser test for each of: no FROM, `FROM '<glob>'`, `FROM ident`.
+With the `GenericDialect`, `sqlparser` 0.62 accepts a `SELECT` with no `FROM`
+(including one that carries `WHERE`/`GROUP BY`) natively, and parses a quoted
+`FROM '<glob>'` as a quoted-identifier table — so **no** synthetic-`FROM`
+injection and **no** raw-SQL regex are needed. `parse()` hands the SQL straight
+to `sqlparser`; the optional FROM target (quoted glob or bare identifier) is
+read from the parsed AST during lowering. Covered by parser tests for: no FROM,
+`FROM '<glob>'`, `FROM ident`. (An earlier design assumed a synthetic-FROM /
+regex-strip approach; the native behavior made both unnecessary.)
 
 ### Example queries
 ```sql
@@ -126,7 +128,9 @@ SELECT epic, group_concat(jira) AS keys GROUP BY epic
 
 ### Record
 Each Markdown file **that has a frontmatter block** becomes one `Record`:
-- an **order-preserving map** `field name → Value` from the YAML frontmatter, and
+- a map `field name → Value` from the YAML frontmatter (per-record field order
+  follows `gray_matter`'s unordered map, so `SELECT *` and `.schema` sort field
+  names alphabetically for determinism), and
 - file metadata backing the `file.*` pseudo-columns.
 
 A file with **no frontmatter block is skipped** — it is not emitted as an
