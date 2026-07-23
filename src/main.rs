@@ -1,3 +1,4 @@
+pub mod frontmatter;
 pub mod model;
 
 fn main() {

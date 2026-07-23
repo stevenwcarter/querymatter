@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+gray_matter = "0.3.2"
 indexmap = "2.14.0"
 thiserror = "2.0.19"
 
