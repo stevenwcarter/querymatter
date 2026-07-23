@@ -427,6 +427,51 @@ fn refresh_relative_path_reparses_and_defeats_stale_cache() {
 }
 
 #[test]
+fn refresh_all_forces_full_rescan_despite_unchanged_mtime_and_size() {
+    // FIX 1: `--refresh-all` must force a full re-scan of the whole vault,
+    // ignoring every per-file freshness shortcut (README: "force a full
+    // re-scan, ignoring every freshness shortcut"). Editing content to an
+    // equal-byte-length value ("draft" -> "ready") and restoring the original
+    // mtime makes (mtime, size) indistinguishable from the cached entry, so
+    // the default incremental refresh would reuse the stale "draft"; only a
+    // forced re-scan surfaces "ready".
+    use std::fs::File;
+    let td = TempDir::new().unwrap();
+    let a = td.path().join("a.md");
+    fs::write(&a, "---\nstatus: draft\n---\n").unwrap();
+    let original_mtime = fs::metadata(&a).unwrap().modified().unwrap();
+
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .arg("init")
+        .arg(td.path())
+        .assert()
+        .success();
+
+    fs::write(&a, "---\nstatus: ready\n---\n").unwrap();
+    File::open(&a)
+        .unwrap()
+        .set_modified(original_mtime)
+        .unwrap();
+
+    let out = Command::cargo_bin("querymatter")
+        .unwrap()
+        .current_dir(td.path())
+        .args(["-e", "SELECT status", "--format", "csv", "--refresh-all"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    assert_eq!(
+        s.lines().last().unwrap().trim(),
+        "ready",
+        "--refresh-all must force a full re-scan even when (mtime, size) are unchanged; got: {s:?}"
+    );
+}
+
+#[test]
 fn refresh_nonexistent_path_exits_nonzero() {
     let td = tree();
     Command::cargo_bin("querymatter")

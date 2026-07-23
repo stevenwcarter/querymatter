@@ -115,14 +115,33 @@ impl InMemoryStore {
     /// which never touches the filesystem beyond the initial cache read and
     /// so never has anything new to persist. A save failure is folded into
     /// the report's warnings rather than panicking.
+    ///
+    /// The two `None` causes are distinguished (design spec §9): when a
+    /// `manifest.bin` is present on disk but [`cache::load_cache`] rejected it
+    /// (incompatible schema or corruption), a warning is prepended to the
+    /// report — `main` prints report warnings to stderr — so the user sees
+    /// *why* every run is doing a slow full rebuild. With no manifest at all
+    /// (a fresh vault, or the unit-test path) the rebuild stays silent.
     pub fn from_cache(vault: &Path, opts: WalkOpts, mode: Freshness) -> (Self, LoadReport) {
-        let (cached, ttl_secs) = match cache::load_cache(vault) {
-            Some((body, dirs)) => (dirs, body.ttl_secs),
-            None => (Vec::new(), DEFAULT_TTL_SECS),
+        let (cached, ttl_secs, incompatible) = match cache::load_cache(vault) {
+            Some((body, dirs)) => (dirs, body.ttl_secs, false),
+            // A `None` with a manifest present means it's unreadable; without
+            // one it's simply a fresh/absent cache (stay silent).
+            None => (Vec::new(), DEFAULT_TTL_SECS, cache::manifest_exists(vault)),
         };
 
         let (fresh, mut report, changed) =
             cache::refresh_against_cache(vault, &cached, &opts, mode, ttl_secs);
+
+        if incompatible {
+            report.warnings.insert(
+                0,
+                format!(
+                    "incompatible or unreadable cache at {} — rebuilding",
+                    cache::cache_dir(vault).display()
+                ),
+            );
+        }
 
         if changed
             && mode != Freshness::ForceCache
@@ -266,32 +285,26 @@ impl RecordStore for InMemoryStore {
     /// The starting point is the on-disk cache ([`cache::load_cache`]) when
     /// one exists; otherwise it's rebuilt from the store's own current
     /// slices ([`InMemoryStore::cached_dirs_from_slices`]) so that
-    /// directories outside `subtree` aren't silently dropped. A `subtree`
-    /// forces a full re-parse of just that directory tree
-    /// ([`cache::refresh_subtree`], ignoring any cached shortcut); `None`
-    /// instead does a whole-vault incremental refresh
-    /// ([`Freshness::PerFile`]), reusing cached fields for files whose
-    /// `(mtime, size)` haven't changed.
+    /// directories outside `subtree` aren't silently dropped.
+    ///
+    /// Both arms force a full re-parse via [`cache::refresh_subtree`],
+    /// ignoring every cached `(mtime, size)` shortcut: a `Some(subtree)`
+    /// re-scans just that directory tree, and `None` re-scans the whole vault
+    /// (by passing `vault` itself as the subtree). This is the forced
+    /// re-scan `--refresh <path>` and `--refresh-all` both promise (spec §4);
+    /// the incremental freshness shortcuts live on the read path
+    /// ([`InMemoryStore::from_cache`]), not here.
     fn refresh(&mut self, vault: &Path, subtree: Option<&Path>) -> LoadReport {
         let (mut cached, ttl_secs) = match cache::load_cache(vault) {
             Some((body, dirs)) => (dirs, body.ttl_secs),
             None => (self.cached_dirs_from_slices(), DEFAULT_TTL_SECS),
         };
 
-        let mut report = match subtree {
-            Some(subtree) => cache::refresh_subtree(vault, &mut cached, subtree, &self.opts),
-            None => {
-                let (fresh, report, _changed) = cache::refresh_against_cache(
-                    vault,
-                    &cached,
-                    &self.opts,
-                    Freshness::PerFile,
-                    ttl_secs,
-                );
-                cached = fresh;
-                report
-            }
-        };
+        // `None` (whole-vault) re-scans every directory under `vault` by using
+        // `vault` itself as the subtree, matching the forced re-parse a
+        // `Some(subtree)` already performs.
+        let subtree = subtree.unwrap_or(vault);
+        let mut report = cache::refresh_subtree(vault, &mut cached, subtree, &self.opts);
 
         if let Err(err) = cache::save_cache(vault, &cached, ttl_secs) {
             report.warnings.push(format!("saving cache: {err}"));
@@ -336,6 +349,7 @@ mod tests {
     use super::*;
     use crate::model::Value;
     use std::fs;
+    use std::fs::File;
     use tempfile::TempDir;
 
     fn write(dir: &std::path::Path, rel: &str, body: &str) {
@@ -407,6 +421,56 @@ mod tests {
             persisted_status,
             Value::Str("in-progress".into()),
             "refresh must persist the edit to disk"
+        );
+    }
+
+    /// FIX 1 (load-bearing): a whole-vault `refresh(vault, None)` must FORCE a
+    /// full re-parse, ignoring the per-file `(mtime, size)` freshness
+    /// shortcut — matching what `refresh(vault, Some(subtree))` already does
+    /// and what spec §4 / the README ("force a full re-scan, ignoring every
+    /// freshness shortcut") promise for `--refresh-all`.
+    ///
+    /// The fixture edits `a.md`'s content to a status of the SAME byte length
+    /// (`draft` -> `ready`, both 5 chars) and restores its original mtime, so
+    /// `(mtime, size)` are indistinguishable from the cached entry: the
+    /// default incremental refresh would REUSE the stale `draft`. Asserting
+    /// `ready` proves the whole-vault refresh forced a re-parse regardless.
+    #[test]
+    fn whole_vault_refresh_forces_reparse_despite_unchanged_mtime_and_size() {
+        let td = TempDir::new().unwrap();
+        let a_path = td.path().join("a.md");
+        let content_a = "---\nstatus: draft\n---\n";
+        write(td.path(), "a.md", content_a);
+        let original_mtime = fs::metadata(&a_path).unwrap().modified().unwrap();
+        cache::build_vault(td.path(), &WalkOpts::default(), 300).unwrap();
+
+        let (mut store, _report) =
+            InMemoryStore::from_cache(td.path(), WalkOpts::default(), Freshness::PerFile);
+        assert_eq!(
+            store.records().next().unwrap().field("status"),
+            Value::Str("draft".into())
+        );
+
+        // Equal byte length keeps `size` unchanged; restoring the original
+        // mtime keeps `(mtime, size)` indistinguishable from the cached entry.
+        let content_b = "---\nstatus: ready\n---\n";
+        assert_eq!(
+            content_a.len(),
+            content_b.len(),
+            "fixture must keep byte length equal to isolate the forced re-parse"
+        );
+        write(td.path(), "a.md", content_b);
+        File::open(&a_path)
+            .unwrap()
+            .set_modified(original_mtime)
+            .unwrap();
+
+        let report = store.refresh(td.path(), None);
+        assert_eq!(report.skipped, 0);
+        assert_eq!(
+            store.records().next().unwrap().field("status"),
+            Value::Str("ready".into()),
+            "whole-vault refresh must FORCE a re-parse, not reuse the stale cached value"
         );
     }
 
@@ -494,6 +558,51 @@ mod tests {
             Value::Str("in-progress".into()),
             "refresh must pick up the edit even when cached_dirs_from_slices \
              (not an on-disk cache) supplies the starting point"
+        );
+    }
+
+    /// FIX 2 (spec §9): a `manifest.bin` present on disk but rejected by
+    /// `load_cache` (incompatible/corrupt) must warn to the report — which
+    /// `main` prints to stderr — before rebuilding via a full live scan, so a
+    /// schema-bumped vault doesn't silently slow-scan every run. A vault with
+    /// NO manifest at all rebuilds silently (no such warning).
+    #[test]
+    fn from_cache_warns_on_incompatible_manifest_but_not_on_missing_one() {
+        // Incompatible: a manifest.bin whose bytes fail the MAGIC/version check.
+        let td = TempDir::new().unwrap();
+        write(td.path(), "a.md", "---\nstatus: draft\n---\n");
+        fs::create_dir_all(td.path().join(".querymatter")).unwrap();
+        fs::write(
+            td.path().join(".querymatter/manifest.bin"),
+            b"NOPEnotaversion",
+        )
+        .unwrap();
+        assert!(cache::load_cache(td.path()).is_none());
+
+        let (store, report) =
+            InMemoryStore::from_cache(td.path(), WalkOpts::default(), Freshness::PerFile);
+        assert!(
+            report.warnings.iter().any(|w| w.contains("incompatible")),
+            "an incompatible on-disk manifest must warn, got: {:?}",
+            report.warnings
+        );
+        // The rebuild still produces correct records via the live scan.
+        assert_eq!(
+            store.records().next().unwrap().field("status"),
+            Value::Str("draft".into())
+        );
+
+        // Missing: no .querymatter at all -> silent rebuild (no such warning).
+        let td2 = TempDir::new().unwrap();
+        write(td2.path(), "a.md", "---\nstatus: draft\n---\n");
+        assert!(cache::load_cache(td2.path()).is_none());
+
+        let (_store, report2) =
+            InMemoryStore::from_cache(td2.path(), WalkOpts::default(), Freshness::PerFile);
+        assert!(
+            !report2.warnings.iter().any(|w| w.contains("incompatible")),
+            "a missing cache must rebuild silently, got: {:?}",
+            report2.warnings
         );
     }
 

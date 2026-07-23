@@ -254,13 +254,31 @@ pub fn load_cache(vault_dir: &Path) -> Option<(ManifestBody, Vec<CachedDir>)> {
     Some((body, loaded))
 }
 
+/// The `.querymatter` cache directory under `vault_dir` (whether or not it
+/// exists on disk). The single place that joins [`CACHE_DIR_NAME`], so callers
+/// naming the cache in diagnostics don't re-hardcode the directory name.
+pub fn cache_dir(vault_dir: &Path) -> PathBuf {
+    vault_dir.join(CACHE_DIR_NAME)
+}
+
+/// True when `vault_dir` has a `manifest.bin` on disk, regardless of whether
+/// it is readable or schema-compatible.
+///
+/// Distinguishes "no cache at all" from "a cache [`load_cache`] rejected as
+/// incompatible/corrupt": only the latter — a `manifest.bin` present but
+/// unusable — warrants a warning before falling back to a full live scan
+/// (design spec §9).
+pub fn manifest_exists(vault_dir: &Path) -> bool {
+    cache_dir(vault_dir).join(MANIFEST_FILE_NAME).is_file()
+}
+
 /// Walks `start` upward through its ancestors, returning the canonicalized
 /// path of the first one containing a `.querymatter/manifest.bin` — i.e. the
 /// vault root a query rooted at `start` should read/write its cache from.
 pub fn find_vault(start: &Path) -> Option<PathBuf> {
     let mut dir = start.canonicalize().ok()?;
     loop {
-        if dir.join(CACHE_DIR_NAME).join(MANIFEST_FILE_NAME).is_file() {
+        if manifest_exists(&dir) {
             return Some(dir);
         }
         if !dir.pop() {
