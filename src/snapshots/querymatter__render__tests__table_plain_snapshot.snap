@@ -1,0 +1,7 @@
+---
+source: src/render.rs
+expression: "render(&table(), Format::Table, TableStyle::Plain)"
+---
+ status  Count
+ synced  2
+ draft   1

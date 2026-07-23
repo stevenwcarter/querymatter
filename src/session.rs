@@ -8,7 +8,7 @@ use anyhow::Context;
 
 use crate::cache;
 use crate::query::{self, ResultTable};
-use crate::render::{self, Format};
+use crate::render::{self, Format, TableStyle};
 use crate::store::{LoadReport, RecordStore};
 
 /// Owns the queryable store plus the current output format, and runs queries
@@ -54,7 +54,9 @@ impl Session {
     /// caller adds exactly one when printing.
     pub fn render_query(&self, sql: &str) -> anyhow::Result<String> {
         let table = self.run(sql)?;
-        Ok(render::render(&table, self.format))
+        // The style is hardcoded here only until Task 2 gives `Session` a
+        // `style` field fed from `--table-style`.
+        Ok(render::render(&table, self.format, TableStyle::Ascii))
     }
 
     /// Switches the output format used by [`render_query`](Self::render_query).
