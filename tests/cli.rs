@@ -473,6 +473,149 @@ fn refresh_path_outside_vault_exits_nonzero() {
 }
 
 #[test]
+fn cache_query_matches_live_scan_byte_for_byte() {
+    // Spec §10 "cache-equals-live" (the load-bearing invariant): a query
+    // answered from a `.querymatter` cache must produce byte-identical stdout
+    // to the same query answered by a live (`--no-cache`) scan of the same
+    // tree.
+    let td = tree();
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .arg("init")
+        .arg(td.path())
+        .assert()
+        .success();
+
+    const QUERY: &str = "SELECT status, count(*) AS n GROUP BY status ORDER BY n";
+
+    let cached = Command::cargo_bin("querymatter")
+        .unwrap()
+        .current_dir(td.path())
+        .args(["-e", QUERY, "--format", "csv"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let live = Command::cargo_bin("querymatter")
+        .unwrap()
+        .current_dir(td.path())
+        .args(["-e", QUERY, "--format", "csv", "--no-cache", "."])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert_eq!(
+        cached,
+        live,
+        "a vault-backed query must return byte-identical stdout to a --no-cache live scan; \
+         cached={:?} live={:?}",
+        String::from_utf8_lossy(&cached),
+        String::from_utf8_lossy(&live),
+    );
+}
+
+#[test]
+fn force_cache_returns_stale_value_after_on_disk_edit() {
+    // Spec §4: `--force-cache` does zero filesystem access, so it must keep
+    // returning the value cached at `init` time even after the file changes
+    // on disk (unlike default per-file freshness, tested below).
+    let td = TempDir::new().unwrap();
+    let a = td.path().join("a.md");
+    fs::write(&a, "---\nstatus: draft\n---\n").unwrap();
+
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .arg("init")
+        .arg(td.path())
+        .assert()
+        .success();
+
+    fs::write(&a, "---\nstatus: done\n---\n").unwrap();
+
+    let out = Command::cargo_bin("querymatter")
+        .unwrap()
+        .current_dir(td.path())
+        .args(["-e", "SELECT status", "--format", "csv", "--force-cache"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    assert_eq!(
+        s.lines().last().unwrap().trim(),
+        "draft",
+        "--force-cache must return the stale cached value, never checking the filesystem; got: {s:?}"
+    );
+}
+
+#[test]
+fn default_freshness_reflects_on_disk_edit() {
+    // Spec §4 default mode: accurate per-file (mtime+size) freshness
+    // re-parses a changed file with no explicit `--refresh` needed. This
+    // complements `refresh_relative_path_reparses_and_defeats_stale_cache`,
+    // which pins the forced-refresh path instead.
+    let td = TempDir::new().unwrap();
+    let a = td.path().join("a.md");
+    fs::write(&a, "---\nstatus: draft\n---\n").unwrap();
+
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .arg("init")
+        .arg(td.path())
+        .assert()
+        .success();
+
+    fs::write(&a, "---\nstatus: done\n---\n").unwrap();
+
+    let out = Command::cargo_bin("querymatter")
+        .unwrap()
+        .current_dir(td.path())
+        .args(["-e", "SELECT status", "--format", "csv"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    assert_eq!(
+        s.lines().last().unwrap().trim(),
+        "done",
+        "default freshness must re-parse a changed file with no --refresh flag; got: {s:?}"
+    );
+}
+
+#[test]
+fn init_non_tty_does_not_modify_gitignore() {
+    // Spec §7: a non-interactive (piped-stdin) `init` inside a git repo must
+    // print a stderr hint but never create or modify `.gitignore`.
+    let td = tree();
+    fs::create_dir_all(td.path().join(".git")).unwrap();
+
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .arg("init")
+        .arg(td.path())
+        // A piped (non-terminal) stdin forces the non-TTY hint branch
+        // deterministically, so the test never blocks on an interactive prompt.
+        .write_stdin("")
+        .assert()
+        .success()
+        .stderr(predicates::str::contains(
+            "hint: add .querymatter/ to .gitignore",
+        ));
+
+    assert!(
+        !td.path().join(".gitignore").exists(),
+        ".gitignore must not be created by a non-TTY init"
+    );
+}
+
+#[test]
 fn missing_ignore_file_flag_exits_nonzero() {
     let td = TempDir::new().unwrap();
     fs::write(td.path().join("a.md"), "---\nstatus: draft\n---\n").unwrap();
