@@ -111,10 +111,14 @@ per line, `#` comments, and `!` to re-include a path a broader pattern
 excluded:
 
 ```gitignore
-templates/
+templates/*
+!templates/keep-this.md   # re-include one file (works because templates/ itself isn't excluded)
 *.draft.md
-!templates/keep-this.md
 ```
+
+Note: a `!` negation can't re-include a file whose parent directory is
+excluded — exclude the directory's contents (`dir/*`) rather than the
+directory (`dir/`) when you want to un-ignore something inside it.
 
 A few things worth knowing:
 
@@ -131,6 +135,10 @@ A few things worth knowing:
 - It composes with `--exclude <GLOB>` (ad-hoc globs) and
   `--respect-gitignore` (`.gitignore`/`.ignore` rules) — all three filters
   apply together.
+- **Anchoring.** The cwd `.querymatterignore` governs content under the
+  current directory; a scan root *outside* cwd is not governed by it (its
+  non-anchored patterns still match by name, but cwd-anchored `/…` patterns
+  won't apply elsewhere).
 
 ## REPL dot-commands
 

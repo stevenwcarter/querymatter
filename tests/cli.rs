@@ -239,5 +239,6 @@ fn missing_ignore_file_flag_exits_nonzero() {
         ])
         .arg(td.path())
         .assert()
-        .failure();
+        .failure()
+        .stderr(predicates::str::contains("definitely-nonexistent.ignore"));
 }

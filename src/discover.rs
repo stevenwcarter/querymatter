@@ -295,6 +295,31 @@ mod tests {
     }
 
     #[test]
+    fn ignore_exclude_and_ext_filters_compose() {
+        // All three filtering stages in one tree, proving they compose:
+        // - ignore file drops drafts/dropped-by-ignore.md
+        // - --exclude glob drops excluded/dropped-by-exclude.md
+        // - extension filter drops notes.txt
+        // - keep.md survives all three
+        let td = TempDir::new().unwrap();
+        touch(td.path(), ".qmi", "drafts/\n");
+        touch(td.path(), "drafts/dropped-by-ignore.md", "x");
+        touch(td.path(), "excluded/dropped-by-exclude.md", "x");
+        touch(td.path(), "notes.txt", "x");
+        touch(td.path(), "keep.md", "x");
+        let opts = WalkOpts {
+            ignore_files: vec![td.path().join(".qmi")],
+            excludes: vec!["**/excluded/**".into()],
+            ..Default::default()
+        };
+        let names: Vec<_> = discover(td.path(), &opts)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, vec!["keep.md"]);
+    }
+
+    #[test]
     fn empty_ignore_file_is_noop() {
         let td = TempDir::new().unwrap();
         touch(td.path(), ".qmi", "# only a comment\n\n");
