@@ -771,3 +771,74 @@ fn bad_table_style_env_var_exits_non_zero() {
         .assert()
         .failure();
 }
+
+#[test]
+fn oneshot_vertical_g_prints_row_blocks() {
+    let td = tree();
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .args(["-e", "SELECT status, prd WHERE prd = '011'\\G"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("1. row"))
+        .stdout(predicates::str::contains("status: synced"))
+        .stdout(predicates::str::contains("+--").not());
+}
+
+/// One piped script, two terminators: each statement renders its own way.
+#[test]
+fn batch_mode_mixes_terminators() {
+    let td = tree();
+    let out = Command::cargo_bin("querymatter")
+        .unwrap()
+        .arg(td.path())
+        .write_stdin("SELECT count(*) AS n;\nSELECT status WHERE prd = '011'\\G\n")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("+--"),
+        "the `;` statement stays a table:\n{text}"
+    );
+    assert!(
+        text.contains("1. row"),
+        "the `\\G` statement goes vertical:\n{text}"
+    );
+}
+
+/// `\G` means "record-wise" whatever the standing format is.
+#[test]
+fn vertical_g_overrides_the_session_format() {
+    let td = tree();
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .args([
+            "-e",
+            "SELECT status WHERE prd = '011'\\G",
+            "--format",
+            "json",
+        ])
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("1. row"))
+        .stdout(predicates::str::contains("[").not());
+}
+
+#[test]
+fn lowercase_g_terminates_like_a_semicolon() {
+    let td = tree();
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .env_remove("QUERYMATTER_TABLE_STYLE")
+        .args(["-e", "SELECT status WHERE prd = '011'\\g"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("+--"))
+        .stdout(predicates::str::contains("1. row").not());
+}

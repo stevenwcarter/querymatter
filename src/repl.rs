@@ -17,7 +17,7 @@ use rustyline::error::ReadlineError;
 
 use crate::model::Value;
 use crate::render::{Format, TableStyle};
-use crate::session::Session;
+use crate::session::{Session, Statement, Terminator};
 use crate::store::LoadReport;
 
 /// Prompt shown while waiting for a new statement or dot-command.
@@ -37,8 +37,9 @@ pub enum Line {
     Blank,
     /// A statement is still accumulating; more input is needed.
     More,
-    /// A complete statement, `;`-terminated (the `;` is stripped).
-    Statement(String),
+    /// A complete statement plus the terminator that ended it (the terminator
+    /// itself is stripped).
+    Statement(Statement),
     /// A `.`-prefixed dot-command.
     Dot(DotCommand),
 }
@@ -78,7 +79,7 @@ pub enum DotCommand {
 }
 
 /// Accumulates raw input lines into complete SQL statements, splitting on a
-/// trailing `;`.
+/// trailing `;`, `\g`, or `\G`.
 ///
 /// A line starting with `.` or an empty/whitespace line is only recognized
 /// as a dot-command/blank line when the buffer is currently empty —
@@ -111,9 +112,12 @@ impl LineBuffer {
             self.buf.push_str(raw);
         }
 
-        match self.buf.trim_end().strip_suffix(';') {
-            Some(stmt) => {
-                let statement = stmt.trim().to_string();
+        match take_terminated(self.buf.trim_end()) {
+            Some((sql, terminator)) => {
+                let statement = Statement {
+                    sql: sql.trim().to_string(),
+                    terminator,
+                };
                 self.buf.clear();
                 Line::Statement(statement)
             }
@@ -125,6 +129,25 @@ impl LineBuffer {
     /// continuation prompt in [`run`].
     fn is_pending(&self) -> bool {
         !self.buf.is_empty()
+    }
+}
+
+/// Splits a trailing `;`, `\g`, or `\G` terminator off `text`, returning the
+/// statement body and which terminator ended it.
+///
+/// Like the bare `;` check this replaces, it looks only at the suffix and is
+/// not quote-aware: a terminator that ends the line ends the statement even
+/// inside a string literal. [`crate::session::split_statements`] is the
+/// quote-aware seam for batch input; the asymmetry predates these terminators
+/// and is left as-is.
+fn take_terminated(text: &str) -> Option<(&str, Terminator)> {
+    if let Some(sql) = text.strip_suffix("\\G") {
+        Some((sql, Terminator::VerticalG))
+    } else if let Some(sql) = text.strip_suffix("\\g") {
+        Some((sql, Terminator::Semicolon))
+    } else {
+        text.strip_suffix(';')
+            .map(|sql| (sql, Terminator::Semicolon))
     }
 }
 
@@ -200,7 +223,7 @@ pub fn run(mut session: Session) -> anyhow::Result<()> {
 
         match buffer.push(&line) {
             Line::Blank | Line::More => {}
-            Line::Statement(sql) => match session.render_query(&sql) {
+            Line::Statement(statement) => match session.render_statement(&statement) {
                 Ok(rendered) => println!("{rendered}"),
                 Err(err) => eprintln!("querymatter: {err:#}"),
             },
@@ -274,7 +297,8 @@ fn print_help() {
     );
     println!("  .quit / .exit      leave the REPL");
     println!();
-    println!("End a statement with ';' to run it; statements may span multiple lines.");
+    println!("End a statement with ';' to run it, or with '\\G' to print each row as a block of");
+    println!("name: value lines; statements may span multiple lines.");
 }
 
 /// Prints the discovered frontmatter fields, the `file.*` pseudo-columns,
@@ -397,11 +421,40 @@ mod tests {
         assert!(matches!(b.push("SELECT status"), Line::More));
         assert!(matches!(b.push("FROM 'x' ;"), Line::Statement(_)));
     }
+
+    #[test]
+    fn buffers_until_vertical_g() {
+        let mut b = LineBuffer::new();
+        assert_eq!(b.push("SELECT status"), Line::More);
+        match b.push("FROM files\\G") {
+            Line::Statement(stmt) => {
+                assert_eq!(stmt.sql, "SELECT status\nFROM files");
+                assert_eq!(stmt.terminator, Terminator::VerticalG);
+            }
+            other => panic!("expected a Statement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lowercase_g_terminates_like_a_semicolon() {
+        let mut b = LineBuffer::new();
+        match b.push("SELECT 1\\g") {
+            Line::Statement(stmt) => {
+                assert_eq!(stmt.sql, "SELECT 1");
+                assert_eq!(stmt.terminator, Terminator::Semicolon);
+            }
+            other => panic!("expected a Statement, got {other:?}"),
+        }
+    }
+
     #[test]
     fn single_line_statement() {
         let mut b = LineBuffer::new();
         match b.push("SELECT 1;") {
-            Line::Statement(s) => assert_eq!(s, "SELECT 1"),
+            Line::Statement(s) => {
+                assert_eq!(s.sql, "SELECT 1");
+                assert_eq!(s.terminator, Terminator::Semicolon);
+            }
             _ => panic!(),
         }
     }
@@ -421,7 +474,10 @@ mod tests {
             ".schema mid-statement must accumulate, not dispatch as Line::Dot"
         );
         match b.push(";") {
-            Line::Statement(s) => assert_eq!(s, "SELECT status\n.schema"),
+            Line::Statement(s) => {
+                assert_eq!(s.sql, "SELECT status\n.schema");
+                assert_eq!(s.terminator, Terminator::Semicolon);
+            }
             other => panic!("expected the accumulated Statement, got {other:?}"),
         }
     }
@@ -436,7 +492,10 @@ mod tests {
             "a blank line mid-statement must be Line::More, not Line::Blank"
         );
         match b.push("WHERE prd = '010';") {
-            Line::Statement(s) => assert_eq!(s, "SELECT status\n   \nWHERE prd = '010'"),
+            Line::Statement(s) => {
+                assert_eq!(s.sql, "SELECT status\n   \nWHERE prd = '010'");
+                assert_eq!(s.terminator, Terminator::Semicolon);
+            }
             other => panic!("expected the accumulated Statement, got {other:?}"),
         }
     }

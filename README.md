@@ -95,7 +95,7 @@ available alongside frontmatter fields:
 
 | Flag | Meaning |
 | --- | --- |
-| `-e, --query <QUERY>` | One-shot mode; `-` reads the query text from stdin. May contain several `;`-separated statements. |
+| `-e, --query <QUERY>` | One-shot mode; `-` reads the query text from stdin. May contain several statements, each ended by `;` (or `\G`, which prints every row as a block of `name: value` lines instead of a table). |
 | `--format <FMT>` | `table` (default), `json`, `csv`, `tsv`, or `md`. In the REPL this is just the *initial* format — `.format` changes it live. |
 | `--table-style <STYLE>` | Border style for `--format table`: `ascii` (default), `unicode`, `compact`, or `plain`. Also settable per-shell with `QUERYMATTER_TABLE_STYLE`; the flag wins. Ignored by `json`/`csv`/`tsv`/`md`. In the REPL this is just the *initial* style — `.style` changes it live. |
 | `--ext <LIST>` | Comma-separated extensions to include. Default `md,markdown`. |
@@ -237,7 +237,11 @@ rather than SQL:
 | `.quit` / `.exit` | Leave the REPL (Ctrl-D also exits; Ctrl-C cancels the current line). |
 
 SQL statements may span multiple lines; a trailing `;` ends the statement and
-runs it.
+runs it. Ending with `\G` instead runs it and prints each row as a block of
+right-aligned `name: value` lines — the readable way to inspect a wide record,
+as in `SELECT * LIMIT 1\G`. `\g` is accepted as a synonym for `;`. `\G`
+overrides whatever `.format` is set to, and works in `-e` and piped batch mode
+as well as the REPL.
 
 ## Accuracy notes / gotchas
 
