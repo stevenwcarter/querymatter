@@ -11,6 +11,7 @@ pub mod frontmatter;
 pub mod model;
 pub mod query;
 pub mod render;
+mod repl;
 mod session;
 pub mod store;
 
@@ -32,7 +33,7 @@ fn main() -> anyhow::Result<()> {
     for warning in &report.warnings {
         eprintln!("querymatter: {warning}");
     }
-    let mut session = Session::new(Box::new(store), cli.format);
+    let session = Session::new(Box::new(store), cli.format);
 
     match cli.query.as_deref() {
         // `-e -`: read the query text from stdin, then run it.
@@ -41,7 +42,7 @@ fn main() -> anyhow::Result<()> {
         Some(sql) => run_statements(&session, sql),
         // No `-e`: batch mode when stdin is piped, otherwise the REPL.
         None if !io::stdin().is_terminal() => run_statements(&session, &read_stdin()?),
-        None => run_interactive(&mut session),
+        None => repl::run(session),
     }
 }
 
@@ -57,13 +58,6 @@ fn run_statements(session: &Session, input: &str) -> anyhow::Result<()> {
         let rendered = session.render_query(&statement)?;
         println!("{rendered}");
     }
-    Ok(())
-}
-
-/// Placeholder for the interactive REPL.
-// TODO(Task 11): replace body with repl::run(session)
-fn run_interactive(_session: &mut Session) -> anyhow::Result<()> {
-    eprintln!("querymatter: interactive REPL not yet available (coming in the next task)");
     Ok(())
 }
 

@@ -1,6 +1,6 @@
 //! A [`Session`] bundles a record store with an output [`Format`] and turns
 //! SQL text into rendered result strings — the shared core behind one-shot,
-//! batch, and (Task 11) interactive modes.
+//! batch, and interactive modes.
 
 use anyhow::Context;
 
@@ -13,7 +13,7 @@ use crate::store::{LoadReport, RecordStore};
 pub struct Session {
     store: Box<dyn RecordStore>,
     /// The format rendered results are produced in; mutable at runtime (the
-    /// REPL's `\format` command, Task 11).
+    /// REPL's `.format` command).
     pub format: Format,
 }
 
@@ -43,25 +43,16 @@ impl Session {
     }
 
     /// Switches the output format used by [`render_query`](Self::render_query).
-    // Part of the Session API surface; first called by the interactive REPL
-    // (Task 11), so unreferenced in this bin crate until then.
-    #[allow(dead_code)]
     pub fn set_format(&mut self, f: Format) {
         self.format = f;
     }
 
     /// Rescans every tracked root, returning the combined load report.
-    // Part of the Session API surface; first called by the interactive REPL
-    // (Task 11), so unreferenced in this bin crate until then.
-    #[allow(dead_code)]
     pub fn reload(&mut self) -> LoadReport {
         self.store.reload_all()
     }
 
     /// The current schema: the sorted union of frontmatter field names.
-    // Part of the Session API surface; first called by the interactive REPL
-    // (Task 11), so unreferenced in this bin crate until then.
-    #[allow(dead_code)]
     pub fn schema(&self) -> Vec<String> {
         self.store.schema()
     }
