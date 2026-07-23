@@ -1,4 +1,6 @@
+use indexmap::IndexMap;
 use std::cmp::Ordering;
+use std::path::Path;
 
 /// A dynamically-typed value read from Markdown YAML frontmatter.
 ///
@@ -76,6 +78,88 @@ pub fn compare_values(a: &Value, b: &Value) -> Option<Ordering> {
     }
 }
 
+/// A `file.*` pseudo-column: a property of the source file itself rather
+/// than a frontmatter field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileAttr {
+    Name,
+    Path,
+    Folder,
+    Ext,
+}
+
+/// One queryable row: a Markdown file's YAML frontmatter fields, plus its
+/// `file.*` pseudo-columns resolved relative to the scan root.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Record {
+    fields: IndexMap<String, Value>,
+    name: String,
+    path: String,
+    folder: String,
+    ext: String,
+}
+
+impl Record {
+    /// Builds a record for the frontmatter `fields` found in the file at
+    /// `path`, resolving its `file.*` attributes relative to `root`.
+    ///
+    /// `path` is stored relative to `root` (via `strip_prefix`, falling back
+    /// to the full path when `path` isn't under `root`); `folder` is the
+    /// parent of that relative path, or an empty string when there is none.
+    /// Path separators are normalized to `/` so output is stable across
+    /// platforms.
+    pub fn new(root: &Path, path: &Path, fields: IndexMap<String, Value>) -> Self {
+        let relative = path.strip_prefix(root).unwrap_or(path);
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let ext = path
+            .extension()
+            .map(|e| e.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let folder = relative.parent().map(join_components).unwrap_or_default();
+
+        Record {
+            fields,
+            name,
+            path: join_components(relative),
+            folder,
+            ext,
+        }
+    }
+
+    /// The value of frontmatter field `name`, or `Value::Null` if absent.
+    pub fn field(&self, name: &str) -> Value {
+        self.fields.get(name).cloned().unwrap_or(Value::Null)
+    }
+
+    /// Resolves a `file.*` pseudo-column to its string value.
+    pub fn file_attr(&self, attr: FileAttr) -> Value {
+        let s = match attr {
+            FileAttr::Name => &self.name,
+            FileAttr::Path => &self.path,
+            FileAttr::Folder => &self.folder,
+            FileAttr::Ext => &self.ext,
+        };
+        Value::Str(s.clone())
+    }
+
+    /// The frontmatter field names, in their original (insertion) order.
+    pub fn field_names(&self) -> impl Iterator<Item = &str> {
+        self.fields.keys().map(String::as_str)
+    }
+}
+
+/// Joins a path's components with `/`, independent of the host platform's
+/// native separator.
+fn join_components(path: &Path) -> String {
+    path.components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,5 +211,44 @@ mod tests {
     fn compare_null_is_none() {
         assert_eq!(compare_values(&Value::Null, &Value::Int(1)), None);
         assert_eq!(compare_values(&Value::Int(1), &Value::Null), None);
+    }
+}
+
+#[cfg(test)]
+mod record_tests {
+    use super::*;
+    use indexmap::IndexMap;
+    use std::path::Path;
+
+    fn rec() -> Record {
+        let mut f = IndexMap::new();
+        f.insert("status".to_string(), Value::Str("draft".into()));
+        Record::new(
+            Path::new("samples"),
+            Path::new("samples/plans/DCP-459.md"),
+            f,
+        )
+    }
+    #[test]
+    fn file_attrs_relative_to_root() {
+        let r = rec();
+        assert_eq!(r.file_attr(FileAttr::Name), Value::Str("DCP-459.md".into()));
+        assert_eq!(
+            r.file_attr(FileAttr::Path),
+            Value::Str("plans/DCP-459.md".into())
+        );
+        assert_eq!(r.file_attr(FileAttr::Folder), Value::Str("plans".into()));
+        assert_eq!(r.file_attr(FileAttr::Ext), Value::Str("md".into()));
+    }
+    #[test]
+    fn field_present_and_missing() {
+        let r = rec();
+        assert_eq!(r.field("status"), Value::Str("draft".into()));
+        assert_eq!(r.field("nope"), Value::Null);
+    }
+    #[test]
+    fn field_names_lists_keys() {
+        let r = rec();
+        assert_eq!(r.field_names().collect::<Vec<_>>(), vec!["status"]);
     }
 }
