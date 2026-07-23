@@ -2,12 +2,11 @@
 //! directory-keyed record store.
 
 use std::collections::BTreeSet;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use crate::cache::{self, ScanResult};
 use crate::discover::{self, WalkOpts};
-use crate::frontmatter::{self, Extract};
 use crate::model::Record;
 
 /// Summary of a load/reload operation: how many files became records, how
@@ -137,30 +136,25 @@ impl RecordStore for InMemoryStore {
 /// Scans `root` for frontmatter records using `opts`, returning the loaded
 /// records alongside a report of how many files were skipped and why.
 ///
-/// A file that fails to read from disk is treated like invalid frontmatter:
-/// it's counted as skipped and warned about, not a hard error.
+/// Delegates the per-file work to [`cache::scan_file`] — the single
+/// "file → record" definition shared with the cache's freshness checks —
+/// discarding the on-disk stat it carries, since a live scan doesn't need
+/// it. A file that fails to read from disk is treated like invalid
+/// frontmatter: it's counted as skipped and warned about, not a hard error.
 fn scan_root(root: &Path, opts: &WalkOpts) -> (Vec<Record>, LoadReport) {
     let mut records = Vec::new();
     let mut report = LoadReport::default();
 
     for path in discover::discover(root, opts) {
-        let content = match fs::read_to_string(&path) {
-            Ok(content) => content,
-            Err(err) => {
-                report.skipped += 1;
-                report.warnings.push(format!("{}: {err}", path.display()));
-                continue;
-            }
-        };
-        match frontmatter::extract(&content) {
-            Extract::Fields(fields) => {
-                records.push(Record::new(root, &path, fields));
+        match cache::scan_file(root, &path) {
+            ScanResult::Cached(file) => {
+                records.push(Record::new(root, &path, file.fields));
                 report.loaded += 1;
             }
-            Extract::None => {}
-            Extract::Invalid(msg) => {
+            ScanResult::NoFrontmatter => {}
+            ScanResult::Warning(msg) => {
                 report.skipped += 1;
-                report.warnings.push(format!("{}: {msg}", path.display()));
+                report.warnings.push(msg);
             }
         }
     }

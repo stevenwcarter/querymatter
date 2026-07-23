@@ -1,13 +1,15 @@
-//! The `.querymatter/` on-disk cache data model.
+//! The `.querymatter/` on-disk cache: its data model, bincode
+//! (de)serialization, atomic read/write, vault discovery, and freshness.
 //!
-//! This module owns the *shape* of the persistent cache and its bincode
-//! (de)serialization — a `CachedDir` blob per scanned filesystem directory,
-//! plus a versioned `manifest.bin` header that lets a future format change
-//! be detected and safely discarded rather than mis-decoded. Nothing here
-//! touches the filesystem; reading/writing the actual files, freshness
-//! checks, and vault discovery are later phases of the cache-vault feature.
+//! A `CachedDir` blob holds every matched file directly under one scanned
+//! filesystem directory, plus a versioned `manifest.bin` header that lets a
+//! future format change be detected and safely discarded rather than
+//! mis-decoded. [`scan_file`] is the single "file → record" definition
+//! shared with [`crate::store::scan_root`] (a live query), so a cached
+//! record and a freshly scanned one never disagree.
 
 use indexmap::IndexMap;
+use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -17,7 +19,10 @@ use std::{fs, io};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-use crate::model::Value;
+use crate::discover::{self, WalkOpts};
+use crate::frontmatter::{self, Extract};
+use crate::model::{Record, Value};
+use crate::store::LoadReport;
 
 /// The on-disk directory (relative to a vault root) holding `manifest.bin`
 /// and one blob file per cached directory.
@@ -264,11 +269,242 @@ pub fn find_vault(start: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Selects how [`refresh_against_cache`] decides whether a cached file is
+/// still trustworthy against the live filesystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Freshness {
+    /// Stat every current file's `(mtime, size)` against its cached entry;
+    /// reuse the cached fields on a match, re-parse on any mismatch. The
+    /// accurate default (design spec §4).
+    PerFile,
+    /// Dir-mtime + TTL hybrid (Task 4): skip per-file stats for a directory
+    /// whose `dir_mtime` hasn't moved and whose cache is still within TTL.
+    /// Not yet implemented — falls back to [`Freshness::PerFile`] until then.
+    Fast,
+    /// Trust the cache verbatim; no filesystem access at all. Erroring when
+    /// no cache exists is the caller's responsibility.
+    ForceCache,
+}
+
+/// The outcome of scanning one file for its frontmatter: mirrors
+/// [`Extract`], but the frontmatter-found case also carries the on-disk stat
+/// needed to build a [`CachedFile`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScanResult {
+    /// Frontmatter fields found — ready to cache and turn into a `Record`.
+    Cached(CachedFile),
+    /// No frontmatter fence: silently skipped, the same treatment a live
+    /// scan gives an ordinary Markdown file with no fence.
+    NoFrontmatter,
+    /// Unreadable file or invalid frontmatter: skipped, with a
+    /// human-readable reason meant for a [`LoadReport`].
+    Warning(String),
+}
+
+/// Stats `path`'s `(mtime, size)` in one call.
+fn stat_file(path: &Path) -> io::Result<(SystemTime, u64)> {
+    let metadata = fs::metadata(path)?;
+    Ok((metadata.modified()?, metadata.len()))
+}
+
+/// Scans one file for its frontmatter and on-disk stat — the single
+/// "file → record" definition shared by [`crate::store::scan_root`] (a live
+/// query, which only keeps `fields`) and [`refresh_against_cache`] (which
+/// also needs the stat, to detect changes on a later run).
+///
+/// `dir` is the directory a [`CachedFile::rel_path`] is resolved relative
+/// to; a caller that doesn't need `rel_path` (`store::scan_root`) may pass
+/// any ancestor of `path`.
+pub fn scan_file(dir: &Path, path: &Path) -> ScanResult {
+    let (mtime, size) = match stat_file(path) {
+        Ok(stat) => stat,
+        Err(err) => return ScanResult::Warning(format!("{}: {err}", path.display())),
+    };
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) => return ScanResult::Warning(format!("{}: {err}", path.display())),
+    };
+    match frontmatter::extract(&content) {
+        Extract::Fields(fields) => ScanResult::Cached(CachedFile {
+            rel_path: path
+                .strip_prefix(dir)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .into_owned(),
+            mtime,
+            size,
+            fields,
+        }),
+        Extract::None => ScanResult::NoFrontmatter,
+        Extract::Invalid(msg) => ScanResult::Warning(format!("{}: {msg}", path.display())),
+    }
+}
+
+/// Refreshes `cached` against the live filesystem under `vault` per `mode`,
+/// returning the refreshed directories, a [`LoadReport`] of what was
+/// (re)loaded/skipped, and whether the result differs from `cached` (so the
+/// caller knows whether it's worth persisting via [`save_cache`]).
+///
+/// Timestamp bookkeeping alone (each `CachedDir`'s `scanned_at`, which
+/// always advances on a `PerFile`/`Fast` refresh) doesn't count toward
+/// "changed" — only actual directory/file membership, stats, or fields do.
+pub fn refresh_against_cache(
+    vault: &Path,
+    cached: &[CachedDir],
+    opts: &WalkOpts,
+    mode: Freshness,
+) -> (Vec<CachedDir>, LoadReport, bool) {
+    match mode {
+        Freshness::ForceCache => (cached.to_vec(), LoadReport::default(), false),
+        // TODO(Task 4): dir-mtime + TTL hybrid. `PerFile` is a correct,
+        // merely non-optimal, fallback until that lands.
+        Freshness::Fast | Freshness::PerFile => refresh_per_file(vault, cached, opts),
+    }
+}
+
+/// The accurate per-file freshness check (see [`Freshness::PerFile`]).
+fn refresh_per_file(
+    vault: &Path,
+    cached: &[CachedDir],
+    opts: &WalkOpts,
+) -> (Vec<CachedDir>, LoadReport, bool) {
+    let cached_by_path: BTreeMap<PathBuf, &CachedFile> = cached
+        .iter()
+        .flat_map(|cached_dir| {
+            cached_dir
+                .files
+                .iter()
+                .map(move |file| (cached_dir.dir.join(&file.rel_path), file))
+        })
+        .collect();
+
+    let mut report = LoadReport::default();
+    let mut by_dir: BTreeMap<PathBuf, Vec<CachedFile>> = BTreeMap::new();
+    for path in discover::discover(vault, opts) {
+        let dir = path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| vault.to_path_buf());
+        let previous = cached_by_path.get(&path).copied();
+        if let Some(file) = refresh_one_file(&dir, &path, previous, &mut report) {
+            by_dir.entry(dir).or_default().push(file);
+        }
+    }
+
+    let dirs: Vec<CachedDir> = by_dir
+        .into_iter()
+        .map(|(dir, files)| {
+            let dir_mtime = stat_dir_mtime(&dir, &mut report);
+            CachedDir {
+                dir,
+                scanned_at: SystemTime::now(),
+                dir_mtime,
+                files,
+            }
+        })
+        .collect();
+
+    let changed = !content_equal(&dirs, cached);
+    (dirs, report, changed)
+}
+
+/// Refreshes one current file against its previous cached entry (if any):
+/// reuses the cached fields when `(mtime, size)` are unchanged, otherwise
+/// re-scans. Returns `None` when the file has no frontmatter or couldn't be
+/// read/parsed — already folded into `report` in that case.
+fn refresh_one_file(
+    dir: &Path,
+    path: &Path,
+    previous: Option<&CachedFile>,
+    report: &mut LoadReport,
+) -> Option<CachedFile> {
+    if let Some(previous) = previous
+        && let Ok((mtime, size)) = stat_file(path)
+        && mtime == previous.mtime
+        && size == previous.size
+    {
+        report.loaded += 1;
+        return Some(previous.clone());
+    }
+
+    match scan_file(dir, path) {
+        ScanResult::Cached(file) => {
+            report.loaded += 1;
+            Some(file)
+        }
+        ScanResult::NoFrontmatter => None,
+        ScanResult::Warning(msg) => {
+            report.skipped += 1;
+            report.warnings.push(msg);
+            None
+        }
+    }
+}
+
+/// Stats `dir`'s own mtime, used by the `--fast` freshness hybrid (Task 4).
+/// A directory that vanishes mid-scan (a rare TOCTOU race, since `discover`
+/// just listed a file under it) falls back to `SystemTime::UNIX_EPOCH` with
+/// a warning rather than aborting the whole refresh.
+fn stat_dir_mtime(dir: &Path, report: &mut LoadReport) -> SystemTime {
+    fs::metadata(dir)
+        .and_then(|m| m.modified())
+        .unwrap_or_else(|err| {
+            report.warnings.push(format!("{}: {err}", dir.display()));
+            SystemTime::UNIX_EPOCH
+        })
+}
+
+/// True when `a` and `b` contain the same directories with the same
+/// `dir_mtime`/`files`, ignoring each `CachedDir`'s `scanned_at` (which
+/// always advances on a `PerFile` refresh and carries no information about
+/// whether anything actually changed).
+fn content_equal(a: &[CachedDir], b: &[CachedDir]) -> bool {
+    fn normalize(dirs: &[CachedDir]) -> Vec<CachedDir> {
+        let mut normalized: Vec<CachedDir> = dirs
+            .iter()
+            .cloned()
+            .map(|dir| CachedDir {
+                scanned_at: SystemTime::UNIX_EPOCH,
+                ..dir
+            })
+            .collect();
+        normalized.sort_by(|x, y| x.dir.cmp(&y.dir));
+        normalized
+    }
+    normalize(a) == normalize(b)
+}
+
+/// Reconstructs [`Record`]s from cached directories for querying, grouped
+/// by directory.
+///
+/// `root` is the overall scan root — passing it (rather than each
+/// [`CachedDir::dir`]) is what keeps the cache-equals-live invariant intact,
+/// since a live scan ([`crate::store::scan_root`]) resolves every record's
+/// `file.*` attributes relative to that same root, not to a file's
+/// immediate containing directory.
+pub fn records_from(root: &Path, dirs: &[CachedDir]) -> Vec<(PathBuf, Vec<Record>)> {
+    dirs.iter()
+        .map(|cached_dir| {
+            let records = cached_dir
+                .files
+                .iter()
+                .map(|file| {
+                    let path = cached_dir.dir.join(&file.rel_path);
+                    Record::new(root, &path, file.fields.clone())
+                })
+                .collect();
+            (cached_dir.dir.clone(), records)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::Value;
+    use crate::store::{InMemoryStore, RecordStore};
     use indexmap::IndexMap;
+    use std::fs::File;
     use std::path::PathBuf;
     use std::time::{Duration, UNIX_EPOCH};
     use tempfile::TempDir;
@@ -441,5 +677,191 @@ mod tests {
 
         let other = TempDir::new().unwrap();
         assert_eq!(find_vault(other.path()), None);
+    }
+
+    fn write_file(dir: &Path, rel: &str, body: &str) {
+        let p = dir.join(rel);
+        if let Some(parent) = p.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(p, body).unwrap();
+    }
+
+    fn set_mtime(path: &Path, time: SystemTime) {
+        File::open(path).unwrap().set_modified(time).unwrap();
+    }
+
+    /// Builds an initial cache for `vault` by refreshing an empty cache
+    /// against it — i.e. a first-ever scan, expressed via the same
+    /// [`refresh_against_cache`] under test rather than a separate helper.
+    fn build_initial_cache(vault: &Path) -> Vec<CachedDir> {
+        let (dirs, _report, _changed) =
+            refresh_against_cache(vault, &[], &WalkOpts::default(), Freshness::PerFile);
+        dirs
+    }
+
+    /// The cached `status` field for the file named `file_name`, searched
+    /// across every directory.
+    fn cached_status(dirs: &[CachedDir], file_name: &str) -> Value {
+        dirs.iter()
+            .flat_map(|d| &d.files)
+            .find(|f| f.rel_path == file_name)
+            .and_then(|f| f.fields.get("status").cloned())
+            .expect("file not found in cache")
+    }
+
+    /// Every cached file's `rel_path`, across every directory, sorted.
+    fn all_rel_paths(dirs: &[CachedDir]) -> Vec<String> {
+        let mut names: Vec<String> = dirs
+            .iter()
+            .flat_map(|d| d.files.iter().map(|f| f.rel_path.clone()))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn unchanged_file_reuses_cached_fields_without_reparsing() {
+        let td = TempDir::new().unwrap();
+        let a_path = td.path().join("a.md");
+        let content_a = "---\nstatus: draft\n---\n";
+        write_file(td.path(), "a.md", content_a);
+        let original_mtime = fs::metadata(&a_path).unwrap().modified().unwrap();
+
+        let cached = build_initial_cache(td.path());
+        assert_eq!(cached_status(&cached, "a.md"), Value::Str("draft".into()));
+
+        // Same byte length as "draft" (5 chars), so overwriting keeps size
+        // equal; restoring the original mtime then makes (mtime, size)
+        // indistinguishable from the cached entry.
+        let content_b = "---\nstatus: final\n---\n";
+        assert_eq!(
+            content_a.len(),
+            content_b.len(),
+            "fixture must keep byte length equal to isolate mtime as the only signal"
+        );
+        write_file(td.path(), "a.md", content_b);
+        set_mtime(&a_path, original_mtime);
+
+        let (refreshed, report, _changed) =
+            refresh_against_cache(td.path(), &cached, &WalkOpts::default(), Freshness::PerFile);
+        assert_eq!(
+            cached_status(&refreshed, "a.md"),
+            Value::Str("draft".into()),
+            "must reuse the cached value, not re-parse the changed content"
+        );
+        assert_eq!(report.loaded, 1);
+        assert_eq!(report.skipped, 0);
+    }
+
+    #[test]
+    fn changed_mtime_triggers_reparse() {
+        let td = TempDir::new().unwrap();
+        let a_path = td.path().join("a.md");
+        let content_a = "---\nstatus: draft\n---\n";
+        write_file(td.path(), "a.md", content_a);
+        let original_mtime = fs::metadata(&a_path).unwrap().modified().unwrap();
+
+        let cached = build_initial_cache(td.path());
+
+        let content_b = "---\nstatus: final\n---\n";
+        assert_eq!(content_a.len(), content_b.len());
+        write_file(td.path(), "a.md", content_b);
+        set_mtime(&a_path, original_mtime + Duration::from_secs(120));
+
+        let (refreshed, report, _changed) =
+            refresh_against_cache(td.path(), &cached, &WalkOpts::default(), Freshness::PerFile);
+        assert_eq!(cached_status(&refreshed, "a.md"), Value::Str("final".into()));
+        assert_eq!(report.loaded, 1);
+    }
+
+    #[test]
+    fn new_file_added_and_deleted_file_dropped() {
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "a.md", "---\nstatus: draft\n---\n");
+        let cached = build_initial_cache(td.path());
+        assert_eq!(all_rel_paths(&cached), vec!["a.md".to_string()]);
+
+        fs::remove_file(td.path().join("a.md")).unwrap();
+        write_file(td.path(), "b.md", "---\nstatus: draft\n---\n");
+
+        let (refreshed, _report, changed) =
+            refresh_against_cache(td.path(), &cached, &WalkOpts::default(), Freshness::PerFile);
+        assert_eq!(all_rel_paths(&refreshed), vec!["b.md".to_string()]);
+        assert!(changed, "adding/removing a file must count as changed");
+    }
+
+    #[test]
+    fn force_cache_returns_cached_even_when_file_changed() {
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "a.md", "---\nstatus: draft\n---\n");
+        let cached = build_initial_cache(td.path());
+
+        write_file(td.path(), "a.md", "---\nstatus: final\n---\n");
+
+        let (refreshed, report, changed) = refresh_against_cache(
+            td.path(),
+            &cached,
+            &WalkOpts::default(),
+            Freshness::ForceCache,
+        );
+        assert_eq!(
+            cached_status(&refreshed, "a.md"),
+            Value::Str("draft".into()),
+            "--force-cache must never re-read the changed file"
+        );
+        assert!(!changed);
+        assert_eq!(report.loaded, 0);
+        assert_eq!(report.skipped, 0);
+        assert!(report.warnings.is_empty());
+    }
+
+    #[test]
+    fn fast_falls_back_to_per_file_for_now() {
+        // Pins today's documented behavior (Task 3): until Task 4 lands the
+        // dir-mtime + TTL hybrid, `Fast` must behave exactly like `PerFile`.
+        let td = TempDir::new().unwrap();
+        let a_path = td.path().join("a.md");
+        let content_a = "---\nstatus: draft\n---\n";
+        write_file(td.path(), "a.md", content_a);
+        let original_mtime = fs::metadata(&a_path).unwrap().modified().unwrap();
+
+        let cached = build_initial_cache(td.path());
+
+        let content_b = "---\nstatus: final\n---\n";
+        assert_eq!(content_a.len(), content_b.len());
+        write_file(td.path(), "a.md", content_b);
+        set_mtime(&a_path, original_mtime + Duration::from_secs(120));
+
+        let (refreshed, _report, _changed) =
+            refresh_against_cache(td.path(), &cached, &WalkOpts::default(), Freshness::Fast);
+        assert_eq!(cached_status(&refreshed, "a.md"), Value::Str("final".into()));
+    }
+
+    #[test]
+    fn cached_record_matches_live_scan_record() {
+        // Cache-equals-live invariant (design spec §4, and this task's own
+        // "Global constraints"): a record rebuilt from an unchanged
+        // CachedFile must be identical — same fields, same file.* — to a
+        // live scan's record for the same file. Explicitly pinned here
+        // rather than assumed, per the "no test needed because of invariant
+        // X" red flag: this invariant is exactly what `records_from`'s
+        // `root` parameter exists to preserve.
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "plans/a.md", "---\nstatus: draft\n---\n");
+
+        let cached = build_initial_cache(td.path());
+        let cached_records: Vec<Record> = records_from(td.path(), &cached)
+            .into_iter()
+            .flat_map(|(_, records)| records)
+            .collect();
+
+        let (live_store, _report) =
+            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default());
+        let live_records: Vec<&Record> = live_store.records().collect();
+
+        assert_eq!(cached_records.len(), 1);
+        assert_eq!(live_records.len(), 1);
+        assert_eq!(&cached_records[0], live_records[0]);
     }
 }
