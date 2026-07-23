@@ -2,6 +2,9 @@
 name = "querymatter"
 version = "0.1.0"
 edition = "2024"
+description = "Query Markdown YAML frontmatter with a SQL subset (REPL + one-shot CLI)"
+keywords = ["markdown", "frontmatter", "sql", "cli", "repl"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = "1.0.104"

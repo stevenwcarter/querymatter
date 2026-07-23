@@ -68,3 +68,132 @@ fn query_error_exits_nonzero() {
         .assert()
         .failure();
 }
+
+/// The committed sample tree under `tests/fixtures/` (mirrors `samples/`,
+/// which is gitignored) so these tests don't depend on gitignored data.
+const FIX: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+
+#[test]
+fn headline_status_counts() {
+    let out = Command::cargo_bin("querymatter")
+        .unwrap()
+        .args([
+            "-e",
+            "SELECT status, count(*) AS Count WHERE prd = '010' GROUP BY status ORDER BY Count DESC",
+            "--format",
+            "csv",
+        ])
+        .arg(format!("{FIX}/plans"))
+        .arg(format!("{FIX}/product"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    let mut lines = s.lines();
+    assert_eq!(lines.next().unwrap(), "status,Count");
+    // prd '010': plans/DCP-459 draft x1, plans/DCP-461 synced x1,
+    // product/stories/DCP-459 synced x1 -> synced=2, draft=1, DESC by count.
+    assert_eq!(lines.next().unwrap(), "synced,2");
+    assert_eq!(lines.next().unwrap(), "draft,1");
+    assert!(lines.next().is_none());
+}
+
+#[test]
+fn group_by_file_folder() {
+    let out = Command::cargo_bin("querymatter")
+        .unwrap()
+        .args([
+            "-e",
+            "SELECT file.folder, count(*) AS n GROUP BY file.folder",
+            "--format",
+            "json",
+        ])
+        .arg(FIX)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    // plans, product/stories, templates
+    assert!(v.as_array().unwrap().len() >= 2);
+}
+
+#[test]
+fn exclude_templates() {
+    let out = Command::cargo_bin("querymatter")
+        .unwrap()
+        .args([
+            "-e",
+            "SELECT count(*) AS n",
+            "--exclude",
+            "**/templates/**",
+            "--format",
+            "csv",
+        ])
+        .arg(FIX)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    // 3 real docs (2 plans + 1 story); the template is excluded.
+    assert_eq!(s.trim(), "n\n3");
+}
+
+#[test]
+fn missing_directory_exits_nonzero_and_names_path() {
+    let bad = "/no/such/directory/definitely-not-real-qm";
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .arg(bad)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(bad));
+}
+
+#[test]
+fn invalid_exclude_glob_exits_nonzero() {
+    let td = tree();
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .args(["--exclude", "["])
+        .arg(td.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("exclude"));
+}
+
+#[test]
+fn malformed_frontmatter_warning_stays_off_stdout() {
+    let td = TempDir::new().unwrap();
+    fs::write(td.path().join("good.md"), "---\nstatus: draft\n---\n").unwrap();
+    fs::write(td.path().join("bad.md"), "---\n: : broken\n  bad\n---\n").unwrap();
+
+    let out = Command::cargo_bin("querymatter")
+        .unwrap()
+        .args(["-e", "SELECT status", "--format", "json"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    // stdout must be pure, parseable JSON even though one file warned on stderr.
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v.as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn batch_good_then_bad_exits_nonzero() {
+    let td = tree();
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .arg(td.path())
+        .write_stdin("SELECT count(*) AS n;\nSELCT bad;\n")
+        .assert()
+        .failure();
+}
