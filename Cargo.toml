@@ -9,6 +9,9 @@ globset = "0.4.19"
 gray_matter = "0.3.2"
 ignore = "0.4.31"
 indexmap = "2.14.0"
+once_cell = "1.21.4"
+regex = "1.13.1"
+sqlparser = "0.62.0"
 thiserror = "2.0.19"
 
 [profile.release]
