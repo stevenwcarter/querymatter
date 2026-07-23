@@ -11,6 +11,7 @@ pub mod cache;
 mod cli;
 pub mod discover;
 pub mod frontmatter;
+mod gitignore;
 pub mod model;
 pub mod query;
 pub mod render;
@@ -20,7 +21,7 @@ pub mod store;
 
 use std::env;
 use std::fs;
-use std::io::{self, IsTerminal, Read};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -56,9 +57,7 @@ fn run_init(args: &InitArgs) -> anyhow::Result<()> {
 
     let report = cache::build_vault(&base, &opts, args.ttl)?;
 
-    // TODO(Task 7): when `init` runs inside a git working tree and stdin is a
-    // TTY, offer to add `.querymatter/` to the repo's top-level `.gitignore`
-    // (design spec §7). Left as a marked call site; not implemented here.
+    offer_gitignore(&base)?;
 
     eprintln!(
         "querymatter: cached {} file(s) under {} ({} skipped)",
@@ -66,6 +65,53 @@ fn run_init(args: &InitArgs) -> anyhow::Result<()> {
         base.display(),
         report.skipped
     );
+    Ok(())
+}
+
+/// Offers to add `.querymatter/` to the enclosing git repo's `.gitignore`
+/// (design spec §7). A no-op outside a git working tree, or when
+/// `.querymatter` is already ignored. Otherwise: an interactive TTY gets the
+/// yes/no prompt; a piped/non-interactive stdin gets a one-line stderr hint
+/// instead, and `.gitignore` is left untouched.
+fn offer_gitignore(base: &Path) -> anyhow::Result<()> {
+    let Some(root) = gitignore::git_root(base) else {
+        return Ok(());
+    };
+    if gitignore::querymatter_ignored(&root) {
+        return Ok(());
+    }
+
+    if io::stdin().is_terminal() {
+        prompt_add_gitignore(&root)
+    } else {
+        eprintln!("hint: add .querymatter/ to .gitignore");
+        Ok(())
+    }
+}
+
+/// Prompts on stderr and reads one line of stdin; on an affirmative
+/// `y`/`yes` answer (case-insensitive, trimmed), appends `.querymatter/` to
+/// `root`'s `.gitignore` and confirms on stderr. Any other answer leaves
+/// `.gitignore` untouched; a stdin read failure propagates as an error,
+/// aborting `init`.
+fn prompt_add_gitignore(root: &Path) -> anyhow::Result<()> {
+    eprint!("Add .querymatter/ to .gitignore? [y/N] ");
+    io::stderr()
+        .flush()
+        .context("failed to flush the git-ignore prompt")?;
+
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .context("failed to read the git-ignore prompt answer")?;
+
+    if matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
+        gitignore::append_gitignore(root)?;
+        eprintln!(
+            "querymatter: added .querymatter/ to {}",
+            root.join(".gitignore").display()
+        );
+    }
     Ok(())
 }
 
