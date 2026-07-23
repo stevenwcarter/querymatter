@@ -258,10 +258,28 @@ mod tests {
     use super::{Cli, Command};
     use crate::cache::Freshness;
     use crate::render::TableStyle;
-    use clap::Parser;
+    use clap::{CommandFactory, FromArgMatches};
     use std::fs;
     use std::path::Path;
     use tempfile::tempdir;
+
+    /// Parses `args` with the `--table-style` env fallback disabled.
+    ///
+    /// `Cli::parse_from` consults the real process environment, so a
+    /// developer with `QUERYMATTER_TABLE_STYLE` exported would otherwise see
+    /// these tests fail — or, for an invalid value, watch clap `exit(2)` take
+    /// the whole unit-test binary down with it.
+    fn parse(args: &[&str]) -> Cli {
+        try_parse(args).expect("valid CLI args")
+    }
+
+    /// Like [`parse`], but returns clap's error instead of exiting, for the
+    /// tests that assert a bad value is rejected.
+    fn try_parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        let command = Cli::command().mut_arg("table_style", |a| a.env(None::<&str>));
+        let matches = command.try_get_matches_from(args)?;
+        Cli::from_arg_matches(&matches)
+    }
 
     #[test]
     fn resolved_roots_dedups_exact_duplicate_dirs() {
@@ -269,7 +287,7 @@ mod tests {
         let path = dir.path().to_str().unwrap();
         // The same directory passed twice must collapse to a single canonical
         // root, so counts aren't doubled.
-        let cli = Cli::parse_from(["querymatter", path, path]);
+        let cli = parse(&["querymatter", path, path]);
         let roots = cli.resolved_roots().unwrap();
         assert_eq!(roots, vec![fs::canonicalize(dir.path()).unwrap()]);
     }
@@ -278,7 +296,7 @@ mod tests {
     fn resolves_cwd_ignore_file_when_present() {
         let td = tempdir().unwrap();
         fs::write(td.path().join(".querymatterignore"), "x\n").unwrap();
-        let cli = Cli::parse_from(["querymatter"]);
+        let cli = parse(&["querymatter"]);
         assert_eq!(
             cli.walk.resolve_ignore_files(td.path()).unwrap(),
             vec![td.path().join(".querymatterignore")]
@@ -289,7 +307,7 @@ mod tests {
     fn no_ignore_file_skips_cwd() {
         let td = tempdir().unwrap();
         fs::write(td.path().join(".querymatterignore"), "x\n").unwrap();
-        let cli = Cli::parse_from(["querymatter", "--no-ignore-file"]);
+        let cli = parse(&["querymatter", "--no-ignore-file"]);
         assert!(cli.walk.resolve_ignore_files(td.path()).unwrap().is_empty());
     }
 
@@ -300,7 +318,7 @@ mod tests {
         let b = td.path().join("b.ignore");
         fs::write(&a, "x\n").unwrap();
         fs::write(&b, "x\n").unwrap();
-        let cli = Cli::parse_from([
+        let cli = parse(&[
             "querymatter",
             "--no-ignore-file",
             "--ignore-file",
@@ -320,7 +338,7 @@ mod tests {
         fs::write(td.path().join(".querymatterignore"), "x\n").unwrap();
         let extra = td.path().join("extra.ignore");
         fs::write(&extra, "y\n").unwrap();
-        let cli = Cli::parse_from(["querymatter", "--ignore-file", extra.to_str().unwrap()]);
+        let cli = parse(&["querymatter", "--ignore-file", extra.to_str().unwrap()]);
         assert_eq!(
             cli.walk.resolve_ignore_files(td.path()).unwrap(),
             vec![td.path().join(".querymatterignore"), extra]
@@ -331,14 +349,14 @@ mod tests {
     fn missing_ignore_file_errors() {
         let td = tempdir().unwrap();
         let missing = td.path().join("nope.ignore");
-        let cli = Cli::parse_from(["querymatter", "--ignore-file", missing.to_str().unwrap()]);
+        let cli = parse(&["querymatter", "--ignore-file", missing.to_str().unwrap()]);
         assert!(cli.walk.resolve_ignore_files(td.path()).is_err());
     }
 
     #[test]
     fn absent_cwd_file_is_not_error() {
         let td = tempdir().unwrap(); // no .querymatterignore
-        let cli = Cli::parse_from(["querymatter"]);
+        let cli = parse(&["querymatter"]);
         assert!(cli.walk.resolve_ignore_files(td.path()).unwrap().is_empty());
     }
 
@@ -346,81 +364,73 @@ mod tests {
     fn freshness_force_cache_wins_over_fast() {
         // `--force-cache` and `--fast` are individually valid; `freshness()`
         // is the pure mapping (validation of the conflict lives in `validate`).
-        let cli = Cli::parse_from(["querymatter", "--force-cache", "--fast"]);
+        let cli = parse(&["querymatter", "--force-cache", "--fast"]);
         assert_eq!(cli.freshness(), Freshness::ForceCache);
     }
 
     #[test]
     fn freshness_fast_when_only_fast() {
-        let cli = Cli::parse_from(["querymatter", "--fast"]);
+        let cli = parse(&["querymatter", "--fast"]);
         assert_eq!(cli.freshness(), Freshness::Fast);
     }
 
     #[test]
     fn freshness_defaults_to_per_file() {
-        let cli = Cli::parse_from(["querymatter"]);
+        let cli = parse(&["querymatter"]);
         assert_eq!(cli.freshness(), Freshness::PerFile);
     }
 
     #[test]
     fn force_cache_conflicts_with_refresh() {
-        let cli = Cli::parse_from(["querymatter", "--force-cache", "--refresh", "sub"]);
+        let cli = parse(&["querymatter", "--force-cache", "--refresh", "sub"]);
         assert!(cli.validate().is_err());
     }
 
     #[test]
     fn force_cache_conflicts_with_refresh_all() {
-        let cli = Cli::parse_from(["querymatter", "--force-cache", "--refresh-all"]);
+        let cli = parse(&["querymatter", "--force-cache", "--refresh-all"]);
         assert!(cli.validate().is_err());
     }
 
     #[test]
     fn no_cache_conflicts_with_force_cache() {
-        let cli = Cli::parse_from(["querymatter", "--no-cache", "--force-cache"]);
+        let cli = parse(&["querymatter", "--no-cache", "--force-cache"]);
         assert!(cli.validate().is_err());
     }
 
     #[test]
     fn no_cache_conflicts_with_refresh() {
-        let cli = Cli::parse_from(["querymatter", "--no-cache", "--refresh", "sub"]);
+        let cli = parse(&["querymatter", "--no-cache", "--refresh", "sub"]);
         assert!(cli.validate().is_err());
     }
 
     #[test]
     fn no_cache_conflicts_with_refresh_all() {
-        let cli = Cli::parse_from(["querymatter", "--no-cache", "--refresh-all"]);
+        let cli = parse(&["querymatter", "--no-cache", "--refresh-all"]);
         assert!(cli.validate().is_err());
     }
 
     #[test]
     fn force_cache_conflicts_with_fast() {
-        let cli = Cli::parse_from(["querymatter", "--force-cache", "--fast"]);
+        let cli = parse(&["querymatter", "--force-cache", "--fast"]);
         assert!(cli.validate().is_err());
     }
 
     #[test]
     fn compatible_flags_pass_validation() {
-        assert!(Cli::parse_from(["querymatter"]).validate().is_ok());
+        assert!(parse(&["querymatter"]).validate().is_ok());
+        assert!(parse(&["querymatter", "--fast"]).validate().is_ok());
         assert!(
-            Cli::parse_from(["querymatter", "--fast"])
+            parse(&["querymatter", "--refresh", "a", "--refresh", "b"])
                 .validate()
                 .is_ok()
         );
-        assert!(
-            Cli::parse_from(["querymatter", "--refresh", "a", "--refresh", "b"])
-                .validate()
-                .is_ok()
-        );
-        assert!(
-            Cli::parse_from(["querymatter", "--no-cache"])
-                .validate()
-                .is_ok()
-        );
+        assert!(parse(&["querymatter", "--no-cache"]).validate().is_ok());
     }
 
     #[test]
     fn init_subcommand_parses_dir_and_ttl() {
-        let cli = Cli::parse_from(["querymatter", "init", "somedir", "--ttl", "42"]);
+        let cli = parse(&["querymatter", "init", "somedir", "--ttl", "42"]);
         match cli.command {
             Some(Command::Init(args)) => {
                 assert_eq!(args.dir.as_deref(), Some(Path::new("somedir")));
@@ -432,7 +442,7 @@ mod tests {
 
     #[test]
     fn init_ttl_defaults_to_300() {
-        let cli = Cli::parse_from(["querymatter", "init"]);
+        let cli = parse(&["querymatter", "init"]);
         match cli.command {
             Some(Command::Init(args)) => assert_eq!(args.ttl, 300),
             other => panic!("expected an Init subcommand, got {other:?}"),
@@ -443,7 +453,7 @@ mod tests {
     fn walk_flags_still_parse_identically_after_flatten() {
         // `flatten` is transparent on the command line: the six walk flags
         // parse exactly as before, now landing on the nested `walk` struct.
-        let cli = Cli::parse_from([
+        let cli = parse(&[
             "querymatter",
             "--hidden",
             "--respect-gitignore",
@@ -460,18 +470,18 @@ mod tests {
 
     #[test]
     fn table_style_defaults_to_ascii() {
-        let cli = Cli::parse_from(["querymatter"]);
+        let cli = parse(&["querymatter"]);
         assert_eq!(cli.table_style, TableStyle::Ascii);
     }
 
     #[test]
     fn table_style_flag_parses() {
-        let cli = Cli::parse_from(["querymatter", "--table-style", "unicode"]);
+        let cli = parse(&["querymatter", "--table-style", "unicode"]);
         assert_eq!(cli.table_style, TableStyle::Unicode);
     }
 
     #[test]
     fn bad_table_style_is_rejected() {
-        assert!(Cli::try_parse_from(["querymatter", "--table-style", "fancy"]).is_err());
+        assert!(try_parse(&["querymatter", "--table-style", "fancy"]).is_err());
     }
 }

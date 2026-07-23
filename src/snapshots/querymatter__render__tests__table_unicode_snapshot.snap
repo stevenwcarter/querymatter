@@ -1,6 +1,6 @@
 ---
 source: src/render.rs
-expression: "render(&table(), Format::Table, TableStyle::Unicode)"
+expression: "render(&table(), Output::Format(Format::Table), TableStyle::Unicode)"
 ---
 ╭────────┬───────╮
 │ status │ Count │

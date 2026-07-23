@@ -22,7 +22,8 @@ use crate::store::LoadReport;
 
 /// Prompt shown while waiting for a new statement or dot-command.
 const PROMPT: &str = "querymatter> ";
-/// Prompt shown while a statement is still accumulating (no `;` yet).
+/// Prompt shown while a statement is still accumulating (no `;`, `\g`, or
+/// `\G` yet).
 const CONTINUATION_PROMPT: &str = "   ...> ";
 /// The `file.*` pseudo-columns every record exposes, independent of
 /// frontmatter (kept in sync with [`crate::model::FileAttr`]'s labels).
@@ -298,7 +299,7 @@ fn print_help() {
     println!("  .quit / .exit      leave the REPL");
     println!();
     println!("End a statement with ';' to run it, or with '\\G' to print each row as a block of");
-    println!("name: value lines; statements may span multiple lines.");
+    println!("name: value lines; '\\g' is a synonym for ';'. Statements may span multiple lines.");
 }
 
 /// Prints the discovered frontmatter fields, the `file.*` pseudo-columns,

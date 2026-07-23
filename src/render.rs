@@ -1,5 +1,6 @@
 //! Rendering a [`ResultTable`] to the REPL's output formats: an aligned
-//! table, JSON, CSV, TSV, and a Markdown table.
+//! table, JSON, CSV, TSV, a Markdown table, and MySQL-style vertical
+//! (`\G`) output.
 //!
 //! Every format is returned with no trailing newline, so a caller (the REPL
 //! printer) can add exactly one when it prints the result.
@@ -18,7 +19,8 @@ use crate::query::ResultTable;
 /// The output format a rendered [`ResultTable`] can take.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
-    /// An aligned, bordered table (via `comfy-table`'s default ASCII style).
+    /// An aligned, bordered table, with borders drawn per the selected
+    /// [`TableStyle`].
     Table,
     /// A JSON array of objects keyed by column header.
     Json,

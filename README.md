@@ -31,7 +31,7 @@ piped stdin.
 | `querymatter [dirs]` (stdin is a TTY) | Interactive REPL |
 | `querymatter -e "SELECT …" [dirs]` | Run one query, print, exit |
 | `querymatter --query - [dirs]` | Read the query text from stdin, run once, exit |
-| `… \| querymatter [dirs]` (stdin piped, no `-e`) | Batch mode: run each `;`-separated statement from stdin in turn, no prompt |
+| `… \| querymatter [dirs]` (stdin piped, no `-e`) | Batch mode: run each statement from stdin in turn (ended by `;` or `\G`), no prompt |
 | `querymatter init [dir]` | Build a `.querymatter/` cache over `dir` (default cwd) — see [Caching large vaults](#caching-large-vaults-querymatter) |
 
 `-e`/`--query` always wins if given; otherwise piped (non-TTY) stdin means

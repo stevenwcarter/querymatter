@@ -1,6 +1,6 @@
 ---
 source: src/render.rs
-expression: "render(&table(), Format::Table, TableStyle::Plain)"
+expression: "render(&table(), Output::Format(Format::Table), TableStyle::Plain)"
 ---
  status  Count
  synced  2

@@ -1,6 +1,6 @@
 ---
 source: src/render.rs
-expression: "render(&table(), Format::Table, TableStyle::Compact)"
+expression: "render(&table(), Output::Format(Format::Table), TableStyle::Compact)"
 ---
 ────────────────
  status   Count

@@ -757,7 +757,8 @@ fn bad_table_style_flag_exits_non_zero() {
         .args(["-e", "SELECT status", "--table-style", "fancy"])
         .arg(td.path())
         .assert()
-        .failure();
+        .failure()
+        .stderr(predicates::str::contains("fancy"));
 }
 
 #[test]
@@ -769,7 +770,8 @@ fn bad_table_style_env_var_exits_non_zero() {
         .args(["-e", "SELECT status"])
         .arg(td.path())
         .assert()
-        .failure();
+        .failure()
+        .stderr(predicates::str::contains("fancy"));
 }
 
 #[test]
