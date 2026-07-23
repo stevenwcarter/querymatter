@@ -176,7 +176,7 @@ fn run_query(cli: &Cli) -> anyhow::Result<()> {
     for warning in &report.warnings {
         eprintln!("querymatter: {warning}");
     }
-    let session = Session::new(Box::new(store), cli.format, session_vault);
+    let session = Session::new(Box::new(store), cli.format, cli.table_style, session_vault);
 
     match cli.query.as_deref() {
         // `-e -`: read the query text from stdin, then run it.

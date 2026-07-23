@@ -20,7 +20,7 @@ use globset::Glob;
 
 use crate::cache::Freshness;
 use crate::discover::WalkOpts;
-use crate::render::Format;
+use crate::render::{Format, TableStyle};
 
 /// The six flags that shape a directory walk, shared verbatim between query
 /// mode and `querymatter init` via `#[command(flatten)]`.
@@ -120,6 +120,10 @@ pub struct Cli {
     /// Output format for results.
     #[arg(long, default_value = "table")]
     pub format: Format,
+
+    /// Border style for `--format table` (ascii, unicode, compact, plain).
+    #[arg(long, env = "QUERYMATTER_TABLE_STYLE", default_value = "ascii")]
+    pub table_style: TableStyle,
 
     /// Flags shared with `querymatter init` that shape the directory walk.
     #[command(flatten)]
@@ -253,6 +257,7 @@ impl Cli {
 mod tests {
     use super::{Cli, Command};
     use crate::cache::Freshness;
+    use crate::render::TableStyle;
     use clap::Parser;
     use std::fs;
     use std::path::Path;
@@ -451,5 +456,22 @@ mod tests {
         assert!(cli.walk.respect_gitignore);
         assert_eq!(cli.walk.ext, vec!["md".to_string(), "txt".to_string()]);
         assert_eq!(cli.walk.exclude, vec!["**/x/**".to_string()]);
+    }
+
+    #[test]
+    fn table_style_defaults_to_ascii() {
+        let cli = Cli::parse_from(["querymatter"]);
+        assert_eq!(cli.table_style, TableStyle::Ascii);
+    }
+
+    #[test]
+    fn table_style_flag_parses() {
+        let cli = Cli::parse_from(["querymatter", "--table-style", "unicode"]);
+        assert_eq!(cli.table_style, TableStyle::Unicode);
+    }
+
+    #[test]
+    fn bad_table_style_is_rejected() {
+        assert!(Cli::try_parse_from(["querymatter", "--table-style", "fancy"]).is_err());
     }
 }

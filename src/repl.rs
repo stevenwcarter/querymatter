@@ -16,7 +16,7 @@ use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
 use crate::model::Value;
-use crate::render::Format;
+use crate::render::{Format, TableStyle};
 use crate::session::Session;
 use crate::store::LoadReport;
 
@@ -52,6 +52,8 @@ pub enum DotCommand {
     Schema,
     /// `.format [fmt]` — set (`Some`) or report (`None`) the output format.
     Format(Option<Format>),
+    /// `.style [style]` — set (`Some`) or report (`None`) the table style.
+    Style(Option<TableStyle>),
     /// `.reload` — rescan every tracked directory (in-memory only; never
     /// touches a `.querymatter` cache).
     Reload,
@@ -67,6 +69,10 @@ pub enum DotCommand {
     /// `.format <name>` where `<name>` is not a known [`Format`], carrying the
     /// offending name so the error can name the format rather than the command.
     BadFormat(String),
+    /// `.style <name>` where `<name>` is not a known [`TableStyle`], carrying
+    /// the offending name so the error can name the style rather than the
+    /// command.
+    BadStyle(String),
     /// Any other `.`-prefixed line, carried verbatim for the error message.
     Unknown(String),
 }
@@ -146,6 +152,13 @@ pub fn parse_dot(line: &str) -> DotCommand {
                 Err(_) => DotCommand::BadFormat(arg.to_string()),
             },
         },
+        "style" => match words.next() {
+            None => DotCommand::Style(None),
+            Some(arg) => match arg.parse() {
+                Ok(style) => DotCommand::Style(Some(style)),
+                Err(_) => DotCommand::BadStyle(arg.to_string()),
+            },
+        },
         _ => DotCommand::Unknown(line.to_string()),
     }
 }
@@ -214,22 +227,27 @@ pub fn run(mut session: Session) -> anyhow::Result<()> {
 /// should exit (`.quit`/`.exit`).
 ///
 /// stdout/stderr policy: reference/inspection output (`.help`, `.schema`, and
-/// `.format`'s report of the current format) goes to stdout; the
-/// `.reload`/`.refresh`/`.refresh-all` reports and all error messages
-/// (unknown command, bad format) go to stderr, keeping stdout clean for
-/// piping.
+/// `.format`'s/`.style`'s reports of the current format/style) goes to
+/// stdout; the `.reload`/`.refresh`/`.refresh-all` reports and all error
+/// messages (unknown command, bad format, bad style) go to stderr, keeping
+/// stdout clean for piping.
 fn dispatch_dot(cmd: DotCommand, session: &mut Session) -> bool {
     match cmd {
         DotCommand::Help => print_help(),
         DotCommand::Schema => print_schema(session),
         DotCommand::Format(Some(fmt)) => session.set_format(fmt),
         DotCommand::Format(None) => println!("format: {}", format_name(session.format)),
+        DotCommand::Style(Some(style)) => session.set_style(style),
+        DotCommand::Style(None) => println!("style: {}", style_name(session.style)),
         DotCommand::Reload => report_reload(session),
         DotCommand::Refresh(path) => report_refresh(session, path.as_deref().map(Path::new)),
         DotCommand::RefreshAll => report_refresh(session, None),
         DotCommand::Quit => return true,
         DotCommand::BadFormat(name) => {
             eprintln!("querymatter: unknown format '{name}' (try: table, json, csv, tsv, md)");
+        }
+        DotCommand::BadStyle(name) => {
+            eprintln!("querymatter: unknown style '{name}' (try: ascii, unicode, compact, plain)");
         }
         DotCommand::Unknown(raw) => {
             eprintln!("querymatter: unknown command {raw:?} (try .help)");
@@ -244,6 +262,9 @@ fn print_help() {
     println!("  .help              show this message");
     println!("  .schema            list frontmatter fields, file.* columns, and the record count");
     println!("  .format [fmt]      show, or set, the output format (table, json, csv, tsv, md)");
+    println!(
+        "  .style [style]     show, or set, the table border style (ascii, unicode, compact, plain)"
+    );
     println!("  .reload            rescan every tracked directory (in-memory only)");
     println!(
         "  .refresh [path]    re-scan path (or all); updates the .querymatter cache, else in memory"
@@ -314,6 +335,17 @@ fn format_name(format: Format) -> &'static str {
         Format::Csv => "csv",
         Format::Tsv => "tsv",
         Format::Md => "md",
+    }
+}
+
+/// The name `.style` reports/accepts for `style`, kept in sync with
+/// [`TableStyle`]'s `FromStr` impl.
+fn style_name(style: TableStyle) -> &'static str {
+    match style {
+        TableStyle::Ascii => "ascii",
+        TableStyle::Unicode => "unicode",
+        TableStyle::Compact => "compact",
+        TableStyle::Plain => "plain",
     }
 }
 
@@ -444,5 +476,24 @@ mod tests {
             DotCommand::Refresh(Some("plans".to_string()))
         );
         assert!(matches!(parse_dot(".refresh-all"), DotCommand::RefreshAll));
+    }
+
+    #[test]
+    fn style_command_parses() {
+        assert_eq!(
+            parse_dot(".style unicode"),
+            DotCommand::Style(Some(TableStyle::Unicode))
+        );
+        assert!(matches!(parse_dot(".style"), DotCommand::Style(None)));
+    }
+
+    /// A known `.style` with an unknown name is BadStyle (reported as an
+    /// unknown *style*), not an unknown command — mirroring `.format`.
+    #[test]
+    fn bad_style_arg_is_bad_style_not_unknown_command() {
+        match parse_dot(".style fancy") {
+            DotCommand::BadStyle(name) => assert_eq!(name, "fancy"),
+            other => panic!("expected BadStyle, got {other:?}"),
+        }
     }
 }

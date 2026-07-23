@@ -97,6 +97,7 @@ available alongside frontmatter fields:
 | --- | --- |
 | `-e, --query <QUERY>` | One-shot mode; `-` reads the query text from stdin. May contain several `;`-separated statements. |
 | `--format <FMT>` | `table` (default), `json`, `csv`, `tsv`, or `md`. In the REPL this is just the *initial* format — `.format` changes it live. |
+| `--table-style <STYLE>` | Border style for `--format table`: `ascii` (default), `unicode`, `compact`, or `plain`. Also settable per-shell with `QUERYMATTER_TABLE_STYLE`; the flag wins. Ignored by `json`/`csv`/`tsv`/`md`. In the REPL this is just the *initial* style — `.style` changes it live. |
 | `--ext <LIST>` | Comma-separated extensions to include. Default `md,markdown`. |
 | `--respect-gitignore` | Honor `.gitignore`/`.ignore` while walking. **Off by default** — see below. |
 | `--hidden` | Descend into hidden files/directories (e.g. `.git`, `.obsidian`). Off by default. |
@@ -229,6 +230,7 @@ rather than SQL:
 | `.help` | List the dot-commands. |
 | `.schema` | List discovered frontmatter fields, the `file.*` columns, and the record count. |
 | `.format [fmt]` | Show, or set, the output format for subsequent queries. |
+| `.style [style]` | Show, or set, the table border style (`ascii`, `unicode`, `compact`, `plain`) for subsequent queries. |
 | `.reload` | Re-scan every tracked directory (in-memory only; never touches a `.querymatter` cache). |
 | `.refresh [path]` | Force a re-scan of `path` (or the whole vault); updates the `.querymatter` cache when one is loaded, otherwise behaves like `.reload`. |
 | `.refresh-all` | Force a re-scan of the whole vault; alias for `.refresh` with no path. |

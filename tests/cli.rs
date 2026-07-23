@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use predicates::prelude::*;
 use std::fs;
 use tempfile::TempDir;
 
@@ -676,4 +677,97 @@ fn missing_ignore_file_flag_exits_nonzero() {
         .assert()
         .failure()
         .stderr(predicates::str::contains("definitely-nonexistent.ignore"));
+}
+
+/// `--table-style` is opt-in: with nothing set, output stays ASCII. The
+/// env-var removal matters — a developer with QUERYMATTER_TABLE_STYLE
+/// exported would otherwise see this pass or fail by accident.
+#[test]
+fn table_style_defaults_to_ascii() {
+    let td = tree();
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .env_remove("QUERYMATTER_TABLE_STYLE")
+        .args(["-e", "SELECT status WHERE prd = '010'"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("+--"))
+        .stdout(predicates::str::contains("╭").not());
+}
+
+#[test]
+fn table_style_flag_draws_unicode_borders() {
+    let td = tree();
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .env_remove("QUERYMATTER_TABLE_STYLE")
+        .args([
+            "-e",
+            "SELECT status WHERE prd = '010'",
+            "--table-style",
+            "unicode",
+        ])
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("╭"));
+}
+
+#[test]
+fn table_style_env_var_is_honored() {
+    let td = tree();
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .env("QUERYMATTER_TABLE_STYLE", "unicode")
+        .args(["-e", "SELECT status WHERE prd = '010'"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("╭"));
+}
+
+#[test]
+fn table_style_flag_overrides_env_var() {
+    let td = tree();
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .env("QUERYMATTER_TABLE_STYLE", "unicode")
+        .args([
+            "-e",
+            "SELECT status WHERE prd = '010'",
+            "--table-style",
+            "ascii",
+        ])
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("+--"))
+        .stdout(predicates::str::contains("╭").not());
+}
+
+/// A typo'd style must fail loudly from either source, never degrade to the
+/// default.
+#[test]
+fn bad_table_style_flag_exits_non_zero() {
+    let td = tree();
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .env_remove("QUERYMATTER_TABLE_STYLE")
+        .args(["-e", "SELECT status", "--table-style", "fancy"])
+        .arg(td.path())
+        .assert()
+        .failure();
+}
+
+#[test]
+fn bad_table_style_env_var_exits_non_zero() {
+    let td = tree();
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .env("QUERYMATTER_TABLE_STYLE", "fancy")
+        .args(["-e", "SELECT status"])
+        .arg(td.path())
+        .assert()
+        .failure();
 }
