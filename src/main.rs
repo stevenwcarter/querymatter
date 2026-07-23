@@ -28,8 +28,10 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     cli.validate_excludes()?;
     let roots = cli.resolved_roots()?;
+    let mut walk_opts = cli.walk_opts();
+    walk_opts.ignore_files = cli.ignore_files()?;
 
-    let (store, report) = InMemoryStore::load(roots, cli.walk_opts());
+    let (store, report) = InMemoryStore::load(roots, walk_opts);
     for warning in &report.warnings {
         eprintln!("querymatter: {warning}");
     }

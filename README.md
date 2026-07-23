@@ -100,6 +100,37 @@ available alongside frontmatter fields:
 | `--respect-gitignore` | Honor `.gitignore`/`.ignore` while walking. **Off by default** — see below. |
 | `--hidden` | Descend into hidden files/directories (e.g. `.git`, `.obsidian`). Off by default. |
 | `--exclude <GLOB>` | Path glob to skip. Repeatable, e.g. `--exclude '**/templates/**'`. |
+| `--ignore-file <PATH>` | Apply a gitignore-style ignore file. Repeatable; applied in order after the auto-discovered cwd `.querymatterignore`. |
+| `--no-ignore-file` | Skip auto-discovering `.querymatterignore` in the current directory. Explicit `--ignore-file`s still apply. |
+
+## Ignoring files (`.querymatterignore`)
+
+`querymatter` will skip files matched by a `.querymatterignore` in the
+current directory, if one exists. It uses **gitignore syntax** — one pattern
+per line, `#` comments, and `!` to re-include a path a broader pattern
+excluded:
+
+```gitignore
+templates/
+*.draft.md
+!templates/keep-this.md
+```
+
+A few things worth knowing:
+
+- **Always honored.** Unlike `.gitignore`, which `querymatter` only reads
+  when you pass `--respect-gitignore`, a `.querymatterignore` applies
+  unconditionally whenever it's found.
+- **Auto-discovered** as `.querymatterignore` in the current directory. (A
+  future `.querymatter` vault marker will also check the vault's parent
+  directory — see [`TODO.md`](TODO.md).)
+- `--ignore-file <PATH>` applies additional ignore files, in the order
+  given, after the cwd file. Repeat it to layer several.
+- `--no-ignore-file` disables the cwd auto-discovery; any explicit
+  `--ignore-file`s you pass still apply.
+- It composes with `--exclude <GLOB>` (ad-hoc globs) and
+  `--respect-gitignore` (`.gitignore`/`.ignore` rules) — all three filters
+  apply together.
 
 ## REPL dot-commands
 

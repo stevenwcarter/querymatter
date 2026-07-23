@@ -113,19 +113,11 @@ impl Cli {
     /// the cwd `.querymatterignore` (unless `--no-ignore-file`) followed by each
     /// `--ignore-file` in order. This is the single seam a future `.querymatter`
     /// vault extends (prepending the vault-parent file).
-    // First consumed by Task 3's `main` wiring; `cli` is a private module
-    // (`mod cli;`), so this `pub` method is unreachable-so-far and clippy's
-    // dead-code lint correctly flags it until then. Remove once Task 3 calls it.
-    #[allow(dead_code)]
     pub fn ignore_files(&self) -> anyhow::Result<Vec<PathBuf>> {
         let cwd = env::current_dir().context("failed to determine the current directory")?;
         self.resolve_ignore_files(&cwd)
     }
 
-    // Exercised directly by the tests below; only reachable through
-    // `ignore_files` (above) in non-test builds, so it's dead there too until
-    // Task 3 wires `main` to call `ignore_files`.
-    #[allow(dead_code)]
     fn resolve_ignore_files(&self, cwd: &Path) -> anyhow::Result<Vec<PathBuf>> {
         let mut files = Vec::new();
         if !self.no_ignore_file {

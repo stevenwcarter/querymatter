@@ -197,3 +197,47 @@ fn batch_good_then_bad_exits_nonzero() {
         .assert()
         .failure();
 }
+
+#[test]
+fn querymatterignore_in_cwd_excludes_matches() {
+    let td = TempDir::new().unwrap();
+    let w = |rel: &str, body: &str| {
+        let p = td.path().join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, body).unwrap();
+    };
+    w("plans/a.md", "---\nstatus: draft\n---\n");
+    w("templates/t.md", "---\nstatus: draft\n---\n");
+    w(".querymatterignore", "templates/\n");
+
+    // Run with cwd = td so the cwd .querymatterignore is auto-discovered; scan ".".
+    let out = Command::cargo_bin("querymatter")
+        .unwrap()
+        .current_dir(td.path())
+        .args(["-e", "SELECT count(*) AS n", "--format", "csv", "."])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    // Only plans/a.md counts; templates/t.md is ignored.
+    assert_eq!(s.lines().last().unwrap().trim(), "1", "got: {s:?}");
+}
+
+#[test]
+fn missing_ignore_file_flag_exits_nonzero() {
+    let td = TempDir::new().unwrap();
+    fs::write(td.path().join("a.md"), "---\nstatus: draft\n---\n").unwrap();
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .args([
+            "--ignore-file",
+            "definitely-nonexistent.ignore",
+            "-e",
+            "SELECT count(*) AS n",
+        ])
+        .arg(td.path())
+        .assert()
+        .failure();
+}
