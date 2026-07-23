@@ -172,6 +172,26 @@ mod tests {
         assert_eq!(names, vec!["kept.md"]);
     }
     #[test]
+    fn matches_extension_case_insensitively() {
+        let td = TempDir::new().unwrap();
+        touch(td.path(), "E.MD", "x");
+        touch(td.path(), "f.Markdown", "x");
+        touch(td.path(), "g.md", "x");
+        let got = discover(td.path(), &WalkOpts::default());
+        let names: Vec<_> = got
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        assert!(
+            names.contains(&"E.MD".to_string()),
+            "uppercase .MD extension should match case-insensitively: {names:?}"
+        );
+        assert!(
+            names.contains(&"f.Markdown".to_string()),
+            "mixed-case .Markdown extension should match case-insensitively: {names:?}"
+        );
+    }
+    #[test]
     fn exclude_glob_skips() {
         let td = TempDir::new().unwrap();
         touch(td.path(), "keep.md", "x");
