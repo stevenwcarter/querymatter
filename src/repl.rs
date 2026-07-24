@@ -21,6 +21,7 @@ use rustyline::{Context as RlContext, Editor, Helper, Highlighter, Hinter, Valid
 
 use crate::config::ConfigKey;
 use crate::model::Value;
+use crate::output::OutputSink;
 use crate::render::{Format, TableStyle};
 use crate::session::{FieldStat, Session, Statement, Terminator};
 use crate::store::LoadReport;
@@ -52,6 +53,7 @@ const DOT_COMMAND_NAMES: &[&str] = &[
     ".describe",
     ".format",
     ".style",
+    ".output",
     ".settings",
     ".set",
     ".unset",
@@ -93,6 +95,10 @@ pub enum DotCommand {
     Format(Option<Format>),
     /// `.style [style]` — set (`Some`) or report (`None`) the table style.
     Style(Option<TableStyle>),
+    /// `.output [path]` — redirect subsequent statement results to `path`
+    /// (`Some`), or reset to stdout (`None`, from a bare `.output` or an
+    /// explicit `.output stdout`).
+    Output(Option<String>),
     /// `.reload` — rescan every tracked directory (in-memory only; never
     /// touches a `.querymatter` cache).
     Reload,
@@ -240,6 +246,11 @@ pub fn parse_dot(line: &str) -> DotCommand {
                 Err(_) => DotCommand::BadStyle(arg.to_string()),
             },
         },
+        "output" => match words.next() {
+            None => DotCommand::Output(None),
+            Some(arg) if arg.eq_ignore_ascii_case("stdout") => DotCommand::Output(None),
+            Some(arg) => DotCommand::Output(Some(arg.to_string())),
+        },
         "settings" => DotCommand::Settings,
         "set" => match (words.next(), rest_after_key(rest, 2)) {
             (Some(key), Some(value)) => match parse_key(key) {
@@ -283,7 +294,10 @@ fn rest_after_key(rest: &str, skip: usize) -> Option<String> {
 /// directory via [`ProjectDirs`]; a missing or unwritable history file is at
 /// most a warning on stderr, never a fatal error — the REPL keeps working
 /// without it. Tab-completion is wired via [`ReplHelper`], whose schema
-/// snapshot is taken here, once, at start-up.
+/// snapshot is taken here, once, at start-up. Each statement's rendered
+/// result goes to an [`OutputSink`] that starts on stdout and is redirected
+/// by `.output` for the rest of the session; the `-- N rows` line and every
+/// error stay on stderr regardless of where the sink points.
 pub fn run(mut session: Session) -> anyhow::Result<()> {
     let helper = ReplHelper {
         schema: session.schema(),
@@ -300,6 +314,7 @@ pub fn run(mut session: Session) -> anyhow::Result<()> {
     println!("{}", banner(record_count(&session)));
 
     let mut buffer = LineBuffer::new();
+    let mut sink = OutputSink::Stdout;
     loop {
         let prompt = if buffer.is_pending() {
             CONTINUATION_PROMPT
@@ -328,13 +343,15 @@ pub fn run(mut session: Session) -> anyhow::Result<()> {
             Line::Blank | Line::More => {}
             Line::Statement(statement) => match session.render_statement_counted(&statement) {
                 Ok((rendered, count)) => {
-                    println!("{rendered}");
+                    if let Err(err) = sink.write_block(&rendered) {
+                        eprintln!("querymatter: failed to write results: {err}");
+                    }
                     eprintln!("{}", row_count_line(count));
                 }
                 Err(err) => eprintln!("querymatter: {err:#}"),
             },
             Line::Dot(cmd, _) => {
-                if dispatch_dot(cmd, &mut session) {
+                if dispatch_dot(cmd, &mut session, &mut sink) {
                     break;
                 }
             }
@@ -397,16 +414,16 @@ fn history_entry(line: &Line) -> Option<String> {
     }
 }
 
-/// Runs one dot-command against `session`, returning `true` when the REPL
-/// should exit (`.quit`/`.exit`).
+/// Runs one dot-command against `session`, redirecting `sink` on `.output`,
+/// and returning `true` when the REPL should exit (`.quit`/`.exit`).
 ///
 /// stdout/stderr policy: reference/inspection output (`.help`, `.schema`,
 /// `.settings`, and `.format`'s/`.style`'s reports of the current
 /// format/style) goes to stdout; the `.reload`/`.refresh`/`.refresh-all`
-/// reports, `.set`/`.unset` confirmations, and all error messages (unknown
-/// command, bad format, bad style, bad key, missing argument) go to stderr,
-/// keeping stdout clean for piping.
-fn dispatch_dot(cmd: DotCommand, session: &mut Session) -> bool {
+/// reports, `.set`/`.unset` confirmations, `.output`'s confirmation, and all
+/// error messages (unknown command, bad format, bad style, bad key, missing
+/// argument) go to stderr, keeping stdout clean for piping.
+fn dispatch_dot(cmd: DotCommand, session: &mut Session, sink: &mut OutputSink) -> bool {
     match cmd {
         DotCommand::Help => print_help(),
         DotCommand::Schema => print_schema(session),
@@ -415,6 +432,7 @@ fn dispatch_dot(cmd: DotCommand, session: &mut Session) -> bool {
         DotCommand::Format(None) => println!("format: {}", format_name(session.format())),
         DotCommand::Style(Some(style)) => session.set_style(style),
         DotCommand::Style(None) => println!("style: {}", style_name(session.style())),
+        DotCommand::Output(target) => apply_output(sink, target),
         DotCommand::Reload => report_reload(session),
         DotCommand::Refresh(path) => report_refresh(session, path.as_deref().map(Path::new)),
         DotCommand::RefreshAll => report_refresh(session, None),
@@ -447,6 +465,29 @@ fn dispatch_dot(cmd: DotCommand, session: &mut Session) -> bool {
         }
     }
     false
+}
+
+/// Applies a `.output` dot-command to `sink`: `Some(path)` truncates and
+/// opens `path`, redirecting every later statement's result to it for the
+/// rest of the session; `None` (a bare `.output` or `.output stdout`) resets
+/// to stdout. Either way a one-line confirmation goes to stderr. A `path`
+/// that can't be opened for writing is reported on stderr instead, and
+/// `sink` is left exactly as it was — the session keeps running on whatever
+/// it was already writing to.
+fn apply_output(sink: &mut OutputSink, target: Option<String>) {
+    match target {
+        None => {
+            *sink = OutputSink::Stdout;
+            eprintln!("querymatter: results on stdout");
+        }
+        Some(path) => match OutputSink::open_file(Path::new(&path)) {
+            Ok(opened) => {
+                *sink = opened;
+                eprintln!("querymatter: writing results to {path}");
+            }
+            Err(err) => eprintln!("querymatter: cannot write to {path}: {err}"),
+        },
+    }
 }
 
 /// Reports the outcome of a `.set` on stderr: the file written, and a note
@@ -523,6 +564,10 @@ fn help_text() -> String {
     let _ = writeln!(
         text,
         "  .style [style]     show, or set, the table border style (ascii, unicode, compact, plain)"
+    );
+    let _ = writeln!(
+        text,
+        "  .output [path]     redirect results to path, or 'stdout'/no argument to reset"
     );
     let _ = writeln!(
         text,
@@ -1050,6 +1095,54 @@ mod tests {
             DotCommand::BadStyle(name) => assert_eq!(name, "fancy"),
             other => panic!("expected BadStyle, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn output_command_parses_a_path() {
+        assert_eq!(
+            parse_dot(".output results.txt"),
+            DotCommand::Output(Some("results.txt".to_string()))
+        );
+    }
+
+    /// A bare `.output` and an explicit `.output stdout` (any casing) both
+    /// mean "reset to stdout" — `None` — rather than redirecting to a file
+    /// literally named `stdout`.
+    #[test]
+    fn output_command_with_no_arg_or_stdout_resets() {
+        assert_eq!(parse_dot(".output"), DotCommand::Output(None));
+        assert_eq!(parse_dot(".output stdout"), DotCommand::Output(None));
+        assert_eq!(parse_dot(".output STDOUT"), DotCommand::Output(None));
+    }
+
+    #[test]
+    fn apply_output_redirects_to_a_file_then_resets_to_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.txt");
+        let mut sink = OutputSink::Stdout;
+
+        apply_output(&mut sink, Some(path.to_str().unwrap().to_string()));
+        assert!(matches!(sink, OutputSink::File(_)));
+        sink.write_block("hello").unwrap();
+
+        apply_output(&mut sink, None);
+        assert!(matches!(sink, OutputSink::Stdout));
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "hello\n");
+    }
+
+    /// A path that can't be opened for writing (its parent directory doesn't
+    /// exist) leaves `sink` exactly as it was, per the ambiguity resolved in
+    /// the task brief: the session keeps running on stdout rather than
+    /// silently losing subsequent results.
+    #[test]
+    fn apply_output_leaves_the_sink_untouched_on_an_unwritable_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("no-such-dir").join("out.txt");
+        let mut sink = OutputSink::Stdout;
+
+        apply_output(&mut sink, Some(bad.to_str().unwrap().to_string()));
+        assert!(matches!(sink, OutputSink::Stdout));
     }
 
     #[test]

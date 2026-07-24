@@ -1583,3 +1583,89 @@ fn without_exit_code_zero_rows_still_exits_zero() {
         .assert()
         .code(0);
 }
+
+#[test]
+fn output_flag_writes_file_and_stdout_is_empty() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    let out = td.path().join("res.txt");
+    qm(home.path())
+        .args([
+            "-e",
+            "SELECT status WHERE prd = '010'",
+            "--format",
+            "csv",
+            "--output",
+            out.to_str().unwrap(),
+        ])
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::is_empty());
+    let body = fs::read_to_string(&out).unwrap();
+    assert!(body.contains("status"));
+}
+
+/// Every statement in one `--output` run appends to the same file — the
+/// second statement's result must not truncate the first's away.
+#[test]
+fn output_flag_appends_multiple_statements_in_one_run() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    let out = td.path().join("res.txt");
+    qm(home.path())
+        .args([
+            "-e",
+            "SELECT status WHERE prd = '010'; SELECT status WHERE prd = '011';",
+            "--format",
+            "csv",
+            "--output",
+            out.to_str().unwrap(),
+        ])
+        .arg(td.path())
+        .assert()
+        .success();
+    let body = fs::read_to_string(&out).unwrap();
+    assert_eq!(
+        body.matches("status").count(),
+        2,
+        "each statement's CSV header should appear once: {body:?}"
+    );
+}
+
+/// A stale file already at the `--output` path is truncated at the start of
+/// the run, not appended to.
+#[test]
+fn output_flag_truncates_a_preexisting_file() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    let out = td.path().join("res.txt");
+    fs::write(&out, "stale content that must not survive\n").unwrap();
+    qm(home.path())
+        .args([
+            "-e",
+            "SELECT status WHERE prd = '010'",
+            "--output",
+            out.to_str().unwrap(),
+        ])
+        .arg(td.path())
+        .assert()
+        .success();
+    let body = fs::read_to_string(&out).unwrap();
+    assert!(!body.contains("stale content"));
+}
+
+/// A `--output` path that can't be opened for writing is a clean, propagated
+/// error, not a panic, and the process exits non-zero.
+#[test]
+fn output_flag_errors_cleanly_on_an_unwritable_path() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    let bad = td.path().join("no-such-dir").join("res.txt");
+    qm(home.path())
+        .args(["-e", "SELECT status", "--output", bad.to_str().unwrap()])
+        .arg(td.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("querymatter:"));
+}

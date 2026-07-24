@@ -15,6 +15,7 @@ pub mod discover;
 pub mod frontmatter;
 mod gitignore;
 pub mod model;
+mod output;
 pub mod query;
 pub mod render;
 mod repl;
@@ -33,6 +34,7 @@ use clap::{ArgMatches, CommandFactory, FromArgMatches};
 
 use crate::cli::{Cli, Command, CompletionsArgs, ConfigAction, ConfigArgs, InitArgs};
 use crate::config::Config;
+use crate::output::OutputSink;
 use crate::session::{Session, split_statements};
 use crate::settings::Settings;
 use crate::store::{InMemoryStore, RecordStore};
@@ -359,13 +361,16 @@ fn run_query(cli: &Cli, config: &Config, matches: &ArgMatches) -> anyhow::Result
     let fallback = Settings::resolve(cli, &Config::default(), matches);
     let session = Session::new(Box::new(store), settings, fallback, session_vault);
 
+    let output = cli.output.as_deref();
     match cli.query.as_deref() {
         // `-e -`: read the query text from stdin, then run it.
-        Some("-") => run_batch(&session, &read_stdin()?, cli.exit_code),
+        Some("-") => run_batch(&session, &read_stdin()?, cli.exit_code, output),
         // `-e <sql>`: run the given query text.
-        Some(sql) => run_batch(&session, sql, cli.exit_code),
+        Some(sql) => run_batch(&session, sql, cli.exit_code, output),
         // No `-e`: batch mode when stdin is piped, otherwise the REPL.
-        None if !io::stdin().is_terminal() => run_batch(&session, &read_stdin()?, cli.exit_code),
+        None if !io::stdin().is_terminal() => {
+            run_batch(&session, &read_stdin()?, cli.exit_code, output)
+        }
         None => {
             repl::run(session)?;
             Ok(ExitCode::SUCCESS)
@@ -377,8 +382,16 @@ fn run_query(cli: &Cli, config: &Config, matches: &ArgMatches) -> anyhow::Result
 /// exit code: 1 only when `exit_code` is set and no statement matched a row,
 /// [`ExitCode::SUCCESS`] otherwise (including every run where the flag is
 /// off, preserving today's always-zero-on-success behavior).
-fn run_batch(session: &Session, input: &str, exit_code: bool) -> anyhow::Result<ExitCode> {
-    let total_rows = run_statements(session, input)?;
+///
+/// `output`, when set, is `--output`'s target file (see [`run_statements`]);
+/// `None` keeps results on stdout, unchanged from before `--output` existed.
+fn run_batch(
+    session: &Session,
+    input: &str,
+    exit_code: bool,
+    output: Option<&Path>,
+) -> anyhow::Result<ExitCode> {
+    let total_rows = run_statements(session, input, output)?;
     Ok(if exit_code && total_rows == 0 {
         ExitCode::from(1)
     } else {
@@ -401,18 +414,28 @@ fn canonicalize_dirs(dirs: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
 }
 
 /// Runs every top-level statement in `input` — `;`/`\g`-terminated, or
-/// `\G`-terminated for vertical output — printing each rendered result to
-/// stdout (with exactly one trailing newline via `println!`), and returns the
-/// sum of their row counts (for `--exit-code`'s grep-style mapping).
+/// `\G`-terminated for vertical output — writing each rendered result (with
+/// exactly one trailing newline) to `output` when set, or to stdout otherwise
+/// (matching the plain `println!` this replaced), and returns the sum of
+/// their row counts (for `--exit-code`'s grep-style mapping).
 ///
-/// The first statement that fails aborts the run: its error propagates to
-/// `main`, which reports it on stderr and exits non-zero. Statements that ran
-/// before it have already printed their results.
-fn run_statements(session: &Session, input: &str) -> anyhow::Result<usize> {
+/// `output` is opened once — creating it and truncating any existing content
+/// — before the first statement runs; every statement in the run then
+/// appends to that same handle, so stdout stays completely empty. The first
+/// statement that fails aborts the run: its error propagates to `main`,
+/// which reports it on stderr and exits non-zero. Statements that ran before
+/// it have already been written.
+fn run_statements(session: &Session, input: &str, output: Option<&Path>) -> anyhow::Result<usize> {
+    let mut sink = match output {
+        Some(path) => OutputSink::open_file(path)
+            .with_context(|| format!("cannot write results to {}", path.display()))?,
+        None => OutputSink::Stdout,
+    };
     let mut total_rows = 0;
     for statement in split_statements(input) {
         let (rendered, rows) = session.render_statement_counted(&statement)?;
-        println!("{rendered}");
+        sink.write_block(&rendered)
+            .context("failed to write query results")?;
         total_rows += rows;
     }
     Ok(total_rows)

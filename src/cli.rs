@@ -115,6 +115,13 @@ pub struct Cli {
     #[arg(long, value_enum, env = "QUERYMATTER_TABLE_STYLE")]
     pub table_style: Option<TableStyle>,
 
+    /// Write query results to PATH instead of stdout (one-shot/batch mode
+    /// only); PATH is truncated before the first statement's result and
+    /// every later statement in the run appends to it. Stdout stays empty.
+    /// The interactive REPL has its own `.output` dot-command instead.
+    #[arg(long, value_name = "PATH")]
+    pub output: Option<PathBuf>,
+
     /// Disable unknown-column validation, treating an unknown
     /// SELECT/WHERE/GROUP BY/ORDER BY/HAVING column as NULL instead of
     /// failing the query with a suggestion.
