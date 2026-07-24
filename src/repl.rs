@@ -6,6 +6,7 @@
 //! [`Line`], [`DotCommand`], [`LineBuffer`], and [`parse_dot`]. [`run`] is
 //! the IO driver built on top of them.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -18,7 +19,7 @@ use rustyline::error::ReadlineError;
 use crate::config::ConfigKey;
 use crate::model::Value;
 use crate::render::{Format, TableStyle};
-use crate::session::{Session, Statement, Terminator};
+use crate::session::{FieldStat, Session, Statement, Terminator};
 use crate::store::LoadReport;
 
 /// Prompt shown while waiting for a new statement or dot-command.
@@ -56,6 +57,9 @@ pub enum DotCommand {
     Help,
     /// `.schema` — list frontmatter fields, `file.*` columns, and the record count.
     Schema,
+    /// `.describe [field]` — detailed type/coverage/value info for `field`,
+    /// or (with no argument) a one-line summary of every field.
+    Describe(Option<String>),
     /// `.format [fmt]` — set (`Some`) or report (`None`) the output format.
     Format(Option<Format>),
     /// `.style [style]` — set (`Some`) or report (`None`) the table style.
@@ -180,6 +184,7 @@ pub fn parse_dot(line: &str) -> DotCommand {
     match cmd.as_str() {
         "help" => DotCommand::Help,
         "schema" => DotCommand::Schema,
+        "describe" => DotCommand::Describe(words.next().map(str::to_string)),
         "reload" => DotCommand::Reload,
         "refresh" => DotCommand::Refresh(words.next().map(str::to_string)),
         "refresh-all" => DotCommand::RefreshAll,
@@ -354,6 +359,7 @@ fn dispatch_dot(cmd: DotCommand, session: &mut Session) -> bool {
     match cmd {
         DotCommand::Help => print_help(),
         DotCommand::Schema => print_schema(session),
+        DotCommand::Describe(field) => print_describe(session, field.as_deref()),
         DotCommand::Format(Some(fmt)) => session.set_format(fmt),
         DotCommand::Format(None) => println!("format: {}", format_name(session.format())),
         DotCommand::Style(Some(style)) => session.set_style(style),
@@ -443,6 +449,7 @@ fn print_help() {
     println!("Dot-commands:");
     println!("  .help              show this message");
     println!("  .schema            list frontmatter fields, file.* columns, and the record count");
+    println!("  .describe [field]  per-field types and coverage, or detail (values) for one field");
     println!("  .format [fmt]      show, or set, the output format (table, json, csv, tsv, md)");
     println!(
         "  .style [style]     show, or set, the table border style (ascii, unicode, compact, plain)"
@@ -475,6 +482,107 @@ fn print_schema(session: &Session) {
         println!("  {column}");
     }
     println!("{} record(s) loaded", record_count(session));
+}
+
+/// Prints `.describe`'s output to stdout: the detailed block for one field
+/// when `field` names one, or a one-line summary of every field (plus the
+/// `file.*` pseudo-columns) when it's `None`.
+///
+/// The `file.*` pseudo-columns are always `Str`-typed and always present, so
+/// naming one directly (`.describe file.name`) gets a trivial one-line note
+/// rather than the frontmatter-field detail block — and, per design, their
+/// distinct-value counts are never computed (`file.path` is unbounded). A
+/// name that is neither a frontmatter field nor a `file.*` column is an
+/// error, printed to stderr.
+fn print_describe(session: &Session, field: Option<&str>) {
+    match field {
+        Some(name) if FILE_COLUMNS.contains(&name) => print_describe_file_column(name),
+        Some(name) => print_describe_field(session, name),
+        None => print_describe_all(session),
+    }
+}
+
+/// The detailed `.describe <field>` block: variant(s), non-null coverage,
+/// and either the capped most-frequent-first value list or a bare distinct
+/// count when the field is over the cap.
+fn print_describe_field(session: &Session, name: &str) {
+    let report = session.describe();
+    let Some(stat) = report.get(name) else {
+        eprintln!("querymatter: unknown field '{name}' (try .schema to list fields)");
+        return;
+    };
+    println!("{name}:");
+    println!("  type: {}", variants_display(&stat.variants));
+    println!(
+        "  non_null: {}/{} ({}%)",
+        stat.non_null,
+        stat.total,
+        coverage_pct(stat)
+    );
+    match &stat.values {
+        Some(values) if !values.is_empty() => {
+            let list = values
+                .iter()
+                .map(|(value, count)| format!("{value}({count})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("  values: {list}");
+        }
+        // A field null in every record has nothing to list — its coverage
+        // line above already says so.
+        Some(_) => {}
+        None => println!("  {} distinct values", stat.distinct),
+    }
+}
+
+/// The trivial `.describe file.*` block: these pseudo-columns are always
+/// `Str`-typed and always present, so there's no coverage or value tally
+/// worth computing — least of all for `file.path`, whose distinct values are
+/// effectively unbounded.
+fn print_describe_file_column(name: &str) {
+    println!("{name}: (file.*) always present, type Str, 100% coverage");
+}
+
+/// `.describe`'s no-argument summary: one aligned line per frontmatter
+/// field's type and coverage, followed by the `file.*` pseudo-columns noted
+/// as `(file.*)`.
+fn print_describe_all(session: &Session) {
+    let report = session.describe();
+    let width = report
+        .keys()
+        .map(String::len)
+        .chain(FILE_COLUMNS.iter().map(|c| c.len()))
+        .max()
+        .unwrap_or(0);
+
+    for (name, stat) in &report {
+        println!(
+            "  {name:width$}  {:<12}  {}/{} ({}%)",
+            variants_display(&stat.variants),
+            stat.non_null,
+            stat.total,
+            coverage_pct(stat),
+        );
+    }
+    for column in FILE_COLUMNS {
+        println!("  {column:width$}  (file.*)");
+    }
+}
+
+/// `stat`'s non-null coverage as an integer percentage: `100` when every
+/// record has a non-null value, `0` when none do (including when `total` is
+/// `0`, which can't currently happen but is handled rather than panicking).
+fn coverage_pct(stat: &FieldStat) -> u64 {
+    if stat.total == 0 {
+        return 0;
+    }
+    (stat.non_null as u64 * 100) / stat.total as u64
+}
+
+/// Renders a field's variant set for `.describe`, e.g. `Str` or `Int, Str`
+/// for a mixed-type field.
+fn variants_display(variants: &BTreeSet<&'static str>) -> String {
+    variants.iter().copied().collect::<Vec<_>>().join(", ")
 }
 
 /// The number of records currently loaded, via a `count(*)` query so
@@ -685,6 +793,15 @@ mod tests {
         assert!(matches!(parse_dot(".bogus"), DotCommand::Unknown(_)));
     }
     #[test]
+    fn parse_dot_describe() {
+        assert_eq!(
+            parse_dot(".describe status"),
+            DotCommand::Describe(Some("status".into()))
+        );
+        assert_eq!(parse_dot(".describe"), DotCommand::Describe(None));
+    }
+
+    #[test]
     fn dot_line_detected_by_buffer() {
         let mut b = LineBuffer::new();
         assert!(matches!(
@@ -765,6 +882,25 @@ mod tests {
         assert_eq!(parse_dot(".set"), DotCommand::MissingArg("set"));
         assert_eq!(parse_dot(".set table_style"), DotCommand::MissingArg("set"));
         assert_eq!(parse_dot(".unset"), DotCommand::MissingArg("unset"));
+    }
+
+    #[test]
+    fn coverage_pct_edges() {
+        let stat = |non_null, total| FieldStat {
+            variants: BTreeSet::new(),
+            non_null,
+            total,
+            values: None,
+            distinct: 0,
+        };
+        assert_eq!(coverage_pct(&stat(4, 4)), 100, "all non-null is 100%");
+        assert_eq!(coverage_pct(&stat(0, 4)), 0, "all null is 0%");
+        assert_eq!(coverage_pct(&stat(3, 4)), 75);
+        assert_eq!(
+            coverage_pct(&stat(0, 0)),
+            0,
+            "no records must not divide by zero"
+        );
     }
 
     #[test]

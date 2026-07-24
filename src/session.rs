@@ -2,6 +2,7 @@
 //! SQL text into rendered result strings — the shared core behind one-shot,
 //! batch, and interactive modes.
 
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -268,6 +269,92 @@ impl Session {
     pub fn schema(&self) -> Vec<String> {
         self.store.schema()
     }
+
+    /// Computes per-field type and coverage statistics for `.describe`:
+    /// which `Value` variant(s) each frontmatter field has taken on, its
+    /// non-null coverage, and — for fields with at most [`VALUE_CAP`]
+    /// distinct non-null values — a most-frequent-first tally of them.
+    ///
+    /// Walks `self.store.records()` exactly once. A field's variant set and
+    /// non-null count only reflect records where the field is actually
+    /// present in that record's frontmatter: a record that omits the field
+    /// entirely leaves it untouched, distinct from a record that sets it
+    /// explicitly to `null` (a present `Value::Null`, which counts toward
+    /// the variant set as `"Null"` without counting as non-null).
+    pub fn describe(&self) -> DescribeReport {
+        let mut raw: BTreeMap<String, RawFieldStat> = BTreeMap::new();
+        let mut total = 0usize;
+        for record in self.store.records() {
+            total += 1;
+            for name in record.field_names() {
+                let value = record.field(name);
+                let stat = raw.entry(name.to_string()).or_default();
+                stat.variants.insert(value.variant_name());
+                if !value.is_null() {
+                    stat.non_null += 1;
+                    *stat.counts.entry(value.display()).or_insert(0) += 1;
+                }
+            }
+        }
+        raw.into_iter()
+            .map(|(name, stat)| (name, stat.finish(total)))
+            .collect()
+    }
+}
+
+/// The number of distinct non-null values a field's [`FieldStat::values`]
+/// keeps before `.describe` falls back to reporting a bare distinct count.
+const VALUE_CAP: usize = 12;
+
+/// Per-field `.describe` statistics, keyed by frontmatter field name in
+/// sorted order (matching [`Session::schema`]).
+pub type DescribeReport = BTreeMap<String, FieldStat>;
+
+/// One field's `.describe` statistics, computed by [`Session::describe`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldStat {
+    /// The distinct `Value` variant names seen for this field, e.g.
+    /// `{"Str"}`, or `{"Int", "Str"}` for a mixed-type field.
+    pub variants: BTreeSet<&'static str>,
+    /// Records where this field is present with a non-null value.
+    pub non_null: usize,
+    /// The total record count (the same for every field).
+    pub total: usize,
+    /// The field's distinct non-null values, most-frequent-first, when
+    /// there are at most [`VALUE_CAP`] of them; `None` when `distinct`
+    /// exceeds the cap, in which case the formatter shows the bare count
+    /// instead of the list.
+    pub values: Option<Vec<(String, usize)>>,
+    /// The number of distinct non-null values seen — accurate even when
+    /// `values` is `None`.
+    pub distinct: usize,
+}
+
+/// Accumulator for one field's `.describe` stats while walking records;
+/// [`RawFieldStat::finish`] turns it into the capped, public [`FieldStat`].
+#[derive(Default)]
+struct RawFieldStat {
+    variants: BTreeSet<&'static str>,
+    non_null: usize,
+    counts: HashMap<String, usize>,
+}
+
+impl RawFieldStat {
+    /// Sorts the accumulated counts most-frequent-first (ties broken
+    /// lexicographically, for deterministic output), then caps the list at
+    /// [`VALUE_CAP`] — recording the true distinct count either way.
+    fn finish(self, total: usize) -> FieldStat {
+        let distinct = self.counts.len();
+        let mut values: Vec<(String, usize)> = self.counts.into_iter().collect();
+        values.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        FieldStat {
+            variants: self.variants,
+            non_null: self.non_null,
+            total,
+            values: (distinct <= VALUE_CAP).then_some(values),
+            distinct,
+        }
+    }
 }
 
 /// How a statement was terminated, which selects how its result renders.
@@ -518,6 +605,116 @@ mod tests {
             .render_statement_counted(&semi("SELECT status WHERE status = 'missing'"))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    /// `.describe`'s core computation: per-field `Value` variant set,
+    /// non-null coverage against the FULL record count (not just records
+    /// where the field is present), and a most-frequent-first value tally.
+    ///
+    /// Record 4 omits `status` entirely — it must lower `non_null` without
+    /// adding to `variants`. Contrast with
+    /// `describe_all_null_field_reports_null_variant` below, where the field
+    /// is present but explicitly `null` in every record.
+    #[test]
+    fn describe_tallies_variants_coverage_and_values() {
+        let td = TempDir::new().unwrap();
+        for (name, body) in [
+            ("a.md", "---\nstatus: draft\nn: 1\n---\n"),
+            ("b.md", "---\nstatus: draft\nn: two\n---\n"),
+            ("c.md", "---\nstatus: done\n---\n"),
+            ("d.md", "---\ntitle: untagged\n---\n"),
+        ] {
+            fs::write(td.path().join(name), body).unwrap();
+        }
+        let (store, _report) =
+            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default());
+        let session = Session::new(
+            Box::new(store),
+            Settings::default(),
+            Settings::default(),
+            None,
+        );
+
+        let report = session.describe();
+
+        let status = &report["status"];
+        assert_eq!(status.variants, BTreeSet::from(["Str"]));
+        assert_eq!(status.non_null, 3);
+        assert_eq!(status.total, 4);
+        assert_eq!(
+            status.values,
+            Some(vec![("draft".to_string(), 2), ("done".to_string(), 1)]),
+            "most-frequent-first, ties broken lexicographically"
+        );
+        assert_eq!(status.distinct, 2);
+
+        let n = &report["n"];
+        assert_eq!(n.variants, BTreeSet::from(["Int", "Str"]));
+        assert_eq!(n.non_null, 2);
+        assert_eq!(n.total, 4);
+    }
+
+    /// A field explicitly `null` in every record (present, not merely
+    /// absent) reports variant set `{"Null"}` and `0` non-null — the
+    /// "present but always null" case, distinct from a field a record's
+    /// frontmatter omits entirely.
+    #[test]
+    fn describe_all_null_field_reports_null_variant() {
+        let td = TempDir::new().unwrap();
+        for (name, body) in [
+            ("a.md", "---\nstatus: null\n---\n"),
+            ("b.md", "---\nstatus: null\n---\n"),
+        ] {
+            fs::write(td.path().join(name), body).unwrap();
+        }
+        let (store, _report) =
+            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default());
+        let session = Session::new(
+            Box::new(store),
+            Settings::default(),
+            Settings::default(),
+            None,
+        );
+
+        let report = session.describe();
+        let status = &report["status"];
+        assert_eq!(status.variants, BTreeSet::from(["Null"]));
+        assert_eq!(status.non_null, 0);
+        assert_eq!(status.total, 2);
+        assert_eq!(status.values, Some(Vec::new()));
+        assert_eq!(status.distinct, 0);
+    }
+
+    /// A field with more than `VALUE_CAP` distinct non-null values reports
+    /// `values: None` while still tracking the true `distinct` count — the
+    /// formatter falls back to "N distinct values" for these instead of
+    /// listing them all.
+    #[test]
+    fn describe_caps_value_list_but_keeps_true_distinct_count() {
+        let td = TempDir::new().unwrap();
+        for i in 0..(VALUE_CAP + 1) {
+            fs::write(
+                td.path().join(format!("f{i}.md")),
+                format!("---\ntag: v{i}\n---\n"),
+            )
+            .unwrap();
+        }
+        let (store, _report) =
+            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default());
+        let session = Session::new(
+            Box::new(store),
+            Settings::default(),
+            Settings::default(),
+            None,
+        );
+
+        let report = session.describe();
+        let tag = &report["tag"];
+        assert_eq!(tag.distinct, VALUE_CAP + 1);
+        assert!(
+            tag.values.is_none(),
+            "a field over the cap must report no value list"
+        );
     }
 
     /// A vault-backed session's `refresh` must both update the in-memory
