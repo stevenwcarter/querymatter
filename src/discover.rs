@@ -164,16 +164,30 @@ pub enum Explanation {
 /// `root` — would be discovered by [`discover`] under `opts`.
 ///
 /// The verdict is ground truth: it is exactly whether `discover(root, opts)`
-/// contains `target`, so it can never disagree with a real query run. When
-/// excluded, the reason is attributed by relaxing one filtering layer at a
-/// time — in the order discovery applies them (extension, hidden, `--exclude`
-/// globs, then ignore files) — and re-checking membership: the first
-/// relaxation that flips the verdict names the responsible layer. Each
-/// candidate reason is only reported after confirming it actually would have
-/// changed the outcome, so the reason can never contradict the verdict. When
-/// no single-layer relaxation isolates it (several layers exclude it
-/// independently), the generic "excluded by the ignore rules" is reported
-/// rather than guessing.
+/// contains `target`, so it can never disagree with a real query run.
+///
+/// When excluded, the reason is attributed one layer at a time, but the
+/// EXTENSION layer is special-cased: it is checked FIRST and, when it's the
+/// problem, reported immediately and unconditionally — with no
+/// relax-and-recheck against `discover`. This is deliberate, not an
+/// oversight: "extension 'txt' not in --ext (md, markdown)" is more
+/// actionable than the generic fallback below, and a wrong extension is
+/// common enough (and cheap enough to detect) to short-circuit on. The other
+/// four layers — hidden, `--exclude` globs, ignore files, then
+/// `--respect-gitignore` — ARE relaxed and rechecked one at a time, in the
+/// order discovery applies them: each candidate reason is only reported
+/// after confirming that relaxing just that layer actually flips `target`
+/// into the discovered set, so those four reasons can never contradict the
+/// verdict. When no single one of those four isolates it (several exclude it
+/// independently) — or a file already has an included extension but is
+/// excluded by more than one of the other layers at once — the generic
+/// "excluded by the ignore rules" is reported rather than guessing.
+///
+/// One consequence of the extension layer's precedence: a file excluded by
+/// BOTH a hidden path component AND a wrong extension is always attributed
+/// to the extension, even though the hidden layer independently excludes it
+/// too — see
+/// [`explain_prefers_extension_reason_over_a_hidden_directory_when_both_exclude`].
 pub fn explain(root: &Path, target: &Path, opts: &WalkOpts) -> Explanation {
     if contains(&discover(root, opts), target) {
         return Explanation::Included;
@@ -568,6 +582,24 @@ mod tests {
                     reason,
                     "hidden directory '.draft' (pass --hidden to include)"
                 );
+            }
+            other => panic!("expected Excluded, got {other:?}"),
+        }
+    }
+
+    /// Pins the documented, intended precedence: a file excluded by BOTH a
+    /// hidden directory AND a wrong extension is attributed to the
+    /// EXTENSION, not the hidden layer — [`explain`]'s doc comment explains
+    /// why (extension is checked first and unconditionally, never
+    /// relax-and-rechecked like the other four layers).
+    #[test]
+    fn explain_prefers_extension_reason_over_a_hidden_directory_when_both_exclude() {
+        let td = TempDir::new().unwrap();
+        touch(td.path(), ".draft/h.txt", "x");
+        let target = fs::canonicalize(td.path().join(".draft/h.txt")).unwrap();
+        match explain(td.path(), &target, &WalkOpts::default()) {
+            Explanation::Excluded(reason) => {
+                assert_eq!(reason, "extension 'txt' not in --ext (md, markdown)");
             }
             other => panic!("expected Excluded, got {other:?}"),
         }
