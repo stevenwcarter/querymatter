@@ -42,6 +42,20 @@ impl Value {
         }
     }
 
+    /// The variant name, used by `.describe` to report which `Value` kinds a
+    /// field has taken on (e.g. `Str`, or both `Int` and `Str` for a
+    /// mixed-type field).
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            Value::Null => "Null",
+            Value::Bool(_) => "Bool",
+            Value::Int(_) => "Int",
+            Value::Float(_) => "Float",
+            Value::Str(_) => "Str",
+            Value::List(_) => "List",
+        }
+    }
+
     /// Coerces this value to `f64` for numeric comparisons, if possible.
     ///
     /// `Int`/`Float` convert directly; `Str` is parsed (after trimming
@@ -178,6 +192,15 @@ mod tests {
     fn display_list_is_comma_joined() {
         let v = Value::List(vec![Value::Str("a".into()), Value::Int(2)]);
         assert_eq!(v.display(), "a, 2");
+    }
+    #[test]
+    fn variant_name_names_each_kind() {
+        assert_eq!(Value::Null.variant_name(), "Null");
+        assert_eq!(Value::Bool(true).variant_name(), "Bool");
+        assert_eq!(Value::Int(1).variant_name(), "Int");
+        assert_eq!(Value::Float(1.0).variant_name(), "Float");
+        assert_eq!(Value::Str("x".into()).variant_name(), "Str");
+        assert_eq!(Value::List(vec![]).variant_name(), "List");
     }
     #[test]
     fn display_scalars() {

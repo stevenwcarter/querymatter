@@ -6,19 +6,23 @@
 //! [`Line`], [`DotCommand`], [`LineBuffer`], and [`parse_dot`]. [`run`] is
 //! the IO driver built on top of them.
 
+use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use directories::ProjectDirs;
-use rustyline::DefaultEditor;
+use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
+use rustyline::history::FileHistory;
+use rustyline::{Context as RlContext, Editor, Helper, Highlighter, Hinter, Validator};
 
 use crate::config::ConfigKey;
 use crate::model::Value;
 use crate::render::{Format, TableStyle};
-use crate::session::{Session, Statement, Terminator};
+use crate::session::{FieldStat, Session, Statement, Terminator};
 use crate::store::LoadReport;
 
 /// Prompt shown while waiting for a new statement or dot-command.
@@ -31,6 +35,32 @@ const CONTINUATION_PROMPT: &str = "   ...> ";
 const FILE_COLUMNS: [&str; 4] = ["file.name", "file.path", "file.folder", "file.ext"];
 /// The history file's name under the REPL's state/data directory.
 const HISTORY_FILE: &str = "history.txt";
+/// The dot-command names, each including its leading `.` — the single source
+/// of truth for both [`parse_dot`] (whose leading guard clause rejects
+/// anything not listed here, so a name present in one but not handled by the
+/// other trips either that guard or the match's `unreachable!()`) and REPL
+/// tab-completion ([`complete_candidates`]). Kept as one list so the two
+/// can't silently drift apart.
+///
+/// `print_help`'s lines are not derived from this list — each carries
+/// per-command argument syntax (`.describe [field]`, `.set <key> <val>`)
+/// that doesn't fit a flat name list — so keep it in sync by hand when adding
+/// a command.
+const DOT_COMMAND_NAMES: &[&str] = &[
+    ".help",
+    ".schema",
+    ".describe",
+    ".format",
+    ".style",
+    ".settings",
+    ".set",
+    ".unset",
+    ".reload",
+    ".refresh",
+    ".refresh-all",
+    ".quit",
+    ".exit",
+];
 
 /// What one line of raw input resolved to, once fed to a [`LineBuffer`].
 #[derive(Debug, Clone, PartialEq)]
@@ -42,8 +72,11 @@ pub enum Line {
     /// A complete statement plus the terminator that ended it (the terminator
     /// itself is stripped).
     Statement(Statement),
-    /// A `.`-prefixed dot-command.
-    Dot(DotCommand),
+    /// A `.`-prefixed dot-command, paired with the original (trimmed) line
+    /// text. [`DotCommand`] alone loses casing and whitespace that parsing
+    /// normalizes away, so the raw text rides along for callers — namely
+    /// [`history_entry`] — that want an exact record of what was typed.
+    Dot(DotCommand, String),
 }
 
 /// A REPL dot-command, parsed from a line beginning with `.`.
@@ -53,6 +86,9 @@ pub enum DotCommand {
     Help,
     /// `.schema` — list frontmatter fields, `file.*` columns, and the record count.
     Schema,
+    /// `.describe [field]` — detailed type/coverage/value info for `field`,
+    /// or (with no argument) a one-line summary of every field.
+    Describe(Option<String>),
     /// `.format [fmt]` — set (`Some`) or report (`None`) the output format.
     Format(Option<Format>),
     /// `.style [style]` — set (`Some`) or report (`None`) the table style.
@@ -117,7 +153,7 @@ impl LineBuffer {
                 return Line::Blank;
             }
             if trimmed.starts_with('.') {
-                return Line::Dot(parse_dot(trimmed));
+                return Line::Dot(parse_dot(trimmed), trimmed.to_string());
             }
             self.buf.push_str(raw);
         } else {
@@ -169,14 +205,23 @@ fn take_terminated(text: &str) -> Option<(&str, Terminator)> {
 /// An unrecognized command name falls back to [`DotCommand::Unknown`] carrying
 /// the whole original line; a recognized `.format` with an unknown format name
 /// becomes [`DotCommand::BadFormat`] carrying just that name, so the error can
-/// name the format rather than imply `.format` itself is unknown.
+/// name the format rather than imply `.format` itself is unknown. The command
+/// name is checked against [`DOT_COMMAND_NAMES`] up front, so the match below
+/// only ever runs for a name that list already vouches for.
 pub fn parse_dot(line: &str) -> DotCommand {
     let rest = line.strip_prefix('.').unwrap_or(line);
     let mut words = rest.split_whitespace();
     let cmd = words.next().unwrap_or("").to_ascii_lowercase();
+    if !DOT_COMMAND_NAMES
+        .iter()
+        .any(|name| name.trim_start_matches('.') == cmd)
+    {
+        return DotCommand::Unknown(line.to_string());
+    }
     match cmd.as_str() {
         "help" => DotCommand::Help,
         "schema" => DotCommand::Schema,
+        "describe" => DotCommand::Describe(words.next().map(str::to_string)),
         "reload" => DotCommand::Reload,
         "refresh" => DotCommand::Refresh(words.next().map(str::to_string)),
         "refresh-all" => DotCommand::RefreshAll,
@@ -210,7 +255,7 @@ pub fn parse_dot(line: &str) -> DotCommand {
             },
             None => DotCommand::MissingArg("unset"),
         },
-        _ => DotCommand::Unknown(line.to_string()),
+        _ => unreachable!("cmd already checked against DOT_COMMAND_NAMES above"),
     }
 }
 
@@ -237,14 +282,22 @@ fn rest_after_key(rest: &str, skip: usize) -> Option<String> {
 /// History persists under the OS's per-app state (falling back to data)
 /// directory via [`ProjectDirs`]; a missing or unwritable history file is at
 /// most a warning on stderr, never a fatal error — the REPL keeps working
-/// without it.
+/// without it. Tab-completion is wired via [`ReplHelper`], whose schema
+/// snapshot is taken here, once, at start-up.
 pub fn run(mut session: Session) -> anyhow::Result<()> {
-    let mut editor = DefaultEditor::new().context("failed to initialize the line editor")?;
+    let helper = ReplHelper {
+        schema: session.schema(),
+    };
+    let mut editor: Editor<ReplHelper, FileHistory> =
+        Editor::new().context("failed to initialize the line editor")?;
+    editor.set_helper(Some(helper));
     let history_path = history_path();
     if let Some(path) = &history_path {
         prepare_history_dir(path);
         load_history(&mut editor, path);
     }
+
+    println!("{}", banner(record_count(&session)));
 
     let mut buffer = LineBuffer::new();
     loop {
@@ -265,15 +318,22 @@ pub fn run(mut session: Session) -> anyhow::Result<()> {
                 break;
             }
         };
-        let _ = editor.add_history_entry(line.as_str());
 
-        match buffer.push(&line) {
+        let resolved = buffer.push(&line);
+        if let Some(entry) = history_entry(&resolved) {
+            let _ = editor.add_history_entry(entry);
+        }
+
+        match resolved {
             Line::Blank | Line::More => {}
-            Line::Statement(statement) => match session.render_statement(&statement) {
-                Ok(rendered) => println!("{rendered}"),
+            Line::Statement(statement) => match session.render_statement_counted(&statement) {
+                Ok((rendered, count)) => {
+                    println!("{rendered}");
+                    eprintln!("{}", row_count_line(count));
+                }
                 Err(err) => eprintln!("querymatter: {err:#}"),
             },
-            Line::Dot(cmd) => {
+            Line::Dot(cmd, _) => {
                 if dispatch_dot(cmd, &mut session) {
                     break;
                 }
@@ -292,6 +352,51 @@ pub fn run(mut session: Session) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The `-- N rows` line printed to stderr after a REPL statement's result,
+/// distinguishing a genuinely empty result from a mistake (REPL-only; batch
+/// and `-e` mode never print this). Pulled out as a pure function so the
+/// singular/plural wording is unit-tested without a TTY.
+fn row_count_line(n: usize) -> String {
+    format!("-- {n} row{}", if n == 1 { "" } else { "s" })
+}
+
+/// The startup banner [`run`] prints to stdout on entering the REPL: the
+/// record count plus a `.help`/`.schema` hint. Pulled out as a pure function
+/// so its content is unit-tested without a TTY; REPL-only — batch and `-e`
+/// mode never print it.
+fn banner(record_count: i64) -> String {
+    format!("querymatter — {record_count} records. Type .help for commands, .schema for fields.")
+}
+
+/// What to add to the line editor's history for one resolved [`Line`], or
+/// `None` when nothing should be recorded.
+///
+/// A statement accumulated across several raw lines ([`Line::More`] then
+/// [`Line::Statement`]) records exactly once, as the assembled SQL plus its
+/// terminator — the W5 fix: previously every raw line got its own history
+/// entry, so a statement typed across N lines left N unrunnable fragments in
+/// history instead of one entry that replays the whole thing. A dot-command
+/// records its original line text verbatim, carried on [`Line::Dot`], rather
+/// than a reconstruction from the parsed [`DotCommand`] (which lowercases the
+/// command name and collapses whitespace). Blank lines and mid-statement
+/// continuations record nothing. A statement typed with a `\g` terminator is
+/// re-emitted with a `;` instead (both are [`Terminator::Semicolon`]) —
+/// harmless, since the two run identically, but worth knowing if a `\g`
+/// history entry ever looks different from what was typed.
+fn history_entry(line: &Line) -> Option<String> {
+    match line {
+        Line::Blank | Line::More => None,
+        Line::Statement(statement) => {
+            let terminator = match statement.terminator {
+                Terminator::Semicolon => ";",
+                Terminator::VerticalG => "\\G",
+            };
+            Some(format!("{}{terminator}", statement.sql))
+        }
+        Line::Dot(_, raw) => Some(raw.clone()),
+    }
+}
+
 /// Runs one dot-command against `session`, returning `true` when the REPL
 /// should exit (`.quit`/`.exit`).
 ///
@@ -305,6 +410,7 @@ fn dispatch_dot(cmd: DotCommand, session: &mut Session) -> bool {
     match cmd {
         DotCommand::Help => print_help(),
         DotCommand::Schema => print_schema(session),
+        DotCommand::Describe(field) => print_describe(session, field.as_deref()),
         DotCommand::Format(Some(fmt)) => session.set_format(fmt),
         DotCommand::Format(None) => println!("format: {}", format_name(session.format())),
         DotCommand::Style(Some(style)) => session.set_style(style),
@@ -391,27 +497,68 @@ fn report_deferred(immediate: bool) {
 
 /// Prints the dot-command reference to stdout.
 fn print_help() {
-    println!("Dot-commands:");
-    println!("  .help              show this message");
-    println!("  .schema            list frontmatter fields, file.* columns, and the record count");
-    println!("  .format [fmt]      show, or set, the output format (table, json, csv, tsv, md)");
-    println!(
+    print!("{}", help_text());
+}
+
+/// The dot-command reference text `print_help` prints, pulled out as a pure
+/// function so a test can assert every name in [`DOT_COMMAND_NAMES`]
+/// actually appears here — a future command that's tab-completable but
+/// missing from this listing would otherwise go unnoticed.
+fn help_text() -> String {
+    let mut text = String::new();
+    let _ = writeln!(text, "Dot-commands:");
+    let _ = writeln!(text, "  .help              show this message");
+    let _ = writeln!(
+        text,
+        "  .schema            list frontmatter fields, file.* columns, and the record count"
+    );
+    let _ = writeln!(
+        text,
+        "  .describe [field]  per-field types and coverage, or detail (values) for one field"
+    );
+    let _ = writeln!(
+        text,
+        "  .format [fmt]      show, or set, the output format (table, json, csv, tsv, md)"
+    );
+    let _ = writeln!(
+        text,
         "  .style [style]     show, or set, the table border style (ascii, unicode, compact, plain)"
     );
-    println!("  .settings          list every setting, its value, and where it came from");
-    println!("  .set <key> <val>   save a setting to the config file");
-    println!("  .unset <key>       remove a setting from the config file");
-    println!("  .reload            rescan every tracked directory (in-memory only)");
-    println!(
+    let _ = writeln!(
+        text,
+        "  .settings          list every setting, its value, and where it came from"
+    );
+    let _ = writeln!(
+        text,
+        "  .set <key> <val>   save a setting to the config file"
+    );
+    let _ = writeln!(
+        text,
+        "  .unset <key>       remove a setting from the config file"
+    );
+    let _ = writeln!(
+        text,
+        "  .reload            rescan every tracked directory (in-memory only)"
+    );
+    let _ = writeln!(
+        text,
         "  .refresh [path]    re-scan path (or all); updates the .querymatter cache, else in memory"
     );
-    println!(
+    let _ = writeln!(
+        text,
         "  .refresh-all       re-scan the whole vault; updates the cache, or in memory with no vault"
     );
-    println!("  .quit / .exit      leave the REPL");
-    println!();
-    println!("End a statement with ';' to run it, or with '\\G' to print each row as a block of");
-    println!("name: value lines; '\\g' is a synonym for ';'. Statements may span multiple lines.");
+    let _ = writeln!(text, "  .quit / .exit      leave the REPL");
+    let _ = writeln!(text);
+    let _ = writeln!(
+        text,
+        "End a statement with ';' to run it, or with '\\G' to print each row as a block of"
+    );
+    let _ = writeln!(
+        text,
+        "name: value lines; '\\g' is a synonym for ';'. Statements may span multiple lines."
+    );
+    text
 }
 
 /// Prints the discovered frontmatter fields, the `file.*` pseudo-columns,
@@ -426,6 +573,107 @@ fn print_schema(session: &Session) {
         println!("  {column}");
     }
     println!("{} record(s) loaded", record_count(session));
+}
+
+/// Prints `.describe`'s output to stdout: the detailed block for one field
+/// when `field` names one, or a one-line summary of every field (plus the
+/// `file.*` pseudo-columns) when it's `None`.
+///
+/// The `file.*` pseudo-columns are always `Str`-typed and always present, so
+/// naming one directly (`.describe file.name`) gets a trivial one-line note
+/// rather than the frontmatter-field detail block — and, per design, their
+/// distinct-value counts are never computed (`file.path` is unbounded). A
+/// name that is neither a frontmatter field nor a `file.*` column is an
+/// error, printed to stderr.
+fn print_describe(session: &Session, field: Option<&str>) {
+    match field {
+        Some(name) if FILE_COLUMNS.contains(&name) => print_describe_file_column(name),
+        Some(name) => print_describe_field(session, name),
+        None => print_describe_all(session),
+    }
+}
+
+/// The detailed `.describe <field>` block: variant(s), non-null coverage,
+/// and either the capped most-frequent-first value list or a bare distinct
+/// count when the field is over the cap.
+fn print_describe_field(session: &Session, name: &str) {
+    let report = session.describe();
+    let Some(stat) = report.get(name) else {
+        eprintln!("querymatter: unknown field '{name}' (try .schema to list fields)");
+        return;
+    };
+    println!("{name}:");
+    println!("  type: {}", variants_display(&stat.variants));
+    println!(
+        "  non_null: {}/{} ({}%)",
+        stat.non_null,
+        stat.total,
+        coverage_pct(stat)
+    );
+    match &stat.values {
+        Some(values) if !values.is_empty() => {
+            let list = values
+                .iter()
+                .map(|(value, count)| format!("{value}({count})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("  values: {list}");
+        }
+        // A field null in every record has nothing to list — its coverage
+        // line above already says so.
+        Some(_) => {}
+        None => println!("  {} distinct values", stat.distinct),
+    }
+}
+
+/// The trivial `.describe file.*` block: these pseudo-columns are always
+/// `Str`-typed and always present, so there's no coverage or value tally
+/// worth computing — least of all for `file.path`, whose distinct values are
+/// effectively unbounded.
+fn print_describe_file_column(name: &str) {
+    println!("{name}: (file.*) always present, type Str, 100% coverage");
+}
+
+/// `.describe`'s no-argument summary: one aligned line per frontmatter
+/// field's type and coverage, followed by the `file.*` pseudo-columns noted
+/// as `(file.*)`.
+fn print_describe_all(session: &Session) {
+    let report = session.describe();
+    let width = report
+        .keys()
+        .map(String::len)
+        .chain(FILE_COLUMNS.iter().map(|c| c.len()))
+        .max()
+        .unwrap_or(0);
+
+    for (name, stat) in &report {
+        println!(
+            "  {name:width$}  {:<12}  {}/{} ({}%)",
+            variants_display(&stat.variants),
+            stat.non_null,
+            stat.total,
+            coverage_pct(stat),
+        );
+    }
+    for column in FILE_COLUMNS {
+        println!("  {column:width$}  (file.*)");
+    }
+}
+
+/// `stat`'s non-null coverage as an integer percentage: `100` when every
+/// record has a non-null value, `0` when none do (including when `total` is
+/// `0`, which can't currently happen but is handled rather than panicking).
+fn coverage_pct(stat: &FieldStat) -> u64 {
+    if stat.total == 0 {
+        return 0;
+    }
+    (stat.non_null as u64 * 100) / stat.total as u64
+}
+
+/// Renders a field's variant set for `.describe`, e.g. `Str` or `Int, Str`
+/// for a mixed-type field.
+fn variants_display(variants: &BTreeSet<&'static str>) -> String {
+    variants.iter().copied().collect::<Vec<_>>().join(", ")
 }
 
 /// The number of records currently loaded, via a `count(*)` query so
@@ -510,7 +758,7 @@ fn prepare_history_dir(path: &Path) {
 
 /// Loads history from `path` into `editor`, ignoring a missing file (normal
 /// on first run) and warning on any other IO error.
-fn load_history(editor: &mut DefaultEditor, path: &Path) {
+fn load_history(editor: &mut Editor<ReplHelper, FileHistory>, path: &Path) {
     if let Err(err) = editor.load_history(path) {
         let missing =
             matches!(&err, ReadlineError::Io(io_err) if io_err.kind() == io::ErrorKind::NotFound);
@@ -520,6 +768,129 @@ fn load_history(editor: &mut DefaultEditor, path: &Path) {
                 path.display()
             );
         }
+    }
+}
+
+/// The word ending at byte offset `pos` in `line` — its start index and text
+/// — found by scanning back to the previous whitespace character, or the
+/// start of the line. `pos` is walked back to the nearest char boundary at or
+/// before itself first, so a `pos` that (unexpectedly) isn't one still can't
+/// panic the slicing below.
+fn current_word(line: &str, pos: usize) -> (usize, &str) {
+    let mut pos = pos.min(line.len());
+    while pos > 0 && !line.is_char_boundary(pos) {
+        pos -= 1;
+    }
+    let start = line[..pos]
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_whitespace())
+        .map_or(0, |(i, c)| i + c.len_utf8());
+    (start, &line[start..pos])
+}
+
+/// True when the word starting at `start` is the key argument of a `.set` or
+/// `.unset` dot-command — i.e. exactly one word precedes it, and that word is
+/// `.set`/`.unset` (case-insensitively). A later word (the *value* half of
+/// `.set <key> <value>`) is deliberately excluded: only the key is a closed
+/// set worth completing.
+fn is_set_or_unset_key_position(line: &str, start: usize) -> bool {
+    let mut words = line[..start].split_whitespace();
+    let Some(command) = words.next() else {
+        return false;
+    };
+    words.next().is_none() && matches!(command.to_ascii_lowercase().as_str(), ".set" | ".unset")
+}
+
+/// The entries of `candidates` that start with `prefix`, owned so the result
+/// can outlive whichever borrow produced it.
+fn filter_prefix<'a>(candidates: impl Iterator<Item = &'a str>, prefix: &str) -> Vec<String> {
+    candidates
+        .filter(|name| name.starts_with(prefix))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Case-insensitive variant of [`filter_prefix`], for dot-command and
+/// config-key completion: [`parse_dot`] itself accepts `.SCHEMA` and
+/// `.Schema` alike, so `.SC<tab>` completing nothing (while `.SCHEMA` runs
+/// fine) would be a needless surprise. Column completion in SQL position
+/// stays case-sensitive — field names genuinely are.
+fn filter_prefix_ci<'a>(candidates: impl Iterator<Item = &'a str>, prefix: &str) -> Vec<String> {
+    let prefix = prefix.to_ascii_lowercase();
+    candidates
+        .filter(|name| name.to_ascii_lowercase().starts_with(&prefix))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Tab-completion candidates for the REPL's input `line` with the cursor at
+/// byte offset `pos`, given a snapshot of the frontmatter `schema` and the
+/// dot-command names to offer. Pure and independent of rustyline, so it's
+/// directly unit-testable; [`ReplHelper::complete`] is a thin adapter onto
+/// rustyline's `Completer` trait.
+///
+/// Dispatches on the current word (see [`current_word`]) and its context:
+/// the command word of a `.`-prefixed line completes against `dot_names`;
+/// the key word of `.set`/`.unset` completes against [`ConfigKey::ALL`];
+/// anything else — a bare word in SQL position — completes against `schema`
+/// plus [`FILE_COLUMNS`], and never against SQL keywords. This last case is
+/// intentionally approximate (it doesn't parse SQL to know whether a column
+/// name even belongs where the cursor is) but harmless either way: rustyline
+/// only replaces the word when the user actually accepts a candidate, so an
+/// empty or wrong-context result just means nothing is offered.
+///
+/// A future sub-project may add saved-query-name completion; the SQL-word
+/// branch is the natural place to fold that in once saved queries exist.
+fn complete_candidates(
+    line: &str,
+    pos: usize,
+    schema: &[String],
+    dot_names: &[&str],
+) -> Vec<String> {
+    let (start, word) = current_word(line, pos);
+
+    if start == 0 && word.starts_with('.') {
+        return filter_prefix_ci(dot_names.iter().copied(), word);
+    }
+    if is_set_or_unset_key_position(line, start) {
+        return filter_prefix_ci(ConfigKey::ALL.iter().map(|key| key.as_str()), word);
+    }
+    filter_prefix(schema.iter().map(String::as_str).chain(FILE_COLUMNS), word)
+}
+
+/// rustyline `Helper`: wires [`complete_candidates`] into the editor as
+/// tab-completion, leaving hinting/highlighting/validation as no-ops (their
+/// trait defaults, brought in via `#[derive]`).
+///
+/// `schema` is a one-time snapshot of [`Session::schema`], taken in [`run`]
+/// when the REPL starts. It does *not* refresh after `.reload`/`.refresh`/
+/// `.refresh-all`, so a frontmatter field discovered mid-session won't
+/// tab-complete until the REPL is restarted — acceptable for v1; revisit if
+/// it's ever a real friction point.
+#[derive(Helper, Hinter, Highlighter, Validator)]
+struct ReplHelper {
+    schema: Vec<String>,
+}
+
+impl Completer for ReplHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &RlContext<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        let (start, _) = current_word(line, pos);
+        let candidates = complete_candidates(line, pos, &self.schema, DOT_COMMAND_NAMES)
+            .into_iter()
+            .map(|text| Pair {
+                display: text.clone(),
+                replacement: text,
+            })
+            .collect();
+        Ok((start, candidates))
     }
 }
 
@@ -636,9 +1007,21 @@ mod tests {
         assert!(matches!(parse_dot(".bogus"), DotCommand::Unknown(_)));
     }
     #[test]
+    fn parse_dot_describe() {
+        assert_eq!(
+            parse_dot(".describe status"),
+            DotCommand::Describe(Some("status".into()))
+        );
+        assert_eq!(parse_dot(".describe"), DotCommand::Describe(None));
+    }
+
+    #[test]
     fn dot_line_detected_by_buffer() {
         let mut b = LineBuffer::new();
-        assert!(matches!(b.push(".schema"), Line::Dot(DotCommand::Schema)));
+        assert!(matches!(
+            b.push(".schema"),
+            Line::Dot(DotCommand::Schema, _)
+        ));
     }
     #[test]
     fn refresh_commands_parse() {
@@ -713,5 +1096,211 @@ mod tests {
         assert_eq!(parse_dot(".set"), DotCommand::MissingArg("set"));
         assert_eq!(parse_dot(".set table_style"), DotCommand::MissingArg("set"));
         assert_eq!(parse_dot(".unset"), DotCommand::MissingArg("unset"));
+    }
+
+    #[test]
+    fn coverage_pct_edges() {
+        let stat = |non_null, total| FieldStat {
+            variants: BTreeSet::new(),
+            non_null,
+            total,
+            values: None,
+            distinct: 0,
+        };
+        assert_eq!(coverage_pct(&stat(4, 4)), 100, "all non-null is 100%");
+        assert_eq!(coverage_pct(&stat(0, 4)), 0, "all null is 0%");
+        assert_eq!(coverage_pct(&stat(3, 4)), 75);
+        assert_eq!(
+            coverage_pct(&stat(0, 0)),
+            0,
+            "no records must not divide by zero"
+        );
+    }
+
+    #[test]
+    fn row_count_line_pluralizes_correctly() {
+        assert_eq!(row_count_line(0), "-- 0 rows");
+        assert_eq!(row_count_line(1), "-- 1 row");
+        assert_eq!(row_count_line(2), "-- 2 rows");
+    }
+
+    /// The startup banner must name the record count and hint at both
+    /// `.help` and `.schema` — pinned here since it's stdout-only/REPL-only
+    /// and can't be reached by an integration test without a TTY.
+    #[test]
+    fn banner_contains_record_count_and_hints() {
+        let text = banner(42);
+        assert!(text.contains("42"), "{text:?}");
+        assert!(text.contains(".help"), "{text:?}");
+        assert!(text.contains(".schema"), "{text:?}");
+    }
+
+    #[test]
+    fn history_records_one_entry_per_statement_not_per_line() {
+        // Feed a multi-line statement through LineBuffer and assert the
+        // history hook yields exactly one entry equal to the joined statement.
+        let mut b = LineBuffer::new();
+        assert_eq!(history_entry(&b.push("SELECT status")), None); // More
+        assert_eq!(history_entry(&b.push("FROM 'x'")), None); // More
+        let done = b.push("WHERE status = 'draft';"); // Statement
+        let entry = history_entry(&done).expect("a completed statement is recorded");
+        assert!(entry.contains("SELECT status") && entry.contains("WHERE status = 'draft'"));
+        assert!(
+            entry.ends_with(';'),
+            "the terminator is re-appended so the entry is directly re-runnable: {entry:?}"
+        );
+        // a dot-command records one entry; blank records none
+        let mut b2 = LineBuffer::new();
+        assert_eq!(history_entry(&b2.push("")), None);
+        assert!(history_entry(&b2.push(".schema")).is_some());
+    }
+
+    #[test]
+    fn history_entry_for_dot_command_is_the_original_line_verbatim() {
+        // history_entry must not reconstruct dot-command text from the
+        // parsed DotCommand (which lowercases the command and collapses
+        // whitespace) — it should carry the original line through unchanged.
+        let mut b = LineBuffer::new();
+        let entry = history_entry(&b.push("  .FORMAT   json  ")).expect("a dot-command records");
+        assert_eq!(entry, ".FORMAT   json");
+    }
+
+    #[test]
+    fn history_entry_for_vertical_g_statement_reappends_it() {
+        let mut b = LineBuffer::new();
+        let entry =
+            history_entry(&b.push("SELECT 1\\G")).expect("a completed statement is recorded");
+        assert_eq!(entry, "SELECT 1\\G");
+    }
+
+    #[test]
+    fn completion_candidates_by_position() {
+        let schema = vec!["status".to_string(), "prd".to_string()];
+        // dot-command completion after '.'
+        let c = complete_candidates(".sc", 3, &schema, DOT_COMMAND_NAMES);
+        assert!(c.iter().any(|x| x == ".schema"));
+        // config-key completion after '.set '
+        let c = complete_candidates(".set for", 8, &schema, DOT_COMMAND_NAMES);
+        assert!(c.iter().any(|x| x == "format"));
+        // column completion for a bare word in SQL position
+        let c = complete_candidates("SELECT sta", 10, &schema, DOT_COMMAND_NAMES);
+        assert!(c.iter().any(|x| x == "status"));
+    }
+
+    /// SQL-position completion must draw only from `schema` plus
+    /// [`FILE_COLUMNS`], never a SQL-keyword list — proven with a prefix
+    /// (`"sel"`) that actually contains `select` as a candidate, unlike the
+    /// `"sta"` prefix in `completion_candidates_by_position` above (which
+    /// can't match `select` regardless of the implementation and so proves
+    /// nothing). The schema here deliberately excludes `select`.
+    #[test]
+    fn sql_position_completion_never_offers_a_sql_keyword() {
+        let schema = vec!["status".to_string(), "prd".to_string()];
+        let c = complete_candidates("SELECT sel", 10, &schema, DOT_COMMAND_NAMES);
+        assert!(
+            !c.iter().any(|x| x.eq_ignore_ascii_case("select")),
+            "completion must never draw from a SQL-keyword list: {c:?}"
+        );
+    }
+
+    /// Every name [`DOT_COMMAND_NAMES`] lists must actually parse to
+    /// something other than `Unknown` — the drift guard `parse_dot`'s leading
+    /// check (and its trailing `unreachable!()`) depends on.
+    #[test]
+    fn dot_command_names_all_parse() {
+        for name in DOT_COMMAND_NAMES {
+            assert!(
+                !matches!(parse_dot(name), DotCommand::Unknown(_)),
+                "{name} is in DOT_COMMAND_NAMES but parse_dot doesn't recognize it"
+            );
+        }
+    }
+
+    /// Every name [`DOT_COMMAND_NAMES`] lists must also appear in `.help`'s
+    /// output, so a command that tab-completes can never go undocumented —
+    /// the sibling drift guard to `dot_command_names_all_parse` above.
+    #[test]
+    fn print_help_documents_every_dot_command_name() {
+        let text = help_text();
+        for name in DOT_COMMAND_NAMES {
+            assert!(
+                text.contains(name),
+                "{name} is in DOT_COMMAND_NAMES but missing from .help's output:\n{text}"
+            );
+        }
+    }
+
+    /// `parse_dot` accepts `.SCHEMA`/`.Schema` case-insensitively, so
+    /// completion of the dot-command word must too — `.SC<tab>` offers
+    /// `.schema` exactly like `.sc<tab>` does.
+    #[test]
+    fn dot_command_completion_is_case_insensitive() {
+        let schema = vec!["status".to_string()];
+        let c = complete_candidates(".SC", 3, &schema, DOT_COMMAND_NAMES);
+        assert!(c.iter().any(|x| x == ".schema"), "{c:?}");
+    }
+
+    #[test]
+    fn completion_offers_file_columns_and_unset_keys_too() {
+        let schema = vec!["status".to_string()];
+        // file.* pseudo-columns complete alongside schema fields.
+        let c = complete_candidates("SELECT file.n", 13, &schema, DOT_COMMAND_NAMES);
+        assert!(c.iter().any(|x| x == "file.name"));
+        // .unset gets the same key completion as .set.
+        let c = complete_candidates(".unset hi", 9, &schema, DOT_COMMAND_NAMES);
+        assert!(c.iter().any(|x| x == "hidden"));
+    }
+
+    /// Only the word immediately after `.set`/`.unset` is a key candidate —
+    /// a later word (the third word overall, i.e. the *value*) must not
+    /// trigger config-key completion. Using a value prefix ("fo") that a real
+    /// key ("format") also starts with makes this a real regression check,
+    /// not a vacuous one.
+    #[test]
+    fn completion_does_not_offer_keys_for_the_value_word() {
+        let schema = vec!["status".to_string()];
+        let line = ".set table_style fo";
+        let c = complete_candidates(line, line.len(), &schema, DOT_COMMAND_NAMES);
+        assert!(!c.iter().any(|x| x == "format"));
+    }
+
+    /// A `.`-looking word that isn't the *first* word of the line (e.g. a
+    /// stray value starting with a dot) must not be treated as a
+    /// dot-command: only `start == 0` triggers that branch.
+    #[test]
+    fn completion_dot_prefix_only_matters_as_the_first_word() {
+        let schema = vec!["status".to_string()];
+        let line = "SELECT .sc";
+        let c = complete_candidates(line, line.len(), &schema, DOT_COMMAND_NAMES);
+        assert!(
+            !c.iter().any(|x| x == ".schema"),
+            "a `.`-looking word that isn't the first word must not complete as a \
+             dot-command: {c:?}"
+        );
+    }
+
+    /// A non-char-boundary or out-of-range `pos` must never panic — only
+    /// rustyline is expected to hand out valid positions, but the completer
+    /// must be defensive regardless.
+    #[test]
+    fn current_word_never_panics_on_bad_positions() {
+        let line = "SELECT 'caf\u{e9}' WHERE x";
+        for pos in 0..=line.len() + 5 {
+            let _ = current_word(line, pos);
+        }
+    }
+
+    #[test]
+    fn repl_helper_complete_delegates_to_complete_candidates() {
+        let helper = ReplHelper {
+            schema: vec!["status".to_string()],
+        };
+        let history = FileHistory::new();
+        let ctx = RlContext::new(&history);
+        let (start, pairs) = helper
+            .complete(".sc", 3, &ctx)
+            .expect("completion never errors");
+        assert_eq!(start, 0);
+        assert!(pairs.iter().any(|p| p.replacement == ".schema"));
     }
 }

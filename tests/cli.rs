@@ -126,6 +126,53 @@ fn batch_mode_from_stdin() {
         .stdout(predicates::str::contains("n"));
 }
 
+/// Batch mode (piped stdin, no `-e`) is the same code path as `-e`/one-shot
+/// and must never print the REPL-only `-- N rows` count line — regression
+/// guard for the row-count feature, which is wired only into `repl::run`.
+#[test]
+fn batch_mode_stdin_emits_no_row_count_line() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg(td.path())
+        .write_stdin("SELECT count(*) AS n;\n")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("n"))
+        .stderr(predicates::str::contains("-- ").not());
+}
+
+/// The startup banner (record count + `.help`/`.schema` hint) is REPL-only:
+/// batch mode (piped stdin, no `-e`) must never print it on stdout, since
+/// that would corrupt piped output. The REPL-positive path needs a TTY and
+/// is out of scope here; `repl`'s `banner_contains_record_count_and_hints`
+/// unit test pins the banner's own content.
+#[test]
+fn batch_mode_stdin_emits_no_startup_banner() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg(td.path())
+        .write_stdin("SELECT count(*) AS n;\n")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Type .help").not());
+}
+
+/// Same guard for `-e`/one-shot mode, which is an entirely separate code path
+/// from batch mode's `run_statements`.
+#[test]
+fn oneshot_emits_no_startup_banner() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["-e", "SELECT count(*) AS n"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Type .help").not());
+}
+
 #[test]
 fn query_error_exits_nonzero() {
     let td = tree();
