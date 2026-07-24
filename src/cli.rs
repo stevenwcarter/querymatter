@@ -115,6 +115,11 @@ pub struct Cli {
     #[arg(long, value_enum, env = "QUERYMATTER_TABLE_STYLE")]
     pub table_style: Option<TableStyle>,
 
+    /// Treat an unknown SELECT/WHERE/GROUP BY/ORDER BY/HAVING column as NULL
+    /// instead of failing the query with a suggestion.
+    #[arg(long)]
+    pub lenient: bool,
+
     /// Flags shared with `querymatter init` that shape the directory walk.
     #[command(flatten)]
     pub walk: WalkFlags,

@@ -47,21 +47,100 @@ pub enum ExecError {
     /// stays total for a hand-built `Query` that bypasses that guarantee.
     #[error("ORDER BY an aggregate requires GROUP BY")]
     AggregateOrderWithoutGroupBy,
+    /// A `SELECT`/`WHERE`/`GROUP BY`/`ORDER BY`/`HAVING`/`MEMBER OF` column
+    /// that isn't in the record set's schema — almost always a typo. Skipped
+    /// entirely under `--lenient` (see [`execute`]), where an unknown column
+    /// resolves to `Value::Null` instead, matching pre-validation behavior.
+    #[error("unknown column `{name}`{}", suggestion_suffix(suggestion))]
+    UnknownColumn {
+        name: String,
+        suggestion: Option<String>,
+    },
 }
 
 /// Executes `q` against `records`, returning the projected, filtered,
 /// ordered, and limited result.
+///
+/// Unless `lenient` is set, every column `q` references (see
+/// [`Query::referenced_fields`]) is checked against the schema — the sorted
+/// union of field names across `records` — before the filter/project
+/// pipeline runs, so a typo'd column fails fast with a suggestion rather than
+/// silently reading as `Null` throughout. An empty `records` skips this
+/// check: a fresh or empty vault has no schema to check against, and must
+/// not fail every query on that account alone.
 ///
 /// Dispatches on whether `q` is grouped/aggregate; see
 /// [`is_grouped_or_aggregate`].
 pub fn execute<'a>(
     q: &Query,
     records: impl Iterator<Item = &'a Record>,
+    lenient: bool,
 ) -> Result<ResultTable, ExecError> {
-    if is_grouped_or_aggregate(q) {
-        return execute_grouped(q, records);
+    let records: Vec<&Record> = records.collect();
+    if !lenient && !records.is_empty() {
+        validate_columns(q, &sorted_field_union(&records))?;
     }
-    execute_ungrouped(q, records)
+    if is_grouped_or_aggregate(q) {
+        return execute_grouped(q, records.into_iter());
+    }
+    execute_ungrouped(q, records.into_iter())
+}
+
+/// Checks every column `q.referenced_fields()` touches against `schema`,
+/// failing on the first (sorted) name that isn't in it.
+fn validate_columns(q: &Query, schema: &[String]) -> Result<(), ExecError> {
+    for name in q.referenced_fields() {
+        if !schema.contains(&name) {
+            let suggestion = nearest(&name, schema);
+            return Err(ExecError::UnknownColumn { name, suggestion });
+        }
+    }
+    Ok(())
+}
+
+/// The schema field nearest to `name` by Levenshtein distance, when one is
+/// close enough to plausibly be what a typo meant: within 2 edits, or within
+/// a third of `name`'s length, whichever allows more slack. `None` when no
+/// field clears that bar (or `schema` is empty).
+fn nearest(name: &str, schema: &[String]) -> Option<String> {
+    let len = name.chars().count();
+    let threshold = len.div_ceil(3).max(2);
+    schema
+        .iter()
+        .map(|field| (field, levenshtein(name, field)))
+        .filter(|(_, dist)| *dist <= threshold)
+        .min_by_key(|(_, dist)| *dist)
+        .map(|(field, _)| field.clone())
+}
+
+/// The Levenshtein (edit) distance between `a` and `b`, char-wise. Used only
+/// by [`nearest`] to suggest a schema field for a likely-typo'd column name,
+/// so this is a plain textbook DP rather than a dependency — the crate has no
+/// other use for a general string-distance metric.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr = vec![0usize; b.len() + 1];
+    for (i, &ca) in a.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
+}
+
+/// The `, did you mean '<x>'?` suffix for [`ExecError::UnknownColumn`]'s
+/// `Display`, or an empty string when no schema field was close enough to
+/// suggest.
+fn suggestion_suffix(suggestion: &Option<String>) -> String {
+    match suggestion {
+        Some(name) => format!(", did you mean '{name}'?"),
+        None => String::new(),
+    }
 }
 
 /// True when `q` needs the grouped/aggregate execution path (Task 8): a
@@ -1091,19 +1170,19 @@ mod tests {
 
         let neg_start = parse("SELECT substr(name, -99999999999999999999)").unwrap();
         assert_eq!(
-            execute(&neg_start, rows.iter()).unwrap().rows,
+            execute(&neg_start, rows.iter(), false).unwrap().rows,
             vec![vec![Value::Str("hello".into())]]
         );
 
         let huge_len = parse("SELECT substr(name, 2, 99999999999999999999)").unwrap();
         assert_eq!(
-            execute(&huge_len, rows.iter()).unwrap().rows,
+            execute(&huge_len, rows.iter(), false).unwrap().rows,
             vec![vec![Value::Str("ello".into())]]
         );
 
         let huge_start = parse("SELECT substr(name, 99999999999999999999)").unwrap();
         assert_eq!(
-            execute(&huge_start, rows.iter()).unwrap().rows,
+            execute(&huge_start, rows.iter(), false).unwrap().rows,
             vec![vec![Value::Str("".into())]]
         );
     }
@@ -1191,19 +1270,19 @@ mod tests {
 
         let lower = parse("SELECT lower(status)").unwrap();
         assert_eq!(
-            execute(&lower, rows.iter()).unwrap().rows,
+            execute(&lower, rows.iter(), false).unwrap().rows,
             vec![vec![Value::Str("draft".into())]]
         );
 
         let div = parse("SELECT (a / b) AS r").unwrap();
         assert_eq!(
-            execute(&div, rows.iter()).unwrap().rows,
+            execute(&div, rows.iter(), false).unwrap().rows,
             vec![vec![Value::Float(1.5)]]
         );
 
         let concat = parse("SELECT a || '-' || status").unwrap();
         assert_eq!(
-            execute(&concat, rows.iter()).unwrap().rows,
+            execute(&concat, rows.iter(), false).unwrap().rows,
             vec![vec![Value::Str("3-Draft".into())]]
         );
     }
@@ -1217,7 +1296,7 @@ mod tests {
         let rows = [rec("s", "s/a.md", &[("x", Value::Str("3.5".into()))])];
         let q = parse("SELECT x + 1").unwrap();
         assert_eq!(
-            execute(&q, rows.iter()).unwrap().rows,
+            execute(&q, rows.iter(), false).unwrap().rows,
             vec![vec![Value::Float(4.5)]]
         );
     }
@@ -1225,7 +1304,7 @@ mod tests {
     #[test]
     fn filter_and_project_with_alias() {
         let q = parse("SELECT status AS S, file.name WHERE prd = '010'").unwrap();
-        let t = execute(&q, recs().iter()).unwrap();
+        let t = execute(&q, recs().iter(), false).unwrap();
         assert_eq!(t.headers, vec!["S", "file.name"]);
         assert_eq!(t.rows.len(), 2);
         assert_eq!(
@@ -1236,7 +1315,7 @@ mod tests {
     #[test]
     fn order_desc_and_limit() {
         let q = parse("SELECT status WHERE prd = '010' ORDER BY status DESC LIMIT 1").unwrap();
-        let t = execute(&q, recs().iter()).unwrap();
+        let t = execute(&q, recs().iter(), false).unwrap();
         assert_eq!(t.rows, vec![vec![Value::Str("synced".into())]]);
     }
     #[test]
@@ -1247,7 +1326,7 @@ mod tests {
             rec("s", "s/b/3.md", &[]),
         ];
         let q = parse("SELECT DISTINCT file.folder").unwrap();
-        let t = execute(&q, rows.iter()).unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
         assert_eq!(
             t.rows,
             vec![vec![Value::Str("a".into())], vec![Value::Str("b".into())]]
@@ -1259,7 +1338,7 @@ mod tests {
         // DISTINCT keys on the final *projected* cells only, so they still
         // collapse to a single row.
         let q = parse("SELECT DISTINCT status").unwrap();
-        let t = execute(&q, recs().iter()).unwrap();
+        let t = execute(&q, recs().iter(), false).unwrap();
         assert_eq!(
             t.rows,
             vec![
@@ -1293,7 +1372,7 @@ mod tests {
             ),
         ];
         let q = parse("SELECT DISTINCT status ORDER BY prd").unwrap();
-        let t = execute(&q, rows.iter()).unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
         assert_eq!(
             t.rows,
             vec![vec![Value::Str("B".into())], vec![Value::Str("A".into())]]
@@ -1302,21 +1381,21 @@ mod tests {
     #[test]
     fn star_expands_sorted_union() {
         let q = parse("SELECT * WHERE status = 'draft'").unwrap();
-        let t = execute(&q, recs().iter()).unwrap();
+        let t = execute(&q, recs().iter(), false).unwrap();
         assert_eq!(t.headers, vec!["prd", "status"]);
     }
     #[test]
     fn from_glob_filters_by_path() {
         let q = parse("SELECT file.name FROM 'plans/**'").unwrap();
-        let t = execute(&q, recs().iter()).unwrap();
+        let t = execute(&q, recs().iter(), false).unwrap();
         assert_eq!(t.rows.len(), 2);
     }
     #[test]
     fn like_and_in() {
         let q = parse("SELECT status WHERE status LIKE 'syn%'").unwrap();
-        assert_eq!(execute(&q, recs().iter()).unwrap().rows.len(), 2);
+        assert_eq!(execute(&q, recs().iter(), false).unwrap().rows.len(), 2);
         let q2 = parse("SELECT status WHERE prd IN ('011')").unwrap();
-        assert_eq!(execute(&q2, recs().iter()).unwrap().rows.len(), 1);
+        assert_eq!(execute(&q2, recs().iter(), false).unwrap().rows.len(), 1);
     }
     #[test]
     fn member_of_list_field() {
@@ -1342,13 +1421,18 @@ mod tests {
         // unknown, not false, so they're excluded either way.
         let present = parse("SELECT file.name WHERE 'mobile' MEMBER OF(tags)").unwrap();
         assert_eq!(
-            execute(&present, rows.iter()).unwrap().rows,
+            execute(&present, rows.iter(), false).unwrap().rows,
             vec![vec![Value::Str("a.md".into())]]
         );
 
         // A non-member yields no match on the list row either.
         let absent = parse("SELECT file.name WHERE 'ios' MEMBER OF(tags)").unwrap();
-        assert!(execute(&absent, rows.iter()).unwrap().rows.is_empty());
+        assert!(
+            execute(&absent, rows.iter(), false)
+                .unwrap()
+                .rows
+                .is_empty()
+        );
 
         // `NOT <lit> MEMBER OF(col)` (sqlparser 0.62 only accepts the prefix
         // NOT form, not `col NOT MEMBER OF(...)`) flips the list row to a
@@ -1356,7 +1440,7 @@ mod tests {
         // must NOT be resurrected.
         let negated = parse("SELECT file.name WHERE NOT 'ios' MEMBER OF(tags)").unwrap();
         assert_eq!(
-            execute(&negated, rows.iter()).unwrap().rows,
+            execute(&negated, rows.iter(), false).unwrap().rows,
             vec![vec![Value::Str("a.md".into())]]
         );
     }
@@ -1376,21 +1460,21 @@ mod tests {
         // 3VL, so `NOT IN` must NOT resurrect it (the pre-3VL bug did).
         let all = recs_with_null_status();
         let q = parse("SELECT file.name WHERE status NOT IN ('draft')").unwrap();
-        let t = execute(&q, all.iter()).unwrap();
+        let t = execute(&q, all.iter(), false).unwrap();
         assert_eq!(t.rows, vec![vec![Value::Str("b.md".into())]]);
     }
     #[test]
     fn not_like_excludes_null_field_row() {
         let all = recs_with_null_status();
         let q = parse("SELECT file.name WHERE status NOT LIKE 'dr%'").unwrap();
-        let t = execute(&q, all.iter()).unwrap();
+        let t = execute(&q, all.iter(), false).unwrap();
         assert_eq!(t.rows, vec![vec![Value::Str("b.md".into())]]);
     }
     #[test]
     fn not_paren_compare_excludes_null_field_row() {
         let all = recs_with_null_status();
         let q = parse("SELECT file.name WHERE NOT (status = 'draft')").unwrap();
-        let t = execute(&q, all.iter()).unwrap();
+        let t = execute(&q, all.iter(), false).unwrap();
         assert_eq!(t.rows, vec![vec![Value::Str("b.md".into())]]);
     }
     #[test]
@@ -1398,13 +1482,13 @@ mod tests {
         let all = recs_with_null_status();
         let is_null = parse("SELECT file.name WHERE status IS NULL").unwrap();
         assert_eq!(
-            execute(&is_null, all.iter()).unwrap().rows,
+            execute(&is_null, all.iter(), false).unwrap().rows,
             vec![vec![Value::Str("c.md".into())]],
             "IS NULL selects only the status-less row"
         );
         let not_null = parse("SELECT file.name WHERE status IS NOT NULL").unwrap();
         assert_eq!(
-            execute(&not_null, all.iter()).unwrap().rows,
+            execute(&not_null, all.iter(), false).unwrap().rows,
             vec![
                 vec![Value::Str("a.md".into())],
                 vec![Value::Str("b.md".into())],
@@ -1420,11 +1504,13 @@ mod tests {
         let ne = execute(
             &parse("SELECT file.name WHERE status != 'draft'").unwrap(),
             all.iter(),
+            false,
         )
         .unwrap();
         let not_paren = execute(
             &parse("SELECT file.name WHERE NOT (status = 'draft')").unwrap(),
             all.iter(),
+            false,
         )
         .unwrap();
         assert_eq!(ne.rows, not_paren.rows);
@@ -1441,7 +1527,7 @@ mod tests {
             rec("s", "s/c.md", &[("n", Value::Str("5".into()))]),
         ];
         let q = parse("SELECT n WHERE n > 2").unwrap();
-        let t = execute(&q, rows.iter()).unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
         assert_eq!(
             t.rows,
             vec![vec![Value::Int(3)], vec![Value::Str("5".into())]]
@@ -1460,27 +1546,30 @@ mod tests {
 
         let lt = parse("SELECT n WHERE n < 10").unwrap();
         assert_eq!(
-            execute(&lt, rows.iter()).unwrap().rows,
+            execute(&lt, rows.iter(), false).unwrap().rows,
             vec![vec![Value::Str("9".into())]],
             "n < 10"
         );
 
         let gt_flipped = parse("SELECT n WHERE 10 > n").unwrap();
         assert_eq!(
-            execute(&gt_flipped, rows.iter()).unwrap().rows,
+            execute(&gt_flipped, rows.iter(), false).unwrap().rows,
             vec![vec![Value::Str("9".into())]],
             "10 > n must agree with n < 10"
         );
 
         let gt = parse("SELECT n WHERE n > 10").unwrap();
         assert!(
-            execute(&gt, rows.iter()).unwrap().rows.is_empty(),
+            execute(&gt, rows.iter(), false).unwrap().rows.is_empty(),
             "n > 10 is false"
         );
 
         let lt_flipped = parse("SELECT n WHERE 10 < n").unwrap();
         assert!(
-            execute(&lt_flipped, rows.iter()).unwrap().rows.is_empty(),
+            execute(&lt_flipped, rows.iter(), false)
+                .unwrap()
+                .rows
+                .is_empty(),
             "10 < n must agree with n > 10"
         );
     }
@@ -1494,12 +1583,12 @@ mod tests {
         let numeric = [rec("s", "s/a.md", &[("status", Value::Str("5.0".into()))])];
         let eq = parse("SELECT status WHERE status = 5").unwrap();
         assert_eq!(
-            execute(&eq, numeric.iter()).unwrap().rows,
+            execute(&eq, numeric.iter(), false).unwrap().rows,
             vec![vec![Value::Str("5.0".into())]]
         );
         let eq_flipped = parse("SELECT status WHERE 5 = status").unwrap();
         assert_eq!(
-            execute(&eq_flipped, numeric.iter()).unwrap().rows,
+            execute(&eq_flipped, numeric.iter(), false).unwrap().rows,
             vec![vec![Value::Str("5.0".into())]],
             "5 = status must agree with status = 5"
         );
@@ -1510,10 +1599,15 @@ mod tests {
             &[("status", Value::Str("draft".into()))],
         )];
         let eq2 = parse("SELECT status WHERE status = 5").unwrap();
-        assert!(execute(&eq2, non_numeric.iter()).unwrap().rows.is_empty());
+        assert!(
+            execute(&eq2, non_numeric.iter(), false)
+                .unwrap()
+                .rows
+                .is_empty()
+        );
         let eq2_flipped = parse("SELECT status WHERE 5 = status").unwrap();
         assert!(
-            execute(&eq2_flipped, non_numeric.iter())
+            execute(&eq2_flipped, non_numeric.iter(), false)
                 .unwrap()
                 .rows
                 .is_empty(),
@@ -1538,7 +1632,7 @@ mod tests {
         ];
         let cmp = parse("SELECT start WHERE start < end").unwrap();
         assert_eq!(
-            execute(&cmp, bounds.iter()).unwrap().rows,
+            execute(&cmp, bounds.iter(), false).unwrap().rows,
             vec![vec![Value::Int(1)]]
         );
 
@@ -1550,7 +1644,7 @@ mod tests {
         )];
         let scalar = parse("SELECT status WHERE lower(status) = 'draft'").unwrap();
         assert_eq!(
-            execute(&scalar, draft.iter()).unwrap().rows,
+            execute(&scalar, draft.iter(), false).unwrap().rows,
             vec![vec![Value::Str("Draft".into())]]
         );
 
@@ -1562,7 +1656,7 @@ mod tests {
         )];
         let arith = parse("SELECT start WHERE start + 1 = end").unwrap();
         assert_eq!(
-            execute(&arith, arith_rows.iter()).unwrap().rows,
+            execute(&arith, arith_rows.iter(), false).unwrap().rows,
             vec![vec![Value::Int(4)]]
         );
     }
@@ -1573,7 +1667,10 @@ mod tests {
         // `Value::Null`; comparing it against `status` (present on both
         // rows) must be unknown — not a match, and not an error — the same
         // 3VL rule a NULL field already follows on the literal-comparison
-        // side (column validation for a genuinely unknown field is T9).
+        // side. `missing` also isn't in the schema, so this pins the 3VL
+        // behavior under `lenient = true`; the strict, non-lenient rejection
+        // of a genuinely unknown column is exercised separately, by the
+        // `unknown_column_*` tests below.
         //
         // A plain `WHERE` can't tell unknown (`None`) apart from `Some(false)`
         // — both yield zero rows — so this also checks the negated form:
@@ -1587,24 +1684,30 @@ mod tests {
             rec("s", "s/b.md", &[("status", Value::Str("synced".into()))]),
         ];
         let q = parse("SELECT status WHERE missing = status").unwrap();
-        assert!(execute(&q, rows.iter()).unwrap().rows.is_empty());
+        assert!(execute(&q, rows.iter(), true).unwrap().rows.is_empty());
 
         let negated = parse("SELECT status WHERE NOT (missing = status)").unwrap();
         assert!(
-            execute(&negated, rows.iter()).unwrap().rows.is_empty(),
+            execute(&negated, rows.iter(), true)
+                .unwrap()
+                .rows
+                .is_empty(),
             "NOT (unknown) is still unknown, not true — must not resurrect the rows"
         );
 
         // Same check with the Null on the right-hand operand instead.
         let right_null = parse("SELECT status WHERE status = missing").unwrap();
         assert!(
-            execute(&right_null, rows.iter()).unwrap().rows.is_empty(),
+            execute(&right_null, rows.iter(), true)
+                .unwrap()
+                .rows
+                .is_empty(),
             "a right-side Null operand must also be unknown, not a hard match/no-match"
         );
 
         let right_null_negated = parse("SELECT status WHERE NOT (status = missing)").unwrap();
         assert!(
-            execute(&right_null_negated, rows.iter())
+            execute(&right_null_negated, rows.iter(), true)
                 .unwrap()
                 .rows
                 .is_empty(),
@@ -1623,12 +1726,64 @@ mod tests {
         all.push(with_null);
 
         let asc = parse("SELECT status, file.name ORDER BY status ASC").unwrap();
-        let t_asc = execute(&asc, all.iter()).unwrap();
+        let t_asc = execute(&asc, all.iter(), false).unwrap();
         assert_eq!(t_asc.rows.last().unwrap()[0], Value::Null);
 
         let desc = parse("SELECT status, file.name ORDER BY status DESC").unwrap();
-        let t_desc = execute(&desc, all.iter()).unwrap();
+        let t_desc = execute(&desc, all.iter(), false).unwrap();
         assert_eq!(t_desc.rows.last().unwrap()[0], Value::Null);
+    }
+
+    #[test]
+    fn unknown_column_errors_with_suggestion() {
+        // "staus" is a one-deletion typo of the real field "status".
+        let q = parse("SELECT staus").unwrap();
+        match execute(&q, recs().iter(), false) {
+            Err(ExecError::UnknownColumn { name, suggestion }) => {
+                assert_eq!(name, "staus");
+                assert_eq!(suggestion.as_deref(), Some("status"));
+            }
+            other => panic!("expected UnknownColumn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lenient_restores_null_for_unknown_column() {
+        // Under `lenient = true`, validation is skipped entirely and an
+        // unknown column resolves to `Value::Null` at every row, matching
+        // pre-validation behavior.
+        let all = recs();
+        let q = parse("SELECT staus").unwrap();
+        let t = execute(&q, all.iter(), true).unwrap();
+        assert_eq!(t.rows, vec![vec![Value::Null]; all.len()]);
+    }
+
+    #[test]
+    fn empty_store_skips_validation() {
+        // An empty record set has no schema to check against — it must not
+        // fail the query just because it declares no fields at all.
+        let none: Vec<Record> = Vec::new();
+        let q = parse("SELECT staus").unwrap();
+        let t = execute(&q, none.iter(), false).unwrap();
+        assert!(t.rows.is_empty());
+    }
+
+    #[test]
+    fn typo_inside_scalar_and_having_is_caught() {
+        // Validation must walk into a scalar-function argument, not just a
+        // bare `SELECT` column.
+        let scalar = parse("SELECT lower(staus)").unwrap();
+        assert!(matches!(
+            execute(&scalar, recs().iter(), false),
+            Err(ExecError::UnknownColumn { .. })
+        ));
+
+        // ...and into a HAVING aggregate's argument too.
+        let having = parse("SELECT status GROUP BY status HAVING count(staus) > 0").unwrap();
+        assert!(matches!(
+            execute(&having, recs().iter(), false),
+            Err(ExecError::UnknownColumn { .. })
+        ));
     }
 }
 
@@ -1666,7 +1821,7 @@ mod agg_tests {
     fn count_per_status_renamed_ordered() {
         let q =
             parse("SELECT status, count(*) AS Count GROUP BY status ORDER BY Count DESC").unwrap();
-        let t = execute(&q, recs().iter()).unwrap();
+        let t = execute(&q, recs().iter(), false).unwrap();
         assert_eq!(t.headers, vec!["status", "Count"]);
         assert_eq!(
             t.rows,
@@ -1679,19 +1834,19 @@ mod agg_tests {
     #[test]
     fn bare_count_star_single_group() {
         let q = parse("SELECT count(*) AS n").unwrap();
-        let t = execute(&q, recs().iter()).unwrap();
+        let t = execute(&q, recs().iter(), false).unwrap();
         assert_eq!(t.rows, vec![vec![Value::Int(3)]]);
     }
     #[test]
     fn count_distinct() {
         let q = parse("SELECT count(distinct status) AS d").unwrap();
-        let t = execute(&q, recs().iter()).unwrap();
+        let t = execute(&q, recs().iter(), false).unwrap();
         assert_eq!(t.rows, vec![vec![Value::Int(2)]]);
     }
     #[test]
     fn group_concat() {
         let q = parse("SELECT prd, group_concat(status) AS ss GROUP BY prd ORDER BY prd").unwrap();
-        let t = execute(&q, recs().iter()).unwrap();
+        let t = execute(&q, recs().iter(), false).unwrap();
         assert_eq!(
             t.rows[0],
             vec![Value::Str("010".into()), Value::Str("draft, synced".into())]
@@ -1701,7 +1856,7 @@ mod agg_tests {
     fn non_grouped_column_errors() {
         let q = parse("SELECT status, prd, count(*) GROUP BY status").unwrap();
         assert!(matches!(
-            execute(&q, recs().iter()),
+            execute(&q, recs().iter(), false),
             Err(ExecError::NonGroupedColumn(_))
         ));
     }
@@ -1711,7 +1866,7 @@ mod agg_tests {
         // it's evaluated over each group's representative row.
         let q =
             parse("SELECT lower(status), count(*) AS n GROUP BY status ORDER BY status").unwrap();
-        let t = execute(&q, recs().iter()).unwrap();
+        let t = execute(&q, recs().iter(), false).unwrap();
         assert_eq!(
             t.rows,
             vec![
@@ -1727,7 +1882,7 @@ mod agg_tests {
         // sub-expressions, not just bare columns.
         let q = parse("SELECT lower(prd), count(*) GROUP BY status").unwrap();
         assert!(matches!(
-            execute(&q, recs().iter()),
+            execute(&q, recs().iter(), false),
             Err(ExecError::NonGroupedColumn(_))
         ));
     }
@@ -1737,7 +1892,7 @@ mod agg_tests {
         // even when the implicit single group (empty GROUP BY) has zero
         // rows to use as a representative.
         let q = parse("SELECT 1 + 1 AS two, count(*) AS n WHERE status = 'nope'").unwrap();
-        let t = execute(&q, recs().iter()).unwrap();
+        let t = execute(&q, recs().iter(), false).unwrap();
         assert_eq!(t.rows, vec![vec![Value::Int(2), Value::Int(0)]]);
     }
     #[test]
@@ -1747,7 +1902,7 @@ mod agg_tests {
             rec_n("s/b.md", "draft", Value::Int(4)),
         ];
         let q = parse("SELECT sum(n) AS total, avg(n) AS mean").unwrap();
-        let t = execute(&q, rows.iter()).unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
         assert_eq!(t.rows, vec![vec![Value::Float(6.0), Value::Float(3.0)]]);
     }
     #[test]
@@ -1758,7 +1913,7 @@ mod agg_tests {
             rec_n("s/c.md", "draft", Value::Int(4)),
         ];
         let q = parse("SELECT sum(n) AS total, avg(n) AS mean").unwrap();
-        let t = execute(&q, rows.iter()).unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
         // The non-numeric "n/a" is skipped, so only 2 and 4 count.
         assert_eq!(t.rows, vec![vec![Value::Float(6.0), Value::Float(3.0)]]);
     }
@@ -1769,7 +1924,7 @@ mod agg_tests {
             rec_n("s/b.md", "draft", Value::Null),
         ];
         let q = parse("SELECT sum(n) AS total, avg(n) AS mean").unwrap();
-        let t = execute(&q, rows.iter()).unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
         // `avg` over zero numeric values is Null; `sum` is the identity 0.0.
         assert_eq!(t.rows, vec![vec![Value::Float(0.0), Value::Null]]);
     }
@@ -1781,7 +1936,7 @@ mod agg_tests {
             rec_n("s/c.md", "draft", Value::Int(3)),
         ];
         let q = parse("SELECT min(n) AS lo, max(n) AS hi").unwrap();
-        let t = execute(&q, rows.iter()).unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
         assert_eq!(t.rows, vec![vec![Value::Int(1), Value::Int(5)]]);
     }
     #[test]
@@ -1791,7 +1946,7 @@ mod agg_tests {
             rec_n("s/b.md", "draft", Value::Null),
         ];
         let q = parse("SELECT min(n) AS lo, max(n) AS hi").unwrap();
-        let t = execute(&q, rows.iter()).unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
         assert_eq!(t.rows, vec![vec![Value::Null, Value::Null]]);
     }
     #[test]
@@ -1805,7 +1960,7 @@ mod agg_tests {
             rec_n("s/c.md", "draft", Value::Int(3)),
         ];
         let q = parse("SELECT count(*) AS rows, count(n) AS non_null").unwrap();
-        let t = execute(&q, rows.iter()).unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
         assert_eq!(t.rows, vec![vec![Value::Int(3), Value::Int(2)]]);
     }
     #[test]
@@ -1814,7 +1969,7 @@ mod agg_tests {
         // invalid as selecting it would be.
         let q = parse("SELECT status, count(*) GROUP BY status ORDER BY prd").unwrap();
         assert!(matches!(
-            execute(&q, recs().iter()),
+            execute(&q, recs().iter(), false),
             Err(ExecError::NonGroupedColumn(_))
         ));
     }
@@ -1823,7 +1978,7 @@ mod agg_tests {
         // status: draft x1, synced x2 (see `recs()`) — no `AS` alias on
         // `count(*)`, yet `ORDER BY count(*) DESC` still sorts groups by it.
         let q = parse("SELECT status, count(*) GROUP BY status ORDER BY count(*) DESC").unwrap();
-        let t = execute(&q, recs().iter()).unwrap();
+        let t = execute(&q, recs().iter(), false).unwrap();
         assert_eq!(
             t.rows,
             vec![
@@ -1837,7 +1992,7 @@ mod agg_tests {
         // `count(*)` drives the sort even though it's absent from SELECT —
         // it's computed fresh from each group's rows, same as `HAVING`.
         let q = parse("SELECT status GROUP BY status ORDER BY count(*) DESC").unwrap();
-        let t = execute(&q, recs().iter()).unwrap();
+        let t = execute(&q, recs().iter(), false).unwrap();
         assert_eq!(
             t.rows,
             vec![
@@ -1849,7 +2004,7 @@ mod agg_tests {
     #[test]
     fn aggregate_with_no_group_by_over_zero_rows_is_one_row_of_zero() {
         let q = parse("SELECT count(*) AS n WHERE status = 'nope'").unwrap();
-        let t = execute(&q, recs().iter()).unwrap();
+        let t = execute(&q, recs().iter(), false).unwrap();
         assert_eq!(t.rows, vec![vec![Value::Int(0)]]);
     }
 
@@ -1861,7 +2016,7 @@ mod agg_tests {
             "SELECT status, count(*) AS n GROUP BY status HAVING count(*) > 1 ORDER BY status",
         )
         .unwrap();
-        let t = execute(&q, recs().iter()).unwrap();
+        let t = execute(&q, recs().iter(), false).unwrap();
         assert_eq!(
             t.rows,
             vec![vec![Value::Str("synced".into()), Value::Int(2)]]
@@ -1872,14 +2027,14 @@ mod agg_tests {
         // `count(*)` never appears in SELECT, only in HAVING — standard SQL
         // still allows filtering on an aggregate that isn't projected.
         let q = parse("SELECT status GROUP BY status HAVING count(*) > 1").unwrap();
-        let t = execute(&q, recs().iter()).unwrap();
+        let t = execute(&q, recs().iter(), false).unwrap();
         assert_eq!(t.rows, vec![vec![Value::Str("synced".into())]]);
     }
     #[test]
     fn having_can_reference_a_grouping_key() {
         let q =
             parse("SELECT status, count(*) AS n GROUP BY status HAVING status = 'draft'").unwrap();
-        let t = execute(&q, recs().iter()).unwrap();
+        let t = execute(&q, recs().iter(), false).unwrap();
         assert_eq!(
             t.rows,
             vec![vec![Value::Str("draft".into()), Value::Int(1)]]
@@ -1894,7 +2049,7 @@ mod agg_tests {
             "SELECT status, count(*) AS n GROUP BY status HAVING count(*) >= 1 AND NOT (count(*) > 1) ORDER BY status",
         )
         .unwrap();
-        let t = execute(&q, recs().iter()).unwrap();
+        let t = execute(&q, recs().iter(), false).unwrap();
         assert_eq!(
             t.rows,
             vec![vec![Value::Str("draft".into()), Value::Int(1)]]
@@ -1908,7 +2063,7 @@ mod agg_tests {
         // hard non-match.
         let rows = [rec_n("s/a.md", "draft", Value::Str("n/a".into()))];
         let q = parse("SELECT status GROUP BY status HAVING avg(n) > 1").unwrap();
-        let t = execute(&q, rows.iter()).unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
         assert!(t.rows.is_empty());
     }
     #[test]
@@ -1927,7 +2082,7 @@ mod agg_tests {
             "SELECT status, count(*) AS n GROUP BY status HAVING count(*) > 1 ORDER BY status LIMIT 1",
         )
         .unwrap();
-        let t = execute(&q, rows.iter()).unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
         assert_eq!(t.rows, vec![vec![Value::Str("x".into()), Value::Int(2)]]);
     }
 }

@@ -7,6 +7,8 @@
 //! ill-formed or unsupported query is rejected at parse time rather than being
 //! representable in the AST.
 
+use std::collections::BTreeSet;
+
 use crate::model::FileAttr;
 
 /// A fully-parsed query: the projection plus its optional clauses.
@@ -262,6 +264,126 @@ pub enum OrderTarget {
     Agg(Aggregate),
 }
 
+impl Query {
+    /// Every `ColRef::Field` name this query references, across every
+    /// column position: `SELECT` (including a column nested inside a
+    /// `Expr::Scalar`/`Expr::Binary` argument or an aggregate's argument),
+    /// `WHERE`, `GROUP BY`, `ORDER BY` (a bare column or an aggregate
+    /// target — an alias is not a field reference, since it names a
+    /// `SELECT` item rather than a column), `HAVING`, and `MEMBER OF`'s
+    /// column. A `file.*` pseudo-column is never included (its validity is
+    /// checked at parse time, not against the schema), and neither is the
+    /// `*` wildcard, which names no specific field.
+    ///
+    /// Used by [`crate::query::exec::execute`] to validate every referenced
+    /// column exists in the schema before running the query. Also consumed
+    /// by a later projection-push-down optimization, which needs the exact
+    /// same "every column this query could possibly touch" set — keep this
+    /// complete for every clause, not just what column validation exercises.
+    pub fn referenced_fields(&self) -> BTreeSet<String> {
+        let mut fields = BTreeSet::new();
+        for item in &self.select {
+            match &item.expr {
+                SelectExpr::Star => {}
+                SelectExpr::Expr(expr) => collect_expr_fields(expr, &mut fields),
+                SelectExpr::Agg(agg) => collect_aggregate_fields(agg, &mut fields),
+            }
+        }
+        if let Some(pred) = &self.filter {
+            collect_predicate_fields(pred, &mut fields);
+        }
+        for col in &self.group_by {
+            collect_col_field(col, &mut fields);
+        }
+        for key in &self.order_by {
+            match &key.target {
+                OrderTarget::Alias(_) => {}
+                OrderTarget::Col(col) => collect_col_field(col, &mut fields),
+                OrderTarget::Agg(agg) => collect_aggregate_fields(agg, &mut fields),
+            }
+        }
+        if let Some(having) = &self.having {
+            collect_having_fields(having, &mut fields);
+        }
+        fields
+    }
+}
+
+/// Adds `col`'s field name to `fields` when it's a frontmatter field; a
+/// `file.*` pseudo-column contributes nothing (see
+/// [`Query::referenced_fields`]).
+fn collect_col_field(col: &ColRef, fields: &mut BTreeSet<String>) {
+    if let ColRef::Field(name) = col {
+        fields.insert(name.clone());
+    }
+}
+
+/// Walks `expr`'s column positions: a bare column, or every argument of a
+/// nested scalar-function/arithmetic expression.
+fn collect_expr_fields(expr: &Expr, fields: &mut BTreeSet<String>) {
+    match expr {
+        Expr::Col(col) => collect_col_field(col, fields),
+        Expr::Lit(_) => {}
+        Expr::Scalar(_, args) => {
+            for arg in args {
+                collect_expr_fields(arg, fields);
+            }
+        }
+        Expr::Binary(_, l, r) => {
+            collect_expr_fields(l, fields);
+            collect_expr_fields(r, fields);
+        }
+    }
+}
+
+/// Adds the column an aggregate's argument references; `CountStar` takes no
+/// column at all.
+fn collect_aggregate_fields(agg: &Aggregate, fields: &mut BTreeSet<String>) {
+    match agg {
+        Aggregate::CountStar => {}
+        Aggregate::Count(col, _)
+        | Aggregate::Min(col)
+        | Aggregate::Max(col)
+        | Aggregate::Sum(col)
+        | Aggregate::Avg(col)
+        | Aggregate::GroupConcat(col) => collect_col_field(col, fields),
+    }
+}
+
+/// Walks a `WHERE` predicate tree's leaves for column references.
+fn collect_predicate_fields(pred: &Predicate, fields: &mut BTreeSet<String>) {
+    match pred {
+        Predicate::Compare(l, _, r) => {
+            collect_expr_fields(l, fields);
+            collect_expr_fields(r, fields);
+        }
+        Predicate::Like(col, _, _) | Predicate::In(col, _, _) | Predicate::IsNull(col, _) => {
+            collect_col_field(col, fields);
+        }
+        Predicate::MemberOf(_, col, _) => collect_col_field(col, fields),
+        Predicate::And(a, b) | Predicate::Or(a, b) => {
+            collect_predicate_fields(a, fields);
+            collect_predicate_fields(b, fields);
+        }
+        Predicate::Not(inner) => collect_predicate_fields(inner, fields),
+    }
+}
+
+/// Walks a `HAVING` predicate tree's leaves for column/aggregate references.
+fn collect_having_fields(having: &Having, fields: &mut BTreeSet<String>) {
+    match having {
+        Having::Compare(leaf, _, _) => match leaf {
+            HavingLeaf::Group(col) => collect_col_field(col, fields),
+            HavingLeaf::Agg(agg) => collect_aggregate_fields(agg, fields),
+        },
+        Having::And(a, b) | Having::Or(a, b) => {
+            collect_having_fields(a, fields);
+            collect_having_fields(b, fields);
+        }
+        Having::Not(inner) => collect_having_fields(inner, fields),
+    }
+}
+
 impl SelectItem {
     /// The column header this item produces in the result table.
     ///
@@ -381,5 +503,46 @@ fn file_attr_label(attr: FileAttr) -> &'static str {
         FileAttr::Path => "file.path",
         FileAttr::Folder => "file.folder",
         FileAttr::Ext => "file.ext",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::query::parse::parse;
+
+    #[test]
+    fn referenced_fields_covers_all_positions() {
+        let q = parse(
+            "SELECT lower(a), count(b) WHERE c = 'x' GROUP BY a HAVING count(b) > 0 ORDER BY a",
+        )
+        .unwrap();
+        let f = q.referenced_fields();
+        for name in ["a", "b", "c"] {
+            assert!(f.contains(name), "missing {name}");
+        }
+    }
+
+    #[test]
+    fn referenced_fields_excludes_star_and_file_attrs() {
+        let q = parse("SELECT *, file.name, file.folder WHERE file.ext = 'md'").unwrap();
+        assert!(
+            q.referenced_fields().is_empty(),
+            "`*` and `file.*` must never appear in referenced_fields"
+        );
+    }
+
+    #[test]
+    fn referenced_fields_includes_member_of_column() {
+        let q = parse("SELECT file.name WHERE 'x' MEMBER OF(tags)").unwrap();
+        assert_eq!(
+            q.referenced_fields(),
+            std::collections::BTreeSet::from(["tags".to_string()])
+        );
+    }
+
+    #[test]
+    fn referenced_fields_includes_order_by_bare_aggregate_column() {
+        let q = parse("SELECT status GROUP BY status ORDER BY sum(n) DESC").unwrap();
+        assert!(q.referenced_fields().contains("n"));
     }
 }
