@@ -1311,6 +1311,11 @@ mod tests {
     /// Guard for Task 2: `refresh_per_file`'s per-file read+parse runs
     /// across worker threads, but the returned `CachedDir`s' file order and
     /// the report's warnings must match a serial scan exactly.
+    ///
+    /// Note: this test passes even with `map_paths`'s final sort removed,
+    /// since `discover()` already hands back a path-sorted list. The real
+    /// guard for the sort itself is
+    /// `parallel::tests::results_are_sorted_by_path_regardless_of_input_order`.
     #[test]
     fn refresh_per_file_matches_serial_order_and_content() {
         let td = TempDir::new().unwrap();
@@ -1375,6 +1380,11 @@ mod tests {
     /// scan's file order and warnings exactly. An empty `cached` makes every
     /// directory's `dir_mtime` lookup miss, forcing every directory through
     /// that branch.
+    ///
+    /// Note: this test passes even with `map_paths`'s final sort removed,
+    /// since `discover()` already hands back a path-sorted list. The real
+    /// guard for the sort itself is
+    /// `parallel::tests::results_are_sorted_by_path_regardless_of_input_order`.
     #[test]
     fn refresh_fast_matches_serial_order_when_rescanning() {
         let td = TempDir::new().unwrap();
