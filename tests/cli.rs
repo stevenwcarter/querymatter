@@ -1539,3 +1539,47 @@ fn no_lenient_overrides_configured_lenient() {
         .assert()
         .success();
 }
+
+#[test]
+fn exit_code_zero_when_rows_match() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["-e", "SELECT status WHERE prd = '010'", "--exit-code"])
+        .arg(td.path())
+        .assert()
+        .code(0);
+}
+
+#[test]
+fn exit_code_one_when_no_rows() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["-e", "SELECT status WHERE prd = 'nope'", "--exit-code"])
+        .arg(td.path())
+        .assert()
+        .code(1);
+}
+
+#[test]
+fn exit_code_two_on_error() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["-e", "SELECT (", "--exit-code"])
+        .arg(td.path())
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn without_exit_code_zero_rows_still_exits_zero() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["-e", "SELECT status WHERE prd = 'nope'"])
+        .arg(td.path())
+        .assert()
+        .code(0);
+}

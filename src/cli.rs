@@ -151,6 +151,12 @@ pub struct Cli {
     #[arg(long)]
     pub refresh_all: bool,
 
+    /// Exit 0 when the query matched at least one row, 1 when it matched
+    /// none, and 2 on a parse/exec/IO error — grep-style, for scripting.
+    /// Query mode only; `init`/`config`/`completions` are unaffected.
+    #[arg(long)]
+    pub exit_code: bool,
+
     /// Subcommand to run instead of a query; `None` means query mode.
     #[command(subcommand)]
     pub command: Option<Command>,

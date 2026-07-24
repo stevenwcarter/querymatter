@@ -26,6 +26,7 @@ use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 
 use anyhow::Context;
 use clap::{ArgMatches, CommandFactory, FromArgMatches};
@@ -36,9 +37,43 @@ use crate::session::{Session, split_statements};
 use crate::settings::Settings;
 use crate::store::{InMemoryStore, RecordStore};
 
-fn main() -> anyhow::Result<()> {
+/// Parses arguments, dispatches, and maps the outcome to a process exit code.
+///
+/// `--exit-code` only ever changes the code chosen here — never what
+/// [`dispatch`] prints — and only applies to query mode: an `init`/`config`/
+/// `completions` error always exits 1, matching today's behavior, since
+/// `--exit-code`'s grep-style 0/1/2 mapping is a query-result concept those
+/// subcommands have no analog for.
+fn main() -> ExitCode {
     let matches = Cli::command().get_matches();
-    let cli = Cli::from_arg_matches(&matches)?;
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(err) => {
+            eprintln!("querymatter: {err:#}");
+            return ExitCode::from(1);
+        }
+    };
+    let query_mode = cli.command.is_none();
+    match dispatch(&cli, &matches) {
+        Ok(code) => code,
+        Err(err) => {
+            eprintln!("querymatter: {err:#}");
+            if cli.exit_code && query_mode {
+                ExitCode::from(2)
+            } else {
+                ExitCode::from(1)
+            }
+        }
+    }
+}
+
+/// Runs the parsed command and reports its exit code.
+///
+/// A query-mode success already carries the right code (0, or 1 under
+/// `--exit-code` when no row matched); every other success is
+/// [`ExitCode::SUCCESS`]. Any error is left to propagate — `main` prints it
+/// once and picks 1 vs. 2 uniformly, so callers here just use `?`.
+fn dispatch(cli: &Cli, matches: &ArgMatches) -> anyhow::Result<ExitCode> {
     // Completions and `config path` must both work even with a broken config
     // file: completions is how a user installs the completion that helps
     // them type `config set` correctly, and `config path` is the one command
@@ -49,11 +84,14 @@ fn main() -> anyhow::Result<()> {
     match &cli.command {
         Some(Command::Completions(args)) => {
             run_completions(args);
-            return Ok(());
+            return Ok(ExitCode::SUCCESS);
         }
         Some(Command::Config(ConfigArgs {
             action: ConfigAction::Path,
-        })) => return run_config_path(),
+        })) => {
+            run_config_path()?;
+            return Ok(ExitCode::SUCCESS);
+        }
         _ => {}
     }
     let config = config::load()?;
@@ -69,11 +107,15 @@ fn main() -> anyhow::Result<()> {
             let sub_matches = matches
                 .subcommand_matches("init")
                 .expect("Command::Init parsed implies the init subcommand matched");
-            run_init(args, &config, sub_matches)
+            run_init(args, &config, sub_matches)?;
+            Ok(ExitCode::SUCCESS)
         }
-        Some(Command::Config(args)) => run_config(&args.action, &cli, &config, &matches),
+        Some(Command::Config(args)) => {
+            run_config(&args.action, cli, &config, matches)?;
+            Ok(ExitCode::SUCCESS)
+        }
         Some(Command::Completions(_)) => unreachable!("handled above"),
-        None => run_query(&cli, &config, &matches),
+        None => run_query(cli, &config, matches),
     }
 }
 
@@ -247,7 +289,13 @@ fn run_config_path() -> anyhow::Result<()> {
 /// Runs a query: loads the store from an ancestor `.querymatter` cache when one
 /// is found (unless `--no-cache`), or live-scans the resolved roots otherwise,
 /// then dispatches to one-shot, batch, or interactive mode.
-fn run_query(cli: &Cli, config: &Config, matches: &ArgMatches) -> anyhow::Result<()> {
+///
+/// One-shot and batch runs (`-e`, or piped stdin) map to an exit code under
+/// `--exit-code`: [`ExitCode::SUCCESS`] when the statements' row counts sum to
+/// more than zero, [`ExitCode::from(1)`] otherwise. Without the flag, or in
+/// the interactive REPL — which has no single "total rows" to report — a
+/// clean run is always [`ExitCode::SUCCESS`], matching today's behavior.
+fn run_query(cli: &Cli, config: &Config, matches: &ArgMatches) -> anyhow::Result<ExitCode> {
     cli.validate()?;
 
     let settings = Settings::resolve(cli, config, matches);
@@ -313,13 +361,29 @@ fn run_query(cli: &Cli, config: &Config, matches: &ArgMatches) -> anyhow::Result
 
     match cli.query.as_deref() {
         // `-e -`: read the query text from stdin, then run it.
-        Some("-") => run_statements(&session, &read_stdin()?),
+        Some("-") => run_batch(&session, &read_stdin()?, cli.exit_code),
         // `-e <sql>`: run the given query text.
-        Some(sql) => run_statements(&session, sql),
+        Some(sql) => run_batch(&session, sql, cli.exit_code),
         // No `-e`: batch mode when stdin is piped, otherwise the REPL.
-        None if !io::stdin().is_terminal() => run_statements(&session, &read_stdin()?),
-        None => repl::run(session),
+        None if !io::stdin().is_terminal() => run_batch(&session, &read_stdin()?, cli.exit_code),
+        None => {
+            repl::run(session)?;
+            Ok(ExitCode::SUCCESS)
+        }
     }
+}
+
+/// Runs `input` via [`run_statements`] and maps its total row count to an
+/// exit code: 1 only when `exit_code` is set and no statement matched a row,
+/// [`ExitCode::SUCCESS`] otherwise (including every run where the flag is
+/// off, preserving today's always-zero-on-success behavior).
+fn run_batch(session: &Session, input: &str, exit_code: bool) -> anyhow::Result<ExitCode> {
+    let total_rows = run_statements(session, input)?;
+    Ok(if exit_code && total_rows == 0 {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
 /// Canonicalizes each positional `[DIRS]` entry (resolving symlinks and
@@ -338,17 +402,20 @@ fn canonicalize_dirs(dirs: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
 
 /// Runs every top-level statement in `input` — `;`/`\g`-terminated, or
 /// `\G`-terminated for vertical output — printing each rendered result to
-/// stdout (with exactly one trailing newline via `println!`).
+/// stdout (with exactly one trailing newline via `println!`), and returns the
+/// sum of their row counts (for `--exit-code`'s grep-style mapping).
 ///
 /// The first statement that fails aborts the run: its error propagates to
 /// `main`, which reports it on stderr and exits non-zero. Statements that ran
 /// before it have already printed their results.
-fn run_statements(session: &Session, input: &str) -> anyhow::Result<()> {
+fn run_statements(session: &Session, input: &str) -> anyhow::Result<usize> {
+    let mut total_rows = 0;
     for statement in split_statements(input) {
-        let rendered = session.render_statement(&statement)?;
+        let (rendered, rows) = session.render_statement_counted(&statement)?;
         println!("{rendered}");
+        total_rows += rows;
     }
-    Ok(())
+    Ok(total_rows)
 }
 
 /// Reads all of stdin as UTF-8 query text.
