@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use clap::{ArgMatches, CommandFactory, FromArgMatches};
 
-use crate::cli::{Cli, Command, ConfigAction, InitArgs};
+use crate::cli::{Cli, Command, CompletionsArgs, ConfigAction, InitArgs};
 use crate::config::Config;
 use crate::session::{Session, split_statements};
 use crate::settings::Settings;
@@ -38,6 +38,12 @@ use crate::store::{InMemoryStore, RecordStore};
 fn main() -> anyhow::Result<()> {
     let matches = Cli::command().get_matches();
     let cli = Cli::from_arg_matches(&matches)?;
+    // Completions must work even with a broken config file — it is how a user
+    // installs the completion that helps them type `config set` correctly.
+    if let Some(Command::Completions(args)) = &cli.command {
+        run_completions(args);
+        return Ok(());
+    }
     let config = config::load()?;
     match &cli.command {
         Some(Command::Init(args)) => {
@@ -54,8 +60,19 @@ fn main() -> anyhow::Result<()> {
             run_init(args, &config, sub_matches)
         }
         Some(Command::Config(args)) => run_config(&args.action, &cli, &config, &matches),
+        Some(Command::Completions(_)) => unreachable!("handled above"),
         None => run_query(&cli, &config, &matches),
     }
+}
+
+/// Writes a shell completion script for `args.shell` to stdout.
+///
+/// The script is data, so it goes to stdout for redirection into the shell's
+/// completion directory (see the README).
+fn run_completions(args: &CompletionsArgs) {
+    let mut command = Cli::command();
+    let name = command.get_name().to_string();
+    clap_complete::generate(args.shell, &mut command, name, &mut io::stdout());
 }
 
 /// Builds a `.querymatter` cache under the requested directory (or the cwd),

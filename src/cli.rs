@@ -161,6 +161,8 @@ pub enum Command {
     Init(InitArgs),
     /// Show or change the persistent configuration.
     Config(ConfigArgs),
+    /// Print a shell completion script to stdout.
+    Completions(CompletionsArgs),
 }
 
 /// Arguments for `querymatter config <ACTION>`.
@@ -213,6 +215,14 @@ pub struct InitArgs {
     /// Walk flags shared with query mode.
     #[command(flatten)]
     pub walk: WalkFlags,
+}
+
+/// Arguments for `querymatter completions <SHELL>`.
+#[derive(Debug, Args)]
+pub struct CompletionsArgs {
+    /// Shell to generate a completion script for.
+    #[arg(value_enum)]
+    pub shell: clap_complete::Shell,
 }
 
 impl Cli {
@@ -585,5 +595,20 @@ mod tests {
     fn config_key_is_rejected_when_misspelled() {
         assert!(try_parse(&["querymatter", "config", "get", "table-style"]).is_err());
         assert!(try_parse(&["querymatter", "config", "get", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn completions_parses_each_shell() {
+        for shell in ["bash", "zsh", "fish", "elvish", "powershell"] {
+            match parse(&["querymatter", "completions", shell]).command {
+                Some(Command::Completions(_)) => {}
+                other => panic!("expected Completions for {shell}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn completions_rejects_an_unknown_shell() {
+        assert!(try_parse(&["querymatter", "completions", "tcsh"]).is_err());
     }
 }

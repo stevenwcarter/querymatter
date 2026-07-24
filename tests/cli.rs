@@ -1143,3 +1143,47 @@ fn config_path_prints_a_path_on_stdout() {
         .success()
         .stdout(predicates::str::contains("config.toml"));
 }
+
+#[test]
+fn completions_emit_a_script_per_shell() {
+    for shell in ["bash", "zsh", "fish"] {
+        let out = Command::cargo_bin("querymatter")
+            .unwrap()
+            .args(["completions", shell])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let script = String::from_utf8(out).unwrap();
+        assert!(
+            script.contains("querymatter"),
+            "{shell} script must name the binary, got:\n{script}"
+        );
+        assert!(script.len() > 100, "{shell} script looks empty:\n{script}");
+    }
+}
+
+/// The completion script must offer the enum values, which is the whole
+/// reason Format/TableStyle/ConfigKey became ValueEnums.
+#[test]
+fn bash_completions_include_enum_values() {
+    let out = Command::cargo_bin("querymatter")
+        .unwrap()
+        .args(["completions", "bash"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let script = String::from_utf8(out).unwrap();
+    assert!(
+        script.contains("unicode"),
+        "table styles missing:\n{script}"
+    );
+    assert!(script.contains("tsv"), "formats missing:\n{script}");
+    assert!(
+        script.contains("table_style"),
+        "config keys missing:\n{script}"
+    );
+}

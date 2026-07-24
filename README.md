@@ -273,6 +273,27 @@ A malformed config file, an unknown key, or an invalid value is a hard error
 naming the file — a typo must not silently do nothing. The file is read once,
 at startup.
 
+## Shell completions
+
+`querymatter completions <SHELL>` prints a completion script to stdout for
+`bash`, `zsh`, `fish`, `elvish`, or `powershell`. It completes subcommands,
+flags, directories, and the allowed values of `--format`, `--table-style`, and
+the `config` keys.
+
+```sh
+# bash
+querymatter completions bash > ~/.local/share/bash-completion/completions/querymatter
+
+# zsh — anywhere on your $fpath
+querymatter completions zsh > "${fpath[1]}/_querymatter"
+
+# fish
+querymatter completions fish > ~/.config/fish/completions/querymatter.fish
+```
+
+Completions work even when the config file is malformed, so you can always
+tab-complete your way to `querymatter config path`.
+
 ## REPL dot-commands
 
 Inside the REPL, a line starting with `.` (no trailing `;`) is a command
