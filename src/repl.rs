@@ -22,8 +22,9 @@ use rustyline::{Context as RlContext, Editor, Helper, Highlighter, Hinter, Valid
 use crate::config::ConfigKey;
 use crate::model::Value;
 use crate::output::OutputSink;
+use crate::queries;
 use crate::render::{Format, TableStyle};
-use crate::session::{FieldStat, Session, Statement, Terminator};
+use crate::session::{FieldStat, Session, Statement, Terminator, split_statements};
 use crate::store::LoadReport;
 
 /// Prompt shown while waiting for a new statement or dot-command.
@@ -60,6 +61,7 @@ const DOT_COMMAND_NAMES: &[&str] = &[
     ".reload",
     ".refresh",
     ".refresh-all",
+    ".query",
     ".quit",
     ".exit",
 ];
@@ -109,6 +111,12 @@ pub enum DotCommand {
     /// `.refresh-all` — force a re-scan of the whole vault, persisting the
     /// update; an explicit alias for `.refresh` with no path.
     RefreshAll,
+    /// `.query run <name>` / `.query list` — run or list saved queries (see
+    /// [`crate::queries`]). Authoring is CLI-only: `querymatter query save`.
+    Query(QueryCmd),
+    /// `.query <word>` where `<word>` is neither `run` nor `list`, carrying
+    /// the offending word so the error can name it rather than the command.
+    BadQueryAction(String),
     /// `.quit` / `.exit` — leave the REPL.
     Quit,
     /// `.format <name>` where `<name>` is not a known [`Format`], carrying the
@@ -131,6 +139,15 @@ pub enum DotCommand {
     MissingArg(&'static str),
     /// Any other `.`-prefixed line, carried verbatim for the error message.
     Unknown(String),
+}
+
+/// A parsed `.query` action, carried by [`DotCommand::Query`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum QueryCmd {
+    /// `.query run <name>` — run a saved query in-session.
+    Run(String),
+    /// `.query list` — list every saved query's name and SQL.
+    List,
 }
 
 /// Accumulates raw input lines into complete SQL statements, splitting on a
@@ -266,6 +283,17 @@ pub fn parse_dot(line: &str) -> DotCommand {
             },
             None => DotCommand::MissingArg("unset"),
         },
+        "query" => match words.next() {
+            Some(action) if action.eq_ignore_ascii_case("list") => {
+                DotCommand::Query(QueryCmd::List)
+            }
+            Some(action) if action.eq_ignore_ascii_case("run") => match words.next() {
+                Some(name) => DotCommand::Query(QueryCmd::Run(name.to_string())),
+                None => DotCommand::MissingArg("query"),
+            },
+            Some(action) => DotCommand::BadQueryAction(action.to_string()),
+            None => DotCommand::MissingArg("query"),
+        },
         _ => unreachable!("cmd already checked against DOT_COMMAND_NAMES above"),
     }
 }
@@ -293,14 +321,20 @@ fn rest_after_key(rest: &str, skip: usize) -> Option<String> {
 /// History persists under the OS's per-app state (falling back to data)
 /// directory via [`ProjectDirs`]; a missing or unwritable history file is at
 /// most a warning on stderr, never a fatal error — the REPL keeps working
-/// without it. Tab-completion is wired via [`ReplHelper`], whose schema
-/// snapshot is taken here, once, at start-up. Each statement's rendered
-/// result goes to an [`OutputSink`] that starts on stdout and is redirected
-/// by `.output` for the rest of the session; the `-- N rows` line and every
-/// error stay on stderr regardless of where the sink points.
+/// without it. Tab-completion is wired via [`ReplHelper`], whose schema and
+/// saved-query-name snapshots are taken here, once, at start-up — a saved
+/// query added mid-session (e.g. via `querymatter query save` in another
+/// terminal) won't tab-complete until the REPL restarts, matching `schema`'s
+/// existing snapshot-not-live-refresh behavior. A malformed `queries.toml` is
+/// a warning here, not fatal: completion just offers no saved-query names,
+/// same as an empty file would. Each statement's rendered result goes to an
+/// [`OutputSink`] that starts on stdout and is redirected by `.output` for
+/// the rest of the session; the `-- N rows` line and every error stay on
+/// stderr regardless of where the sink points.
 pub fn run(mut session: Session) -> anyhow::Result<()> {
     let helper = ReplHelper {
         schema: session.schema(),
+        query_names: saved_query_names(),
     };
     let mut editor: Editor<ReplHelper, FileHistory> =
         Editor::new().context("failed to initialize the line editor")?;
@@ -341,15 +375,7 @@ pub fn run(mut session: Session) -> anyhow::Result<()> {
 
         match resolved {
             Line::Blank | Line::More => {}
-            Line::Statement(statement) => match session.render_statement_counted(&statement) {
-                Ok((rendered, count)) => {
-                    if let Err(err) = sink.write_block(&rendered) {
-                        eprintln!("querymatter: failed to write results: {err}");
-                    }
-                    eprintln!("{}", row_count_line(count));
-                }
-                Err(err) => eprintln!("querymatter: {err:#}"),
-            },
+            Line::Statement(statement) => run_statement(&session, &statement, &mut sink),
             Line::Dot(cmd, _) => {
                 if dispatch_dot(cmd, &mut session, &mut sink) {
                     break;
@@ -367,6 +393,23 @@ pub fn run(mut session: Session) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Runs one statement against `session`, writing its rendered result to
+/// `sink` and the `-- N rows` line to stderr, or the error to stderr on
+/// failure. Shared by the main loop (a directly typed statement) and
+/// [`dispatch_query`] (each statement inside a `.query run <name>`'s saved
+/// SQL), so both paths format results identically.
+fn run_statement(session: &Session, statement: &Statement, sink: &mut OutputSink) {
+    match session.render_statement_counted(statement) {
+        Ok((rendered, count)) => {
+            if let Err(err) = sink.write_block(&rendered) {
+                eprintln!("querymatter: failed to write results: {err}");
+            }
+            eprintln!("{}", row_count_line(count));
+        }
+        Err(err) => eprintln!("querymatter: {err:#}"),
+    }
 }
 
 /// The `-- N rows` line printed to stderr after a REPL statement's result,
@@ -418,11 +461,15 @@ fn history_entry(line: &Line) -> Option<String> {
 /// and returning `true` when the REPL should exit (`.quit`/`.exit`).
 ///
 /// stdout/stderr policy: reference/inspection output (`.help`, `.schema`,
-/// `.settings`, and `.format`'s/`.style`'s reports of the current
-/// format/style) goes to stdout; the `.reload`/`.refresh`/`.refresh-all`
-/// reports, `.set`/`.unset` confirmations, `.output`'s confirmation, and all
-/// error messages (unknown command, bad format, bad style, bad key, missing
-/// argument) go to stderr, keeping stdout clean for piping.
+/// `.settings`, `.query list`, and `.format`'s/`.style`'s reports of the
+/// current format/style) goes to stdout; the `.reload`/`.refresh`/
+/// `.refresh-all` reports, `.set`/`.unset` confirmations, `.output`'s
+/// confirmation, and all error messages (unknown command, bad format, bad
+/// style, bad key, missing argument, unknown saved-query name) go to stderr,
+/// keeping stdout clean for piping. `.query run <name>`'s query results
+/// follow a typed statement's own policy instead — the rendered result goes
+/// wherever `sink` points, and the `-- N rows` line stays on stderr (see
+/// [`run_statement`]).
 fn dispatch_dot(cmd: DotCommand, session: &mut Session, sink: &mut OutputSink) -> bool {
     match cmd {
         DotCommand::Help => print_help(),
@@ -436,12 +483,16 @@ fn dispatch_dot(cmd: DotCommand, session: &mut Session, sink: &mut OutputSink) -
         DotCommand::Reload => report_reload(session),
         DotCommand::Refresh(path) => report_refresh(session, path.as_deref().map(Path::new)),
         DotCommand::RefreshAll => report_refresh(session, None),
+        DotCommand::Query(query_cmd) => dispatch_query(query_cmd, session, sink),
         DotCommand::Quit => return true,
         DotCommand::BadFormat(name) => {
             eprintln!("querymatter: unknown format '{name}' (try: table, json, csv, tsv, md)");
         }
         DotCommand::BadStyle(name) => {
             eprintln!("querymatter: unknown style '{name}' (try: ascii, unicode, compact, plain)");
+        }
+        DotCommand::BadQueryAction(name) => {
+            eprintln!("querymatter: unknown '.query {name}' (try: .query run <name>, .query list)");
         }
         DotCommand::Settings => println!("{}", session.settings().rows()),
         DotCommand::Set(key, value) => report_set(session.persist_set(key, &value), key),
@@ -458,13 +509,60 @@ fn dispatch_dot(cmd: DotCommand, session: &mut Session, sink: &mut OutputSink) -
         }
         DotCommand::MissingArg(cmd) => match cmd {
             "set" => eprintln!("querymatter: usage: .set <key> <value>"),
-            _ => eprintln!("querymatter: usage: .unset <key>"),
+            "unset" => eprintln!("querymatter: usage: .unset <key>"),
+            "query" => eprintln!("querymatter: usage: .query run <name> | .query list"),
+            _ => unreachable!("every MissingArg cmd name is handled above"),
         },
         DotCommand::Unknown(raw) => {
             eprintln!("querymatter: unknown command {raw:?} (try .help)");
         }
     }
     false
+}
+
+/// Runs a `.query` dot-command: `.query list` prints every saved query's name
+/// and SQL to stdout; `.query run <name>` resolves `name` via [`queries::load`]
+/// and runs its SQL in-session through [`run_statement`] — since a saved
+/// query may itself contain several `;`-separated statements, each is split
+/// out via [`split_statements`] and run (and rendered to `sink`) in order,
+/// exactly like the REPL's own multi-line statement handling. A malformed
+/// `queries.toml` or an unknown name is reported on stderr, not a panic.
+fn dispatch_query(cmd: QueryCmd, session: &Session, sink: &mut OutputSink) {
+    let saved = match queries::load() {
+        Ok(saved) => saved,
+        Err(err) => {
+            eprintln!("querymatter: {err:#}");
+            return;
+        }
+    };
+    match cmd {
+        QueryCmd::List => {
+            for (name, sql) in saved.iter() {
+                println!("{name}\t{sql}");
+            }
+        }
+        QueryCmd::Run(name) => match queries::get(&saved, &name) {
+            Some(sql) => {
+                for statement in split_statements(sql) {
+                    run_statement(session, &statement, sink);
+                }
+            }
+            None => eprintln!("querymatter: no saved query named '{name}'"),
+        },
+    }
+}
+
+/// Every saved query's name, for [`ReplHelper`]'s tab-completion snapshot. A
+/// malformed `queries.toml` is a warning here, not fatal — the REPL still
+/// starts, just with no saved-query names to offer.
+fn saved_query_names() -> Vec<String> {
+    match queries::load() {
+        Ok(saved) => saved.names().map(String::from).collect(),
+        Err(err) => {
+            eprintln!("querymatter: warning: {err:#}");
+            Vec::new()
+        }
+    }
 }
 
 /// Applies a `.output` dot-command to `sink`: `Some(path)` truncates and
@@ -592,6 +690,14 @@ fn help_text() -> String {
     let _ = writeln!(
         text,
         "  .refresh-all       re-scan the whole vault; updates the cache, or in memory with no vault"
+    );
+    let _ = writeln!(
+        text,
+        "  .query run <name>  run a saved query in-session (see 'querymatter query save')"
+    );
+    let _ = writeln!(
+        text,
+        "  .query list        list saved queries (name and SQL)"
     );
     let _ = writeln!(text, "  .quit / .exit      leave the REPL");
     let _ = writeln!(text);
@@ -847,6 +953,23 @@ fn is_set_or_unset_key_position(line: &str, start: usize) -> bool {
     words.next().is_none() && matches!(command.to_ascii_lowercase().as_str(), ".set" | ".unset")
 }
 
+/// True when the word starting at `start` is the `<name>` argument of a
+/// `.query run` dot-command — i.e. exactly two words precede it, `.query`
+/// then `run` (both case-insensitively, matching [`parse_dot`]'s own
+/// case-folding of the command name and action word).
+fn is_query_run_name_position(line: &str, start: usize) -> bool {
+    let mut words = line[..start].split_whitespace();
+    let Some(command) = words.next() else {
+        return false;
+    };
+    let Some(action) = words.next() else {
+        return false;
+    };
+    words.next().is_none()
+        && command.eq_ignore_ascii_case(".query")
+        && action.eq_ignore_ascii_case("run")
+}
+
 /// The entries of `candidates` that start with `prefix`, owned so the result
 /// can outlive whichever borrow produced it.
 fn filter_prefix<'a>(candidates: impl Iterator<Item = &'a str>, prefix: &str) -> Vec<String> {
@@ -870,28 +993,28 @@ fn filter_prefix_ci<'a>(candidates: impl Iterator<Item = &'a str>, prefix: &str)
 }
 
 /// Tab-completion candidates for the REPL's input `line` with the cursor at
-/// byte offset `pos`, given a snapshot of the frontmatter `schema` and the
-/// dot-command names to offer. Pure and independent of rustyline, so it's
-/// directly unit-testable; [`ReplHelper::complete`] is a thin adapter onto
-/// rustyline's `Completer` trait.
+/// byte offset `pos`, given a snapshot of the frontmatter `schema`, the
+/// dot-command names to offer, and the saved-query `names` to offer after
+/// `.query run `. Pure and independent of rustyline, so it's directly
+/// unit-testable; [`ReplHelper::complete`] is a thin adapter onto rustyline's
+/// `Completer` trait.
 ///
 /// Dispatches on the current word (see [`current_word`]) and its context:
 /// the command word of a `.`-prefixed line completes against `dot_names`;
-/// the key word of `.set`/`.unset` completes against [`ConfigKey::ALL`];
+/// the key word of `.set`/`.unset` completes against [`ConfigKey::ALL`]; the
+/// `<name>` argument of `.query run` completes against `query_names`;
 /// anything else — a bare word in SQL position — completes against `schema`
 /// plus [`FILE_COLUMNS`], and never against SQL keywords. This last case is
 /// intentionally approximate (it doesn't parse SQL to know whether a column
 /// name even belongs where the cursor is) but harmless either way: rustyline
 /// only replaces the word when the user actually accepts a candidate, so an
 /// empty or wrong-context result just means nothing is offered.
-///
-/// A future sub-project may add saved-query-name completion; the SQL-word
-/// branch is the natural place to fold that in once saved queries exist.
 fn complete_candidates(
     line: &str,
     pos: usize,
     schema: &[String],
     dot_names: &[&str],
+    query_names: &[String],
 ) -> Vec<String> {
     let (start, word) = current_word(line, pos);
 
@@ -901,6 +1024,9 @@ fn complete_candidates(
     if is_set_or_unset_key_position(line, start) {
         return filter_prefix_ci(ConfigKey::ALL.iter().map(|key| key.as_str()), word);
     }
+    if is_query_run_name_position(line, start) {
+        return filter_prefix(query_names.iter().map(String::as_str), word);
+    }
     filter_prefix(schema.iter().map(String::as_str).chain(FILE_COLUMNS), word)
 }
 
@@ -908,14 +1034,17 @@ fn complete_candidates(
 /// tab-completion, leaving hinting/highlighting/validation as no-ops (their
 /// trait defaults, brought in via `#[derive]`).
 ///
-/// `schema` is a one-time snapshot of [`Session::schema`], taken in [`run`]
-/// when the REPL starts. It does *not* refresh after `.reload`/`.refresh`/
-/// `.refresh-all`, so a frontmatter field discovered mid-session won't
-/// tab-complete until the REPL is restarted — acceptable for v1; revisit if
-/// it's ever a real friction point.
+/// `schema` and `query_names` are one-time snapshots — of [`Session::schema`]
+/// and [`saved_query_names`] respectively — taken in [`run`] when the REPL
+/// starts. Neither refreshes after `.reload`/`.refresh`/`.refresh-all` (for
+/// `schema`) or a saved query added mid-session (for `query_names`), so a
+/// frontmatter field or saved query added after start won't tab-complete
+/// until the REPL is restarted — acceptable for v1; revisit if it's ever a
+/// real friction point.
 #[derive(Helper, Hinter, Highlighter, Validator)]
 struct ReplHelper {
     schema: Vec<String>,
+    query_names: Vec<String>,
 }
 
 impl Completer for ReplHelper {
@@ -928,13 +1057,19 @@ impl Completer for ReplHelper {
         _ctx: &RlContext<'_>,
     ) -> rustyline::Result<(usize, Vec<Pair>)> {
         let (start, _) = current_word(line, pos);
-        let candidates = complete_candidates(line, pos, &self.schema, DOT_COMMAND_NAMES)
-            .into_iter()
-            .map(|text| Pair {
-                display: text.clone(),
-                replacement: text,
-            })
-            .collect();
+        let candidates = complete_candidates(
+            line,
+            pos,
+            &self.schema,
+            DOT_COMMAND_NAMES,
+            &self.query_names,
+        )
+        .into_iter()
+        .map(|text| Pair {
+            display: text.clone(),
+            replacement: text,
+        })
+        .collect();
         Ok((start, candidates))
     }
 }
@@ -1076,6 +1211,37 @@ mod tests {
             DotCommand::Refresh(Some("plans".to_string()))
         );
         assert!(matches!(parse_dot(".refresh-all"), DotCommand::RefreshAll));
+    }
+
+    #[test]
+    fn query_run_and_list_parse() {
+        assert_eq!(
+            parse_dot(".query run stale"),
+            DotCommand::Query(QueryCmd::Run("stale".to_string()))
+        );
+        assert_eq!(parse_dot(".query list"), DotCommand::Query(QueryCmd::List));
+        // Case-insensitive on the action word, matching every other dot-command.
+        assert_eq!(
+            parse_dot(".query RUN stale"),
+            DotCommand::Query(QueryCmd::Run("stale".to_string()))
+        );
+    }
+
+    /// An unrecognized `.query` action word is `BadQueryAction` (reported as
+    /// an unknown *action*), not an unknown command — mirroring
+    /// `.format`/`.style`'s `BadFormat`/`BadStyle`.
+    #[test]
+    fn query_bad_action_is_bad_query_action_not_unknown_command() {
+        match parse_dot(".query bogus") {
+            DotCommand::BadQueryAction(name) => assert_eq!(name, "bogus"),
+            other => panic!("expected BadQueryAction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn query_missing_arguments_are_reported_as_missing() {
+        assert_eq!(parse_dot(".query"), DotCommand::MissingArg("query"));
+        assert_eq!(parse_dot(".query run"), DotCommand::MissingArg("query"));
     }
 
     #[test]
@@ -1270,13 +1436,13 @@ mod tests {
     fn completion_candidates_by_position() {
         let schema = vec!["status".to_string(), "prd".to_string()];
         // dot-command completion after '.'
-        let c = complete_candidates(".sc", 3, &schema, DOT_COMMAND_NAMES);
+        let c = complete_candidates(".sc", 3, &schema, DOT_COMMAND_NAMES, &[]);
         assert!(c.iter().any(|x| x == ".schema"));
         // config-key completion after '.set '
-        let c = complete_candidates(".set for", 8, &schema, DOT_COMMAND_NAMES);
+        let c = complete_candidates(".set for", 8, &schema, DOT_COMMAND_NAMES, &[]);
         assert!(c.iter().any(|x| x == "format"));
         // column completion for a bare word in SQL position
-        let c = complete_candidates("SELECT sta", 10, &schema, DOT_COMMAND_NAMES);
+        let c = complete_candidates("SELECT sta", 10, &schema, DOT_COMMAND_NAMES, &[]);
         assert!(c.iter().any(|x| x == "status"));
     }
 
@@ -1289,7 +1455,7 @@ mod tests {
     #[test]
     fn sql_position_completion_never_offers_a_sql_keyword() {
         let schema = vec!["status".to_string(), "prd".to_string()];
-        let c = complete_candidates("SELECT sel", 10, &schema, DOT_COMMAND_NAMES);
+        let c = complete_candidates("SELECT sel", 10, &schema, DOT_COMMAND_NAMES, &[]);
         assert!(
             !c.iter().any(|x| x.eq_ignore_ascii_case("select")),
             "completion must never draw from a SQL-keyword list: {c:?}"
@@ -1329,7 +1495,7 @@ mod tests {
     #[test]
     fn dot_command_completion_is_case_insensitive() {
         let schema = vec!["status".to_string()];
-        let c = complete_candidates(".SC", 3, &schema, DOT_COMMAND_NAMES);
+        let c = complete_candidates(".SC", 3, &schema, DOT_COMMAND_NAMES, &[]);
         assert!(c.iter().any(|x| x == ".schema"), "{c:?}");
     }
 
@@ -1337,10 +1503,10 @@ mod tests {
     fn completion_offers_file_columns_and_unset_keys_too() {
         let schema = vec!["status".to_string()];
         // file.* pseudo-columns complete alongside schema fields.
-        let c = complete_candidates("SELECT file.n", 13, &schema, DOT_COMMAND_NAMES);
+        let c = complete_candidates("SELECT file.n", 13, &schema, DOT_COMMAND_NAMES, &[]);
         assert!(c.iter().any(|x| x == "file.name"));
         // .unset gets the same key completion as .set.
-        let c = complete_candidates(".unset hi", 9, &schema, DOT_COMMAND_NAMES);
+        let c = complete_candidates(".unset hi", 9, &schema, DOT_COMMAND_NAMES, &[]);
         assert!(c.iter().any(|x| x == "hidden"));
     }
 
@@ -1353,7 +1519,7 @@ mod tests {
     fn completion_does_not_offer_keys_for_the_value_word() {
         let schema = vec!["status".to_string()];
         let line = ".set table_style fo";
-        let c = complete_candidates(line, line.len(), &schema, DOT_COMMAND_NAMES);
+        let c = complete_candidates(line, line.len(), &schema, DOT_COMMAND_NAMES, &[]);
         assert!(!c.iter().any(|x| x == "format"));
     }
 
@@ -1364,12 +1530,52 @@ mod tests {
     fn completion_dot_prefix_only_matters_as_the_first_word() {
         let schema = vec!["status".to_string()];
         let line = "SELECT .sc";
-        let c = complete_candidates(line, line.len(), &schema, DOT_COMMAND_NAMES);
+        let c = complete_candidates(line, line.len(), &schema, DOT_COMMAND_NAMES, &[]);
         assert!(
             !c.iter().any(|x| x == ".schema"),
             "a `.`-looking word that isn't the first word must not complete as a \
              dot-command: {c:?}"
         );
+    }
+
+    /// `.query run <name>` completes saved-query names — the deferred
+    /// completion the SQL-word branch's old doc comment pointed at, now
+    /// realized as its own dedicated context (not folded into the SQL-word
+    /// branch, since a saved-query name and a schema field are different
+    /// vocabularies).
+    #[test]
+    fn query_run_completes_saved_query_names() {
+        let schema = vec!["status".to_string()];
+        let query_names = vec!["stale-plans".to_string(), "synced".to_string()];
+        let c = complete_candidates(
+            ".query run st",
+            13,
+            &schema,
+            DOT_COMMAND_NAMES,
+            &query_names,
+        );
+        assert!(c.iter().any(|x| x == "stale-plans"), "{c:?}");
+        assert!(!c.iter().any(|x| x == "synced"), "{c:?}");
+        // Case-insensitive on the "run" action word, matching parse_dot.
+        let c = complete_candidates(
+            ".query RUN st",
+            13,
+            &schema,
+            DOT_COMMAND_NAMES,
+            &query_names,
+        );
+        assert!(c.iter().any(|x| x == "stale-plans"), "{c:?}");
+    }
+
+    /// `.query list` (not `run`) and a bare `.query ` must NOT trigger
+    /// saved-query-name completion — only the `<name>` slot of `.query run`
+    /// does.
+    #[test]
+    fn query_list_does_not_complete_saved_query_names() {
+        let schema = vec!["status".to_string()];
+        let query_names = vec!["stale-plans".to_string()];
+        let c = complete_candidates(".query list", 11, &schema, DOT_COMMAND_NAMES, &query_names);
+        assert!(!c.iter().any(|x| x == "stale-plans"), "{c:?}");
     }
 
     /// A non-char-boundary or out-of-range `pos` must never panic — only
@@ -1387,6 +1593,7 @@ mod tests {
     fn repl_helper_complete_delegates_to_complete_candidates() {
         let helper = ReplHelper {
             schema: vec!["status".to_string()],
+            query_names: Vec::new(),
         };
         let history = FileHistory::new();
         let ctx = RlContext::new(&history);

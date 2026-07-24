@@ -1669,3 +1669,251 @@ fn output_flag_errors_cleanly_on_an_unwritable_path() {
         .failure()
         .stderr(predicates::str::contains("querymatter:"));
 }
+
+// --- `querymatter query` (saved named queries) ---
+
+#[test]
+fn query_save_then_get_and_list() {
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["query", "save", "stale", "SELECT status WHERE prd = '010'"])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("stale"));
+
+    qm(home.path())
+        .args(["query", "get", "stale"])
+        .assert()
+        .success()
+        .stdout("SELECT status WHERE prd = '010'\n");
+
+    qm(home.path())
+        .args(["query", "list"])
+        .assert()
+        .success()
+        .stdout("stale\tSELECT status WHERE prd = '010'\n");
+}
+
+/// `query list` with nothing saved prints nothing on stdout — it must not
+/// error just because `queries.toml` has never been written.
+#[test]
+fn query_list_is_empty_when_nothing_is_saved() {
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["query", "list"])
+        .assert()
+        .success()
+        .stdout(predicates::str::is_empty());
+}
+
+/// A query that fails to parse is rejected up front, naming the parse
+/// error — it must never be possible to save a query that only breaks later
+/// at `query run`.
+#[test]
+fn query_save_rejects_a_query_that_fails_to_parse() {
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["query", "save", "broken", "SELECT ("])
+        .assert()
+        .failure();
+
+    // A rejected save must not persist anything.
+    qm(home.path())
+        .args(["query", "list"])
+        .assert()
+        .success()
+        .stdout(predicates::str::is_empty());
+}
+
+#[test]
+fn query_save_rejects_a_bad_name() {
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["query", "save", "has space", "SELECT status"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("has space"));
+}
+
+/// A name collision on `save` overwrites — last-write-wins, like `config set`.
+#[test]
+fn query_save_overwrites_an_existing_name() {
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["query", "save", "stale", "SELECT status"])
+        .assert()
+        .success();
+    qm(home.path())
+        .args(["query", "save", "stale", "SELECT status WHERE prd = '010'"])
+        .assert()
+        .success();
+    qm(home.path())
+        .args(["query", "get", "stale"])
+        .assert()
+        .success()
+        .stdout("SELECT status WHERE prd = '010'\n");
+}
+
+#[test]
+fn query_get_unknown_name_errors() {
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["query", "get", "nope"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("nope"));
+}
+
+#[test]
+fn query_delete_removes_a_saved_query() {
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["query", "save", "stale", "SELECT status"])
+        .assert()
+        .success();
+    qm(home.path())
+        .args(["query", "delete", "stale"])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("stale"));
+    qm(home.path())
+        .args(["query", "get", "stale"])
+        .assert()
+        .failure();
+}
+
+/// Deleting a name that was never saved (with no `queries.toml` at all) is
+/// reported on stderr, not an error — mirrors `config unset` on an absent key.
+#[test]
+fn query_delete_on_absent_name_is_not_an_error() {
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["query", "delete", "nope"])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("no saved query named 'nope'"));
+}
+
+/// `query run <name>` must produce byte-identical output to `-e` given the
+/// same resolved SQL — it is fed through the SAME store-building/rendering
+/// path, not a parallel implementation.
+#[test]
+fn query_run_matches_dash_e_byte_for_byte() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    let sql = "SELECT status, count(*) AS Count GROUP BY status ORDER BY Count DESC";
+
+    qm(home.path())
+        .args(["query", "save", "counts", sql])
+        .assert()
+        .success();
+
+    let via_dash_e = qm(home.path())
+        .current_dir(td.path())
+        .args(["-e", sql])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let via_query_run = qm(home.path())
+        .current_dir(td.path())
+        .args(["query", "run", "counts"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert_eq!(via_dash_e, via_query_run);
+}
+
+/// `query run` honors `--format`/`--output`, exactly like `-e` — proof it
+/// shares `run_query`'s machinery rather than a parallel path that could
+/// silently ignore them.
+#[test]
+fn query_run_honors_format_and_output_flags() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .current_dir(td.path())
+        .args(["query", "save", "drafts", "SELECT status WHERE prd = '010'"])
+        .assert()
+        .success();
+
+    let out = td.path().join("res.csv");
+    qm(home.path())
+        .current_dir(td.path())
+        .args([
+            "--format",
+            "csv",
+            "--output",
+            out.to_str().unwrap(),
+            "query",
+            "run",
+            "drafts",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::is_empty());
+    let body = fs::read_to_string(&out).unwrap();
+    assert!(body.contains("status"), "got: {body:?}");
+}
+
+/// `query run` participates in `--exit-code`'s grep-style mapping exactly
+/// like `-e` does: 0 when rows matched, 1 when none did.
+#[test]
+fn query_run_honors_exit_code_flag() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .current_dir(td.path())
+        .args(["query", "save", "drafts", "SELECT status WHERE prd = '010'"])
+        .assert()
+        .success();
+    qm(home.path())
+        .current_dir(td.path())
+        .args(["--exit-code", "query", "run", "drafts"])
+        .assert()
+        .code(0);
+
+    qm(home.path())
+        .current_dir(td.path())
+        .args(["query", "save", "none", "SELECT status WHERE prd = 'nope'"])
+        .assert()
+        .success();
+    qm(home.path())
+        .current_dir(td.path())
+        .args(["--exit-code", "query", "run", "none"])
+        .assert()
+        .code(1);
+}
+
+#[test]
+fn query_run_unknown_name_errors() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .current_dir(td.path())
+        .args(["query", "run", "nope"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("nope"));
+}
+
+/// A broken `queries.toml` blocks every `query` action, so its message must
+/// name the file — mirrors `malformed_config_exits_non_zero_naming_the_path`.
+#[test]
+fn malformed_queries_file_exits_non_zero_naming_the_path() {
+    let home = TempDir::new().unwrap();
+    let dir = home.path().join("querymatter");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("queries.toml"), "= = broken\n").unwrap();
+
+    qm(home.path())
+        .args(["query", "list"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("queries.toml"));
+}

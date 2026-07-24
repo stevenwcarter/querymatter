@@ -160,7 +160,8 @@ pub struct Cli {
 
     /// Exit 0 when the query matched at least one row, 1 when it matched
     /// none, and 2 on a parse/exec/IO error — grep-style, for scripting.
-    /// Query mode only; `init`/`config`/`completions` are unaffected.
+    /// Query mode and `query run` only; `init`/`config`/`query save`/`query
+    /// list`/`query get`/`query delete`/`completions` are unaffected.
     #[arg(long)]
     pub exit_code: bool,
 
@@ -177,6 +178,8 @@ pub enum Command {
     Init(InitArgs),
     /// Show or change the persistent configuration.
     Config(ConfigArgs),
+    /// Save, list, inspect, run, or delete a saved named query.
+    Query(QueryArgs),
     /// Print a shell completion script to stdout.
     Completions(CompletionsArgs),
 }
@@ -216,6 +219,51 @@ pub enum ConfigAction {
     },
     /// Print the config file's path, whether or not it exists.
     Path,
+}
+
+/// Arguments for `querymatter query <ACTION>`.
+#[derive(Debug, Args)]
+pub struct QueryArgs {
+    /// What to do with saved queries.
+    #[command(subcommand)]
+    pub action: QueryAction,
+}
+
+/// The `querymatter query` actions.
+///
+/// Saved queries are static SQL text with no parameters (YAGNI): `save`
+/// stores it under a name, `run` resolves the name back to SQL and executes
+/// it exactly like `-e` would — honoring the same `--format`/`--table-style`/
+/// `--output`/`--exit-code`/walk flags — via [`Command::Query`]'s dispatch in
+/// `main`. `save`/`list`/`get`/`delete` never build a record store; they only
+/// read and write the `queries.toml` file (see [`crate::queries`]).
+#[derive(Debug, Subcommand)]
+pub enum QueryAction {
+    /// Save SQL under NAME, overwriting any existing query already saved
+    /// under that name.
+    Save {
+        /// The name to save under: letters, digits, `_`, and `-` only.
+        name: String,
+        /// The SQL to save; rejected up front if it fails to parse.
+        sql: String,
+    },
+    /// List every saved query's name and SQL.
+    List,
+    /// Print one saved query's SQL.
+    Get {
+        /// The saved query's name.
+        name: String,
+    },
+    /// Run a saved query, honoring the same output flags as `-e`.
+    Run {
+        /// The saved query's name.
+        name: String,
+    },
+    /// Remove a saved query.
+    Delete {
+        /// The saved query's name.
+        name: String,
+    },
 }
 
 /// Arguments for `querymatter init [DIR]`.
@@ -318,7 +366,7 @@ impl Cli {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, ConfigAction};
+    use super::{Cli, Command, ConfigAction, QueryAction};
     use crate::cache::Freshness;
     use crate::config::ConfigKey;
     use crate::render::{Format, TableStyle};
@@ -611,6 +659,49 @@ mod tests {
     fn config_key_is_rejected_when_misspelled() {
         assert!(try_parse(&["querymatter", "config", "get", "table-style"]).is_err());
         assert!(try_parse(&["querymatter", "config", "get", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn query_save_parses_name_and_sql() {
+        match parse(&["querymatter", "query", "save", "stale", "SELECT status"]).command {
+            Some(Command::Query(args)) => match args.action {
+                QueryAction::Save { name, sql } => {
+                    assert_eq!(name, "stale");
+                    assert_eq!(sql, "SELECT status");
+                }
+                other => panic!("expected Save, got {other:?}"),
+            },
+            other => panic!("expected a Query subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn query_list_get_run_delete_parse() {
+        assert!(matches!(
+            parse(&["querymatter", "query", "list"]).command,
+            Some(Command::Query(_))
+        ));
+        match parse(&["querymatter", "query", "get", "stale"]).command {
+            Some(Command::Query(args)) => match args.action {
+                QueryAction::Get { name } => assert_eq!(name, "stale"),
+                other => panic!("expected Get, got {other:?}"),
+            },
+            other => panic!("expected a Query subcommand, got {other:?}"),
+        }
+        match parse(&["querymatter", "query", "run", "stale"]).command {
+            Some(Command::Query(args)) => match args.action {
+                QueryAction::Run { name } => assert_eq!(name, "stale"),
+                other => panic!("expected Run, got {other:?}"),
+            },
+            other => panic!("expected a Query subcommand, got {other:?}"),
+        }
+        match parse(&["querymatter", "query", "delete", "stale"]).command {
+            Some(Command::Query(args)) => match args.action {
+                QueryAction::Delete { name } => assert_eq!(name, "stale"),
+                other => panic!("expected Delete, got {other:?}"),
+            },
+            other => panic!("expected a Query subcommand, got {other:?}"),
+        }
     }
 
     #[test]

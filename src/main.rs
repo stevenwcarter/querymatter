@@ -16,6 +16,7 @@ pub mod frontmatter;
 mod gitignore;
 pub mod model;
 mod output;
+mod queries;
 pub mod query;
 pub mod render;
 mod repl;
@@ -32,7 +33,9 @@ use std::process::ExitCode;
 use anyhow::Context;
 use clap::{ArgMatches, CommandFactory, FromArgMatches};
 
-use crate::cli::{Cli, Command, CompletionsArgs, ConfigAction, ConfigArgs, InitArgs};
+use crate::cli::{
+    Cli, Command, CompletionsArgs, ConfigAction, ConfigArgs, InitArgs, QueryAction, QueryArgs,
+};
 use crate::config::Config;
 use crate::output::OutputSink;
 use crate::session::{Session, split_statements};
@@ -42,10 +45,13 @@ use crate::store::{InMemoryStore, RecordStore};
 /// Parses arguments, dispatches, and maps the outcome to a process exit code.
 ///
 /// `--exit-code` only ever changes the code chosen here — never what
-/// [`dispatch`] prints — and only applies to query mode: an `init`/`config`/
-/// `completions` error always exits 1, matching today's behavior, since
-/// `--exit-code`'s grep-style 0/1/2 mapping is a query-result concept those
-/// subcommands have no analog for.
+/// [`dispatch`] prints — and only applies to query mode and `query run`
+/// ([`is_query_like`]): an `init`/`config`/`query save`/`query list`/`query
+/// get`/`query delete`/`completions` error always exits 1, matching today's
+/// behavior, since `--exit-code`'s grep-style 0/1/2 mapping is a query-result
+/// concept those subcommands have no analog for — `query run` is the one
+/// subcommand that genuinely is a query (it resolves a saved name to SQL and
+/// runs it the same way `-e` does), so it participates like query mode does.
 fn main() -> ExitCode {
     let matches = Cli::command().get_matches();
     let cli = match Cli::from_arg_matches(&matches) {
@@ -55,7 +61,7 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let query_mode = cli.command.is_none();
+    let query_mode = is_query_like(&cli.command);
     match dispatch(&cli, &matches) {
         Ok(code) => code,
         Err(err) => {
@@ -67,6 +73,20 @@ fn main() -> ExitCode {
             }
         }
     }
+}
+
+/// Whether `command` is a query-result concept `--exit-code`'s grep-style
+/// 0/1/2 error mapping applies to: no subcommand (ordinary query mode) or
+/// `query run` (which resolves a saved name to SQL and runs it exactly like
+/// `-e` would, via [`run_query_cmd`]). Every other subcommand keeps today's
+/// plain "error exits 1" behavior.
+fn is_query_like(command: &Option<Command>) -> bool {
+    matches!(
+        command,
+        None | Some(Command::Query(QueryArgs {
+            action: QueryAction::Run { .. },
+        }))
+    )
 }
 
 /// Runs the parsed command and reports its exit code.
@@ -116,6 +136,7 @@ fn dispatch(cli: &Cli, matches: &ArgMatches) -> anyhow::Result<ExitCode> {
             run_config(&args.action, cli, &config, matches)?;
             Ok(ExitCode::SUCCESS)
         }
+        Some(Command::Query(args)) => run_query_cmd(&args.action, cli, &config, matches),
         Some(Command::Completions(_)) => unreachable!("handled above"),
         None => run_query(cli, &config, matches),
     }
@@ -288,6 +309,77 @@ fn run_config_path() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Runs a `querymatter query` action.
+///
+/// `Save`/`List`/`Get`/`Delete` operate only on the `queries.toml` file (see
+/// [`queries`]) and never build a record store — matching `config`'s
+/// stdout/stderr split, data goes to stdout, confirmations and errors to
+/// stderr. `Run` resolves the saved SQL and executes it through the SAME
+/// [`build_session`]/[`run_batch`] machinery `-e` uses (fed the resolved SQL
+/// as the query text), so it honors `--format`/`--table-style`/`--output`/
+/// `--exit-code` and the walk flags exactly like a one-shot query would,
+/// rather than a parallel, easily-drifting implementation.
+fn run_query_cmd(
+    action: &QueryAction,
+    cli: &Cli,
+    config: &Config,
+    matches: &ArgMatches,
+) -> anyhow::Result<ExitCode> {
+    match action {
+        QueryAction::Save { name, sql } => {
+            // Rejected up front, naming the parse error, so a saved query can
+            // never be a broken one that only fails later at `query run`.
+            query::parse(sql).with_context(|| format!("failed to parse query: {sql}"))?;
+            let mut saved = queries::load()?;
+            queries::set(&mut saved, name, sql)?;
+            let path = queries::save(&saved)?;
+            eprintln!("querymatter: saved query '{name}' in {}", path.display());
+            Ok(ExitCode::SUCCESS)
+        }
+        QueryAction::List => {
+            let saved = queries::load()?;
+            for (name, sql) in saved.iter() {
+                println!("{name}\t{sql}");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        QueryAction::Get { name } => {
+            let saved = queries::load()?;
+            let sql = queries::get(&saved, name)
+                .with_context(|| format!("no saved query named '{name}'"))?;
+            println!("{sql}");
+            Ok(ExitCode::SUCCESS)
+        }
+        QueryAction::Delete { name } => {
+            let mut saved = queries::load()?;
+            // Absent is reported, not an error, matching `config unset`'s
+            // no-op-on-absent-key behavior.
+            if queries::remove(&mut saved, name) {
+                let path = queries::save(&saved)?;
+                eprintln!(
+                    "querymatter: deleted query '{name}' from {}",
+                    path.display()
+                );
+            } else {
+                let path = queries::queries_path()
+                    .context("cannot determine a config directory for this user")?;
+                eprintln!(
+                    "querymatter: no saved query named '{name}' in {}",
+                    path.display()
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        QueryAction::Run { name } => {
+            let saved = queries::load()?;
+            let sql = queries::get(&saved, name)
+                .with_context(|| format!("no saved query named '{name}'"))?;
+            let session = build_session(cli, config, matches)?;
+            run_batch(&session, sql, cli.exit_code, cli.output.as_deref())
+        }
+    }
+}
+
 /// Runs a query: loads the store from an ancestor `.querymatter` cache when one
 /// is found (unless `--no-cache`), or live-scans the resolved roots otherwise,
 /// then dispatches to one-shot, batch, or interactive mode.
@@ -298,6 +390,34 @@ fn run_config_path() -> anyhow::Result<()> {
 /// the interactive REPL — which has no single "total rows" to report — a
 /// clean run is always [`ExitCode::SUCCESS`], matching today's behavior.
 fn run_query(cli: &Cli, config: &Config, matches: &ArgMatches) -> anyhow::Result<ExitCode> {
+    let session = build_session(cli, config, matches)?;
+
+    let output = cli.output.as_deref();
+    match cli.query.as_deref() {
+        // `-e -`: read the query text from stdin, then run it.
+        Some("-") => run_batch(&session, &read_stdin()?, cli.exit_code, output),
+        // `-e <sql>`: run the given query text.
+        Some(sql) => run_batch(&session, sql, cli.exit_code, output),
+        // No `-e`: batch mode when stdin is piped, otherwise the REPL.
+        None if !io::stdin().is_terminal() => {
+            run_batch(&session, &read_stdin()?, cli.exit_code, output)
+        }
+        None => {
+            repl::run(session)?;
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+/// Builds the queryable [`Session`] shared by [`run_query`] (`-e`/stdin/the
+/// REPL) and [`run_query_cmd`]'s `Run` action (a saved query): resolves
+/// settings, validates the resolved exclude globs, loads the record store
+/// from an ancestor `.querymatter` cache when one is found (unless
+/// `--no-cache`) or live-scans the resolved roots otherwise, and applies any
+/// `--refresh`/`--refresh-all`/positional-`[DIRS]` vault narrowing. Pulled out
+/// so `query run` reuses exactly this — not a second, easily-drifting
+/// implementation of the same cache/walk/vault logic.
+fn build_session(cli: &Cli, config: &Config, matches: &ArgMatches) -> anyhow::Result<Session> {
     cli.validate()?;
 
     let settings = Settings::resolve(cli, config, matches);
@@ -359,23 +479,12 @@ fn run_query(cli: &Cli, config: &Config, matches: &ArgMatches) -> anyhow::Result
         eprintln!("querymatter: {warning}");
     }
     let fallback = Settings::resolve(cli, &Config::default(), matches);
-    let session = Session::new(Box::new(store), settings, fallback, session_vault);
-
-    let output = cli.output.as_deref();
-    match cli.query.as_deref() {
-        // `-e -`: read the query text from stdin, then run it.
-        Some("-") => run_batch(&session, &read_stdin()?, cli.exit_code, output),
-        // `-e <sql>`: run the given query text.
-        Some(sql) => run_batch(&session, sql, cli.exit_code, output),
-        // No `-e`: batch mode when stdin is piped, otherwise the REPL.
-        None if !io::stdin().is_terminal() => {
-            run_batch(&session, &read_stdin()?, cli.exit_code, output)
-        }
-        None => {
-            repl::run(session)?;
-            Ok(ExitCode::SUCCESS)
-        }
-    }
+    Ok(Session::new(
+        Box::new(store),
+        settings,
+        fallback,
+        session_vault,
+    ))
 }
 
 /// Runs `input` via [`run_statements`] and maps its total row count to an
