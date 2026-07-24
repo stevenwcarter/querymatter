@@ -3,8 +3,9 @@
 //! from an ancestor cache when one is found, or live-scanning otherwise — and
 //! dispatch to one-shot, batch, or interactive mode.
 //!
-//! Output discipline: **stdout carries query results only.** Every
-//! diagnostic, warning, and prompt goes to stderr, so a pipeline like
+//! Output discipline: **stdout carries data** — query results, `config
+//! list`/`get`/`path` output, and completion scripts. Every diagnostic,
+//! warning, confirmation, and prompt goes to stderr, so a pipeline like
 //! `querymatter -e '…' --format json | jq` sees pure JSON.
 
 pub mod cache;
@@ -188,17 +189,21 @@ fn run_config(
             );
         }
         ConfigAction::Unset { key } => {
-            let mut updated = config.clone();
-            let was_present = config::get(config, *key).is_some();
-            config::unset(&mut updated, *key);
-            let path = config::save(&updated)?;
-            if was_present {
+            // A key that is already absent is a no-op: writing the file (and
+            // creating its parent directory) for nothing would surprise a
+            // user who has never run `config set` at all.
+            if config::get(config, *key).is_some() {
+                let mut updated = config.clone();
+                config::unset(&mut updated, *key);
+                let path = config::save(&updated)?;
                 eprintln!(
                     "querymatter: removed {} from {}",
                     key.as_str(),
                     path.display()
                 );
             } else {
+                let path = config::config_path()
+                    .context("cannot determine a config directory for this user")?;
                 eprintln!(
                     "querymatter: {} was not set in {}",
                     key.as_str(),

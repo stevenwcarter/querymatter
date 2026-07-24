@@ -22,7 +22,7 @@ use crate::cache::Freshness;
 use crate::config::ConfigKey;
 use crate::render::{Format, TableStyle};
 
-/// The six flags that shape a directory walk, shared verbatim between query
+/// Every flag that shapes a directory walk, shared verbatim between query
 /// mode and `querymatter init` via `#[command(flatten)]`.
 ///
 /// Grouping them here keeps [`validate_excludes`](WalkFlags::validate_excludes)

@@ -320,8 +320,8 @@ fn dispatch_dot(cmd: DotCommand, session: &mut Session) -> bool {
             eprintln!("querymatter: unknown style '{name}' (try: ascii, unicode, compact, plain)");
         }
         DotCommand::Settings => println!("{}", session.settings().rows()),
-        DotCommand::Set(key, value) => report_persist(session.persist_set(key, &value), key, false),
-        DotCommand::Unset(key) => report_persist(session.persist_unset(key), key, true),
+        DotCommand::Set(key, value) => report_set(session.persist_set(key, &value), key),
+        DotCommand::Unset(key) => report_unset(session.persist_unset(key), key),
         DotCommand::BadKey(name) => {
             eprintln!(
                 "querymatter: unknown setting '{name}' (try: {})",
@@ -343,20 +343,49 @@ fn dispatch_dot(cmd: DotCommand, session: &mut Session) -> bool {
     false
 }
 
-/// Reports the outcome of a `.set`/`.unset` on stderr: the file written, and
-/// a note when the change only takes effect on the next run.
-fn report_persist(outcome: anyhow::Result<(PathBuf, bool)>, key: ConfigKey, removed: bool) {
+/// Reports the outcome of a `.set` on stderr: the file written, and a note
+/// when the change only takes effect on the next run.
+fn report_set(outcome: anyhow::Result<(PathBuf, bool)>, key: ConfigKey) {
     match outcome {
         Ok((path, immediate)) => {
-            let verb = if removed { "removed" } else { "saved" };
-            eprintln!("querymatter: {verb} {} in {}", key.as_str(), path.display());
-            if !immediate {
-                eprintln!(
-                    "querymatter: takes effect on the next run (the store is already loaded)"
-                );
-            }
+            eprintln!("querymatter: saved {} in {}", key.as_str(), path.display());
+            report_deferred(immediate);
         }
         Err(err) => eprintln!("querymatter: {err:#}"),
+    }
+}
+
+/// Reports the outcome of a `.unset` on stderr: "removed" (plus the file
+/// written, and a note when the change only takes effect on the next run)
+/// when the key had actually been set, or an accurate "was not set" —
+/// matching `querymatter config unset`'s wording — when it was already
+/// absent, since that case never wrote anything.
+fn report_unset(outcome: anyhow::Result<(PathBuf, bool, bool)>, key: ConfigKey) {
+    match outcome {
+        Ok((path, true, immediate)) => {
+            eprintln!(
+                "querymatter: removed {} from {}",
+                key.as_str(),
+                path.display()
+            );
+            report_deferred(immediate);
+        }
+        Ok((path, false, _)) => {
+            eprintln!(
+                "querymatter: {} was not set in {}",
+                key.as_str(),
+                path.display()
+            );
+        }
+        Err(err) => eprintln!("querymatter: {err:#}"),
+    }
+}
+
+/// Prints the "takes effect on the next run" note when a change was deferred
+/// (a scan setting: the store is already loaded from before the change).
+fn report_deferred(immediate: bool) {
+    if !immediate {
+        eprintln!("querymatter: takes effect on the next run (the store is already loaded)");
     }
 }
 

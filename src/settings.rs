@@ -184,7 +184,11 @@ impl Settings {
             .join("\n")
     }
 
-    /// One setting's value, spelled the way `config set` accepts it.
+    /// One setting's displayed value: spelled the way `config set` accepts
+    /// it, EXCEPT an empty `ext`/`exclude` list, which renders as the
+    /// display sentinel `(none)` rather than an empty string. `(none)` is not
+    /// itself a value `config set` accepts — round-tripping an empty list
+    /// means using `config unset`, not passing `(none)` back in.
     pub fn value_of(&self, key: ConfigKey) -> String {
         self.cells()[&key].0.clone()
     }

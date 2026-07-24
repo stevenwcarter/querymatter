@@ -284,7 +284,9 @@ the `config` keys.
 # bash
 querymatter completions bash > ~/.local/share/bash-completion/completions/querymatter
 
-# zsh — anywhere on your $fpath
+# zsh — anywhere on your $fpath (must be writable without sudo; not every
+# distro's default ${fpath[1]} is, so check first or point at a dir of
+# your own that's on $fpath)
 querymatter completions zsh > "${fpath[1]}/_querymatter"
 
 # fish

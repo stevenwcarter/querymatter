@@ -1009,6 +1009,37 @@ fn env_overrides_the_config_file() {
         .stdout(predicates::str::contains("╭"));
 }
 
+/// Pins `Source::Env` directly (nothing else in the suite asserts it): a
+/// unit test can't exercise this without mutating the whole test process's
+/// environment (unsafe under `cargo test`'s parallelism), since clap's `env`
+/// resolution reads the real process environment during parsing. Spawning
+/// the real binary as a child process — as `assert_cmd`'s `.env()` already
+/// does for a single child — sidesteps that: `config list`'s `table_style`
+/// row must show `(env)`, which only happens if `source_of` maps
+/// `ValueSource::EnvVariable` to `Source::Env` correctly (a swapped match arm
+/// would still pass `env_overrides_the_config_file` above, since that test
+/// only checks the rendered value, not its reported source).
+#[test]
+fn config_list_reports_env_as_table_styles_source() {
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "table_style = \"ascii\"\n");
+    let mut cmd = Command::cargo_bin("querymatter").unwrap();
+    let out = with_config_home(&mut cmd, home.path())
+        .env("QUERYMATTER_TABLE_STYLE", "unicode")
+        .args(["config", "list"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(out).unwrap();
+    let table_style_row = row_for(&text, "table_style");
+    assert!(
+        table_style_row.contains("unicode") && table_style_row.contains("(env)"),
+        "table_style row must show the env value and (env) source, got: {table_style_row:?}"
+    );
+}
+
 #[test]
 fn config_file_supplies_the_format() {
     let td = tree();
@@ -1074,19 +1105,42 @@ fn config_set_then_query_honors_it() {
         .stdout(predicates::str::contains("╭"));
 }
 
+/// Finds the `config list`/`.settings` row for `key` (the line whose first
+/// word is its name), so a test can assert a value and source are on the
+/// SAME row rather than merely present somewhere in the output.
+fn row_for<'a>(text: &'a str, key: &str) -> &'a str {
+    text.lines()
+        .find(|line| line.split_whitespace().next() == Some(key))
+        .unwrap_or_else(|| panic!("no {key} row in:\n{text}"))
+}
+
 #[test]
 fn config_list_names_the_source_of_each_value() {
     let home = TempDir::new().unwrap();
     write_config(home.path(), "table_style = \"unicode\"\n");
     let mut cmd = Command::cargo_bin("querymatter").unwrap();
-    with_config_home(&mut cmd, home.path())
+    let out = with_config_home(&mut cmd, home.path())
         .args(["config", "list"])
         .assert()
         .success()
-        .stdout(predicates::str::contains("table_style"))
-        .stdout(predicates::str::contains("unicode"))
-        .stdout(predicates::str::contains("(config)"))
-        .stdout(predicates::str::contains("(default)"));
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(out).unwrap();
+
+    // The configured key's own row must carry both its value and its
+    // source — not just have both strings present anywhere in the output,
+    // which wouldn't catch a source/key attribution swap between rows.
+    let table_style_row = row_for(&text, "table_style");
+    assert!(
+        table_style_row.contains("unicode") && table_style_row.contains("(config)"),
+        "table_style row must show its value and source together, got: {table_style_row:?}"
+    );
+    let format_row = row_for(&text, "format");
+    assert!(
+        format_row.contains("(default)"),
+        "format row must show its (unconfigured) source, got: {format_row:?}"
+    );
 }
 
 #[test]
@@ -1100,7 +1154,8 @@ fn config_get_prints_the_value_and_allowed_values() {
         .success()
         .stdout(predicates::str::contains("unicode"))
         .stdout(predicates::str::contains("ascii"))
-        .stdout(predicates::str::contains("compact"));
+        .stdout(predicates::str::contains("compact"))
+        .stdout(predicates::str::contains("plain"));
 }
 
 /// A rejected value must not touch the file.
@@ -1131,6 +1186,25 @@ fn config_unset_removes_the_key() {
         .success();
     let text = fs::read_to_string(home.path().join("querymatter/config.toml")).unwrap();
     assert!(!text.contains("table_style"), "got:\n{text}");
+}
+
+/// `config unset` on a key that was never set, with no config file existing
+/// at all, is semantically a no-op: it must not materialize the config file
+/// or its parent directory, and it must report accurately rather than
+/// claiming a removal that never happened.
+#[test]
+fn config_unset_on_absent_key_with_no_config_file_is_a_true_no_op() {
+    let home = TempDir::new().unwrap();
+    let mut cmd = Command::cargo_bin("querymatter").unwrap();
+    with_config_home(&mut cmd, home.path())
+        .args(["config", "unset", "table_style"])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("was not set"));
+    assert!(
+        !home.path().join("querymatter").exists(),
+        "no config directory must be created for a no-op unset"
+    );
 }
 
 #[test]
