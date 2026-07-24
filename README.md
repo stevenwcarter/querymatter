@@ -47,25 +47,64 @@ JSON.
 A subset of SQL:
 
 ```
-SELECT cols [AS alias] [FROM 'glob'] [WHERE ...] [GROUP BY ...] [ORDER BY ... [ASC|DESC]] [LIMIT n [OFFSET m]]
+SELECT [DISTINCT] cols [AS alias] [FROM 'glob'] [WHERE ...] [GROUP BY ...] [HAVING ...] [ORDER BY ... [ASC|DESC]] [LIMIT n [OFFSET m]]
 ```
 
-- **SELECT** — frontmatter field names, `file.*` pseudo-columns (below), `*`
-  (every frontmatter key seen, in sorted (alphabetical) order), or an aggregate:
-  `count(*)`, `count(col)`, `count(distinct col)`, `min`, `max`, `sum`, `avg`,
-  `group_concat`. Any item may take `AS <alias>` to rename its output header.
+- **SELECT** — a comma-separated list of items, each optionally `AS <alias>`:
+  a frontmatter field name, `file.*` pseudo-column (below), `*` (every
+  frontmatter key seen, in sorted order), a scalar expression (below), or an
+  aggregate: `count(*)`, `count(col)`, `count(distinct col)`, `min`, `max`,
+  `sum`, `avg`, `group_concat`. `SELECT DISTINCT` drops duplicate output rows
+  (after projection, before `ORDER BY`); it cannot be combined with `GROUP
+  BY` (a grouped query already yields one row per distinct key).
+- **Scalar expressions** — usable in `SELECT` and on either side of a `WHERE`
+  comparison: arithmetic `+ - * / %`, string concat `||`, and the functions
+  `lower(s)`, `upper(s)` (both Unicode-aware, not ASCII-only), `length(s)`,
+  `trim(s)`, `ltrim(s)`, `rtrim(s)`, `substr(s, start[, len])` (1-based,
+  clamped), `replace(s, from, to)`. A `Null` or non-numeric operand to
+  arithmetic, and divide/mod by zero, all yield `Null` rather than an error.
+  Arithmetic is computed in `f64`, so an integer field beyond `f64`'s 53-bit
+  exact range loses precision. An expression *containing* an aggregate (e.g.
+  `count(*) + 1`) is not supported — mix them via `HAVING` instead.
 - **FROM** — optional; when present its value is a path glob applied within
   the scanned directories (e.g. `FROM 'plans/**'`). Omit it and every
   discovered record is in scope.
-- **WHERE** — `= != <> < <= > >=`, `LIKE`/`NOT LIKE` (`%`/`_` wildcards),
-  `IN (...)`/`NOT IN (...)`, `IS NULL`/`IS NOT NULL`, combined with `AND`,
-  `OR`, `NOT`, and parentheses. A quoted string literal forces string
+- **WHERE** — a comparison (`= != <> < <= > >=`) between two scalar
+  expressions (so `WHERE start < end` or `WHERE upper(status) = 'DRAFT'`
+  work), plus `LIKE`/`NOT LIKE` (`%`/`_` wildcards), `IN (...)`/`NOT IN
+  (...)`, `IS NULL`/`IS NOT NULL`, and `[NOT] '<value>' MEMBER OF(<col>)` for
+  a list-valued field (e.g. `WHERE 'mobile' MEMBER OF(tags)`) — combined with
+  `AND`, `OR`, `NOT`, and parentheses. A quoted string literal forces string
   comparison; a bare numeric literal compares numerically.
-- **GROUP BY** — one or more grouping keys; every non-aggregate `SELECT` item
-  must be one of them.
-- **ORDER BY** — column, alias, or `file.*`, each with optional `ASC`/`DESC`.
-  NULLs sort last regardless of direction.
+- **GROUP BY** — one or more grouping keys, each a column or a `SELECT AS`
+  alias that resolves to one (`GROUP BY <alias>`); every non-aggregate
+  `SELECT` item must be composed entirely of grouping-key columns.
+- **HAVING** — filters *groups* (evaluated after aggregation, before `ORDER
+  BY`/`LIMIT`): a comparison between a grouping-key column or an aggregate
+  and a literal (e.g. `HAVING count(*) > 1`, `HAVING status = 'draft'`),
+  combined with `AND`/`OR`/`NOT`. The aggregate need not appear in `SELECT` —
+  it's computed on demand from each group's rows. Requires `GROUP BY`.
+- **ORDER BY** — a column, a `SELECT AS` alias, `file.*`, or a bare aggregate
+  call needing no alias (`ORDER BY count(*) DESC`, valid only alongside
+  `GROUP BY`) — each with optional `ASC`/`DESC`. NULLs sort last regardless
+  of direction.
 - **LIMIT n [OFFSET m]**.
+
+### Boundaries worth knowing
+
+A few spots where this subset stops short of full SQL:
+
+- **`ORDER BY`** accepts a column, a `SELECT` alias, or a bare aggregate call
+  — not an arbitrary scalar expression (`ORDER BY upper(status)` is
+  rejected; add `SELECT upper(status) AS s ... ORDER BY s` instead).
+- **`HAVING`** only compares a leaf (grouping-key column or aggregate)
+  against a literal — never aggregate-vs-aggregate (`HAVING count(*) <
+  sum(n)`) and never a scalar function.
+- **`GROUP BY`** keys must be plain columns (directly, or via a `SELECT AS`
+  alias on a plain column) — an alias on a computed expression or an
+  aggregate is not a valid grouping key.
+- **`DISTINCT` + `GROUP BY`** together are rejected; a grouped query already
+  produces one row per distinct key.
 
 ### Headline example
 
@@ -92,6 +131,32 @@ available alongside frontmatter fields:
 | `file.folder` | the parent-directory portion of `file.path` |
 | `file.ext` | extension without the dot, e.g. `md` |
 
+### Unknown-column validation
+
+**Behavior change:** a typo'd column name (`SELECT staus` for `status`) is
+now a **hard error by default**, naming the offending column and, when one is
+close enough, suggesting the nearest real one:
+
+```
+$ querymatter -e "SELECT staus" notes/
+Error: failed to execute query: SELECT staus
+
+Caused by:
+    unknown column `staus`, did you mean 'status'?
+```
+
+This checks every column position — `SELECT` (including inside a scalar
+function or aggregate argument), `WHERE`, `GROUP BY`, `ORDER BY`, `HAVING`,
+and `MEMBER OF`'s column — against the schema (the union of frontmatter field
+names across the scanned records). An empty schema (a fresh or empty vault,
+or one whose only records have an explicit-but-empty frontmatter mapping)
+skips the check entirely, so it can't fail every query on that account alone.
+
+Pass `--lenient` (or set the `lenient` config key) to restore the old
+behavior — an unknown column silently reads as `NULL` throughout. `--no-lenient`
+forces strict validation for one invocation, overriding a configured `lenient
+= true`.
+
 ## Flags
 
 | Flag | Meaning |
@@ -99,6 +164,8 @@ available alongside frontmatter fields:
 | `-e, --query <QUERY>` | One-shot mode; `-` reads the query text from stdin. May contain several statements, each ended by `;` (or `\G`, which prints every row as a block of `name: value` lines instead of a table). |
 | `--format <FMT>` | `table` (default), `json`, `csv`, `tsv`, or `md`. In the REPL this is just the *initial* format — `.format` changes it live. |
 | `--table-style <STYLE>` | Border style for `--format table`: `ascii` (default), `unicode`, `compact`, or `plain`. Also settable per-shell with `QUERYMATTER_TABLE_STYLE`; the flag wins. Ignored by `json`/`csv`/`tsv`/`md`. In the REPL this is just the *initial* style — `.style` changes it live. |
+| `--lenient` | Disable unknown-column validation — an unknown column reads as `NULL` instead of failing the query. Off by default — see [Unknown-column validation](#unknown-column-validation). |
+| `--no-lenient` | Force strict unknown-column validation, overriding a config `lenient = true`. |
 | `--ext <LIST>` | Comma-separated extensions to include. Default `md,markdown`. |
 | `--respect-gitignore` | Honor `.gitignore`/`.ignore` while walking. **Off by default** — see below. |
 | `--no-respect-gitignore` | Ignore `.gitignore`/`.ignore` rules, overriding a config `respect_gitignore = true`. |
@@ -236,6 +303,7 @@ ext               = ["md", "markdown"]
 respect_gitignore = true
 hidden            = false
 exclude           = ["**/templates/**"]
+lenient           = false
 ```
 
 Every key is optional; an absent key falls through to the next layer. Values
@@ -246,8 +314,11 @@ flag  >  environment  >  config file  >  built-in default
 ```
 
 So a configured `hidden = true` still scans hidden files when you pass no flag,
-and `--no-hidden` turns it back off for one run. `--table-style` additionally
-reads `QUERYMATTER_TABLE_STYLE`, which outranks the file but loses to the flag.
+and `--no-hidden` turns it back off for one run. Likewise a configured
+`lenient = true` still tolerates an unknown column when you pass no flag, and
+`--no-lenient` turns it back to strict for one run. `--table-style`
+additionally reads `QUERYMATTER_TABLE_STYLE`, which outranks the file but
+loses to the flag.
 
 | Command | Meaning |
 | --- | --- |
@@ -268,6 +339,7 @@ ext                md,markdown  (default)
 respect_gitignore  false        (default)
 hidden             false        (default)
 exclude            (none)       (default)
+lenient            false        (default)
 ```
 
 A malformed config file, an unknown key, or an invalid value is a hard error
