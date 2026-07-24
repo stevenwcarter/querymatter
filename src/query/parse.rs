@@ -11,11 +11,11 @@
 //! `WHERE title = 'imported from "x"'`) is passed through the real parser
 //! untouched and never corrupted.
 //!
-//! Anything outside the supported subset — joins, subqueries, whole-query
-//! `DISTINCT`, set operations, multiple statements, any clause that sqlparser
-//! parses but querymatter does not translate, or any node kind the lowering
-//! does not understand — is rejected with a [`ParseError`] rather than
-//! silently ignored.
+//! Anything outside the supported subset — joins, subqueries, `DISTINCT ON`,
+//! set operations, multiple statements, any clause that sqlparser parses but
+//! querymatter does not translate, or any node kind the lowering does not
+//! understand — is rejected with a [`ParseError`] rather than silently
+//! ignored.
 
 use sqlparser::ast as sql;
 use sqlparser::dialect::GenericDialect;
@@ -90,12 +90,19 @@ fn lower_query(query: &sql::Query) -> Result<Query, ParseError> {
 
     let filter = select.selection.as_ref().map(lower_predicate).transpose()?;
     let group_by = lower_group_by(&select.group_by, &select_items)?;
+    let distinct = lower_distinct(select.distinct.as_ref())?;
+    if distinct && !group_by.is_empty() {
+        // A grouped query already yields one row per distinct group key, so
+        // combining the two is redundant/confusing rather than meaningful.
+        return Err(unsupported("DISTINCT combined with GROUP BY"));
+    }
     let having = lower_having(select.having.as_ref(), &group_by)?;
     let order_by = lower_order_by(query.order_by.as_ref(), &aliases)?;
     let (limit, offset) = lower_limit(query.limit_clause.as_ref())?;
 
     Ok(Query {
         select: select_items,
+        distinct,
         from_glob,
         filter,
         group_by,
@@ -104,6 +111,21 @@ fn lower_query(query: &sql::Query) -> Result<Query, ParseError> {
         limit,
         offset,
     })
+}
+
+/// Lowers the `SELECT [DISTINCT | ALL]` marker to `Query.distinct`.
+///
+/// Only the plain `DISTINCT` form sets the flag; a bare `SELECT` and the
+/// explicit `ALL` form (which just spells out the default of keeping
+/// duplicates) both lower to `false`. `DISTINCT ON (...)` is a Postgres
+/// extension outside this subset, so it's rejected by name here rather than
+/// falling through to a `{:?}`-dumped generic error.
+fn lower_distinct(distinct: Option<&sql::Distinct>) -> Result<bool, ParseError> {
+    match distinct {
+        None | Some(sql::Distinct::All) => Ok(false),
+        Some(sql::Distinct::Distinct) => Ok(true),
+        Some(sql::Distinct::On(_)) => Err(unsupported("DISTINCT ON")),
+    }
 }
 
 /// Rejects `Query`-level clauses that sqlparser parses but querymatter does not
@@ -129,7 +151,6 @@ fn reject_unsupported_query_clauses(query: &sql::Query) -> Result<(), ParseError
 /// each must be inspected explicitly or it would be parsed and dropped.
 fn reject_unsupported_select_clauses(select: &sql::Select) -> Result<(), ParseError> {
     let clauses = [
-        ("DISTINCT on the whole SELECT", select.distinct.is_some()),
         ("SELECT INTO", select.into.is_some()),
         ("PREWHERE clause", select.prewhere.is_some()),
         ("QUALIFY clause", select.qualify.is_some()),
@@ -1449,11 +1470,21 @@ mod tests {
         ));
     }
     #[test]
-    fn rejects_whole_query_distinct() {
+    fn distinct_sets_the_flag() {
+        assert!(!parse("SELECT jira").unwrap().distinct);
+        assert!(!parse("SELECT ALL jira").unwrap().distinct);
+        assert!(parse("SELECT DISTINCT jira").unwrap().distinct);
+    }
+    #[test]
+    fn rejects_distinct_on() {
         assert!(matches!(
-            parse("SELECT DISTINCT jira"),
+            parse("SELECT DISTINCT ON (jira) jira"),
             Err(ParseError::Unsupported(_))
         ));
+    }
+    #[test]
+    fn distinct_with_group_by_is_rejected() {
+        assert!(parse("SELECT DISTINCT status, count(*) GROUP BY status").is_err());
     }
     #[test]
     fn rejects_set_operation() {

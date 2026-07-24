@@ -18,6 +18,11 @@ use crate::model::FileAttr;
 pub struct Query {
     /// Projected columns / expressions, in output order.
     pub select: Vec<SelectItem>,
+    /// Whether `SELECT DISTINCT` was specified: duplicate result rows (keyed
+    /// on the final projected cells) are dropped, keeping the first
+    /// occurrence. The parser rejects this combined with `GROUP BY` rather
+    /// than leaving that combination representable.
+    pub distinct: bool,
     /// The glob or directory the query scans, if a `FROM` clause was given.
     pub from_glob: Option<String>,
     /// The `WHERE` predicate, if any.

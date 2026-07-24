@@ -8,7 +8,7 @@
 //! `SELECT` item); see [`is_grouped_or_aggregate`] for the dispatch check.
 
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 
 use globset::Glob;
@@ -103,6 +103,10 @@ fn execute_ungrouped<'a>(
         })
         .collect();
 
+    if q.distinct {
+        dedup_rows(&mut rows);
+    }
+
     let order = resolve_order_targets(&q.order_by, &headers)?;
     rows.sort_by(|(ra, rowa), (rb, rowb)| {
         order
@@ -125,6 +129,21 @@ fn execute_ungrouped<'a>(
         .collect();
 
     Ok(ResultTable { headers, rows })
+}
+
+/// Drops duplicate projected rows in place for `SELECT DISTINCT`, keeping
+/// each row's first occurrence.
+///
+/// A row is keyed on its cells' [`Value::to_cmp_string`] — the same
+/// non-`Value` conversion `count(distinct col)` keys on, since `Value` has
+/// no `Eq`/`Hash` — collected per-row rather than joined into one string, so
+/// that e.g. cells `("ab", "c")` and `("a", "bc")` never collide.
+fn dedup_rows(rows: &mut Vec<(&Record, Vec<Value>)>) {
+    let mut seen: HashSet<Vec<String>> = HashSet::new();
+    rows.retain(|(_, row)| {
+        let key: Vec<String> = row.iter().map(Value::to_cmp_string).collect();
+        seen.insert(key)
+    });
 }
 
 /// The filter / group / aggregate / `HAVING` / order / limit pipeline for a
@@ -1186,6 +1205,66 @@ mod tests {
         let q = parse("SELECT status WHERE prd = '010' ORDER BY status DESC LIMIT 1").unwrap();
         let t = execute(&q, recs().iter()).unwrap();
         assert_eq!(t.rows, vec![vec![Value::Str("synced".into())]]);
+    }
+    #[test]
+    fn distinct_dedups_projection() {
+        let rows = [
+            rec("s", "s/a/1.md", &[]),
+            rec("s", "s/a/2.md", &[]),
+            rec("s", "s/b/3.md", &[]),
+        ];
+        let q = parse("SELECT DISTINCT file.folder").unwrap();
+        let t = execute(&q, rows.iter()).unwrap();
+        assert_eq!(
+            t.rows,
+            vec![vec![Value::Str("a".into())], vec![Value::Str("b".into())]]
+        );
+    }
+    #[test]
+    fn distinct_collapses_rows_that_differ_only_outside_the_projection() {
+        // b and c both have status "synced" but differ in `prd`/folder —
+        // DISTINCT keys on the final *projected* cells only, so they still
+        // collapse to a single row.
+        let q = parse("SELECT DISTINCT status").unwrap();
+        let t = execute(&q, recs().iter()).unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec![Value::Str("draft".into())],
+                vec![Value::Str("synced".into())],
+            ]
+        );
+    }
+    #[test]
+    fn distinct_dedup_uses_scan_order_before_order_by_resolves_ties() {
+        // Regression pin for pipeline order: dedup must run before ORDER BY,
+        // keeping each key's *first-scanned* row, even when ORDER BY sorts
+        // by a column outside the SELECT list. Sorting first would instead
+        // let whichever duplicate sorts smallest win the tie, changing which
+        // row's non-projected columns decide the final order.
+        let rows = [
+            rec(
+                "s",
+                "s/a.md",
+                &[("status", Value::Str("A".into())), ("prd", Value::Int(9))],
+            ),
+            rec(
+                "s",
+                "s/a2.md",
+                &[("status", Value::Str("A".into())), ("prd", Value::Int(1))],
+            ),
+            rec(
+                "s",
+                "s/b.md",
+                &[("status", Value::Str("B".into())), ("prd", Value::Int(5))],
+            ),
+        ];
+        let q = parse("SELECT DISTINCT status ORDER BY prd").unwrap();
+        let t = execute(&q, rows.iter()).unwrap();
+        assert_eq!(
+            t.rows,
+            vec![vec![Value::Str("B".into())], vec![Value::Str("A".into())]]
+        );
     }
     #[test]
     fn star_expands_sorted_union() {
