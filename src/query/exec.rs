@@ -367,11 +367,18 @@ struct Group<'a> {
 /// Buckets `records` by the tuple of `group_by` column values, in
 /// first-appearance order (the caller sorts for determinism afterward).
 ///
-/// Buckets are found via a `HashMap` keyed on each row's group-by cells'
-/// [`Value::to_cmp_string`] form — collected per-cell into a `Vec<String>`
-/// rather than joined into one string, same rationale as [`dedup_rows`], so
-/// e.g. `("ab", "c")` and `("a", "bc")` never collide — mapping to the
-/// bucket's index in `groups`. This keeps bucketing near-linear in
+/// Buckets are found via a `HashMap` keyed on each row's group-by cells,
+/// mapping to the bucket's index in `groups`. Each cell is turned into a
+/// `String` by [`hashable_cell_key`] and the per-cell keys are collected into
+/// a `Vec<String>` rather than joined into one string — this preserves two
+/// boundaries a naive key would lose. Cross-column: e.g. `("ab", "c")` and
+/// `("a", "bc")` never collide, since each cell is hashed separately (same
+/// rationale as [`dedup_rows`]). Cross-variant: e.g. `Value::Int(1)` and
+/// `Value::Str("1")`, or `Value::Null` and `Value::Str("")`, stay in separate
+/// groups even though [`Value::to_cmp_string`] displays them identically,
+/// because [`hashable_cell_key`] also folds in the cell's `Value` variant —
+/// matching the type-distinctness a structural `Vec<Value>` `PartialEq`
+/// comparison would give. This keeps bucketing near-linear in
 /// `records.len()` even for high-cardinality group-by columns; a per-row
 /// linear scan of existing groups would be quadratic.
 ///
@@ -392,7 +399,7 @@ fn group_rows<'a>(records: &[&'a Record], group_by: &[ColRef]) -> Vec<Group<'a>>
             .iter()
             .map(|col| resolve_col(record, col))
             .collect();
-        let hash_key: Vec<String> = key.iter().map(Value::to_cmp_string).collect();
+        let hash_key: Vec<String> = key.iter().map(hashable_cell_key).collect();
         match index.entry(hash_key) {
             Entry::Occupied(entry) => groups[*entry.get()].rows.push(record),
             Entry::Vacant(entry) => {
@@ -405,6 +412,22 @@ fn group_rows<'a>(records: &[&'a Record], group_by: &[ColRef]) -> Vec<Group<'a>>
         }
     }
     groups
+}
+
+/// The `HashMap` key for one `GROUP BY` cell: its `Value` variant name, a
+/// `\u{1}` separator (which can't appear in a variant name — see
+/// [`Value::variant_name`]), then its [`Value::to_cmp_string`] form.
+///
+/// The variant prefix is what makes the key type-distinct: `to_cmp_string()`
+/// alone is [`Value::display`], which is lossy across variants (`Int(1)` and
+/// `Str("1")` both display `"1"`; `Null` and `Str("")` both display `""`), so
+/// hashing on it directly would silently merge groups that a structural
+/// `Vec<Value>` key (this function's pre-hashing predecessor) kept apart. A
+/// `Value::List` cell hashes fine too: its `to_cmp_string()` is a
+/// comma-joined rendering of its elements, prefixed with `"List"`, so it
+/// can't collide with a scalar cell either.
+fn hashable_cell_key(value: &Value) -> String {
+    format!("{}\u{1}{}", value.variant_name(), value.to_cmp_string())
 }
 
 /// Orders two group-key tuples element-wise via [`order_cmp`] (always
@@ -2155,6 +2178,26 @@ mod agg_tests {
                 ],
             ]
         );
+    }
+    #[test]
+    fn group_by_key_preserves_value_variant_identity() {
+        // Four rows share a single grouping column `n` whose values are
+        // type-distinct but display identically: `Int(1)`/`Str("1")` both
+        // "1", and `Null`/`Str("")` both "". A hash key built from
+        // `Value::to_cmp_string()` alone (display, lossy across variants)
+        // would collapse these into 2 groups; the previous structural
+        // `Vec<Value>` `PartialEq` key — and the fixed hash key — keep all 4
+        // apart.
+        let rows = [
+            rec_n("s/a.md", "x", Value::Int(1)),
+            rec_n("s/b.md", "x", Value::Str("1".into())),
+            rec_n("s/c.md", "x", Value::Null),
+            rec_n("s/d.md", "x", Value::Str("".into())),
+        ];
+        let q = parse("SELECT n, count(*) AS n_count GROUP BY n").unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
+        assert_eq!(t.rows.len(), 4);
+        assert!(t.rows.iter().all(|row| row[1] == Value::Int(1)));
     }
     #[test]
     fn group_by_many_distinct_groups_partitions_all_rows() {
