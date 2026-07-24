@@ -398,9 +398,15 @@ struct Group<'a> {
 /// groups even though [`Value::to_cmp_string`] displays them identically,
 /// because [`hashable_cell_key`] also folds in the cell's `Value` variant —
 /// matching the type-distinctness a structural `Vec<Value>` `PartialEq`
-/// comparison would give. This keeps bucketing near-linear in
-/// `records.len()` even for high-cardinality group-by columns; a per-row
-/// linear scan of existing groups would be quadratic.
+/// comparison would give. [`hashable_cell_key`] also matches that structural
+/// comparison's two other quirks: a `Value::List` cell keys on its elements
+/// recursively rather than `to_cmp_string()`'s lossy `", "`-joined form (so
+/// `[a, b]` and `["a, b"]` land in different groups, like `main`'s `Vec<Value>`
+/// `==` would), and a `Value::Float` cell normalizes `-0.0` to `0.0` before
+/// keying (so `0.0` and `-0.0` land in the SAME group, like `f64`'s `==`).
+/// This keeps bucketing near-linear in `records.len()` even for
+/// high-cardinality group-by columns; a per-row linear scan of existing
+/// groups would be quadratic.
 ///
 /// An empty `group_by` means "aggregate over everything": every record —
 /// including none at all — falls into the single group keyed by `[]`, so a
@@ -434,20 +440,52 @@ fn group_rows<'a>(records: &[&'a Record], group_by: &[ColRef]) -> Vec<Group<'a>>
     groups
 }
 
-/// The `HashMap` key for one `GROUP BY` cell: its `Value` variant name, a
-/// `\u{1}` separator (which can't appear in a variant name — see
-/// [`Value::variant_name`]), then its [`Value::to_cmp_string`] form.
+/// The `HashMap` key for one `GROUP BY` cell, built to agree exactly with
+/// `main`'s structural `Vec<Value>` `PartialEq` over a group-by tuple —
+/// including its two non-obvious cases, `List` and `Float`.
 ///
-/// The variant prefix is what makes the key type-distinct: `to_cmp_string()`
-/// alone is [`Value::display`], which is lossy across variants (`Int(1)` and
-/// `Str("1")` both display `"1"`; `Null` and `Str("")` both display `""`), so
-/// hashing on it directly would silently merge groups that a structural
-/// `Vec<Value>` key (this function's pre-hashing predecessor) kept apart. A
-/// `Value::List` cell hashes fine too: its `to_cmp_string()` is a
-/// comma-joined rendering of its elements, prefixed with `"List"`, so it
-/// can't collide with a scalar cell either.
+/// A scalar (`Null`/`Bool`/`Int`/`Str`) keys on its [`Value::variant_name`],
+/// a `\u{1}` separator (which can't appear in a variant name), then its
+/// [`Value::to_cmp_string`] form. The variant prefix is what makes the key
+/// type-distinct: `to_cmp_string()` alone is [`Value::display`], which is
+/// lossy across variants (`Int(1)` and `Str("1")` both display `"1"`; `Null`
+/// and `Str("")` both display `""`), so hashing on it directly would
+/// silently merge groups that structural equality keeps apart.
+///
+/// `Float(f)` normalizes `-0.0` to `0.0` before keying, since `f64`'s
+/// `PartialEq` (and so `Value`'s derived one) treats them as equal —
+/// `to_cmp_string()` alone would key them `"-0"` and `"0"`, splitting one
+/// structural group into two.
+///
+/// `List(items)` recurses into each element's own `hashable_cell_key`
+/// rather than using [`Value::to_cmp_string`]'s `", "`-joined `display()`
+/// form: that join is lossy the same way string concatenation always is —
+/// `[Str("a"), Str("b")]` and `[Str("a, b")]` both display `"a, b"`, so
+/// hashing the joined string would merge two structurally-distinct lists
+/// into one group. Each element's key is instead length-prefixed
+/// (`"<byte-len>\u{1}<key>"`) before being appended, which is what makes the
+/// concatenation collision-free regardless of what characters an element's
+/// own key contains: decoding never needs to guess where one element's key
+/// ends and the next begins.
 fn hashable_cell_key(value: &Value) -> String {
-    format!("{}\u{1}{}", value.variant_name(), value.to_cmp_string())
+    match value {
+        Value::List(items) => {
+            let mut key = String::from("List");
+            for item in items {
+                let element = hashable_cell_key(item);
+                key.push('\u{1}');
+                key.push_str(&element.len().to_string());
+                key.push('\u{1}');
+                key.push_str(&element);
+            }
+            key
+        }
+        Value::Float(f) => {
+            let normalized = if *f == 0.0 { 0.0 } else { *f };
+            format!("Float\u{1}{normalized}")
+        }
+        _ => format!("{}\u{1}{}", value.variant_name(), value.to_cmp_string()),
+    }
 }
 
 /// Orders two group-key tuples element-wise via [`order_cmp`] (always
@@ -2219,6 +2257,61 @@ mod agg_tests {
         assert_eq!(t.rows.len(), 4);
         assert!(t.rows.iter().all(|row| row[1] == Value::Int(1)));
     }
+
+    /// MUST-FIX #3 (Finding A) characterization: `main`'s GROUP BY key is a
+    /// structural `Vec<Value>` `PartialEq`, under which `[Str("a"),
+    /// Str("b")]` and `[Str("a, b")]` are different — even though
+    /// `Value::display()`'s `", "`-join renders both `"a, b"`, which would
+    /// merge them into one group if `hashable_cell_key` still hashed a
+    /// list's `to_cmp_string()` directly instead of recursing into its
+    /// elements.
+    #[test]
+    fn group_by_list_column_distinguishes_structurally_different_lists() {
+        let rows = [
+            rec_n(
+                "s/a.md",
+                "x",
+                Value::List(vec![Value::Str("a".into()), Value::Str("b".into())]),
+            ),
+            rec_n("s/b.md", "x", Value::List(vec![Value::Str("a, b".into())])),
+        ];
+
+        let q = parse("SELECT n, count(*) AS n_count GROUP BY n").unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
+        assert_eq!(
+            t.rows.len(),
+            2,
+            "[a, b] and [\"a, b\"] must land in different groups, matching \
+             main's structural Vec<Value> equality; got: {:?}",
+            t.rows
+        );
+        assert!(t.rows.iter().all(|row| row[1] == Value::Int(1)));
+    }
+
+    /// MUST-FIX #3 (Finding A) characterization: `f64`'s `PartialEq` (and so
+    /// `Value`'s derived one) treats `0.0 == -0.0`, so `main`'s structural
+    /// GROUP BY key puts them in the SAME group — which `hashable_cell_key`
+    /// would miss without normalizing `-0.0` away, since `"-0"` and `"0"`
+    /// are different strings.
+    #[test]
+    fn group_by_float_column_treats_positive_and_negative_zero_as_one_group() {
+        let rows = [
+            rec_n("s/a.md", "x", Value::Float(0.0)),
+            rec_n("s/b.md", "x", Value::Float(-0.0)),
+        ];
+
+        let q = parse("SELECT n, count(*) AS n_count GROUP BY n").unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
+        assert_eq!(
+            t.rows.len(),
+            1,
+            "0.0 and -0.0 must land in the SAME group, matching main's \
+             structural Value PartialEq; got: {:?}",
+            t.rows
+        );
+        assert_eq!(t.rows[0][1], Value::Int(2));
+    }
+
     #[test]
     fn group_by_many_distinct_groups_partitions_all_rows() {
         // High-cardinality guard for the hash-keyed bucketing: 500 records
