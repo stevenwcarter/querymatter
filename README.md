@@ -284,6 +284,9 @@ rather than SQL:
 | `.schema` | List discovered frontmatter fields, the `file.*` columns, and the record count. |
 | `.format [fmt]` | Show, or set, the output format for subsequent queries. |
 | `.style [style]` | Show, or set, the table border style (`ascii`, `unicode`, `compact`, `plain`) for subsequent queries. |
+| `.settings` | List every setting, its resolved value, and which layer supplied it. |
+| `.set <key> <value>` | Save a setting to the config file. Rendering settings (`format`, `table_style`) also apply immediately; scan settings take effect on the next run. |
+| `.unset <key>` | Remove a setting from the config file. |
 | `.reload` | Re-scan every tracked directory (in-memory only; never touches a `.querymatter` cache). |
 | `.refresh [path]` | Force a re-scan of `path` (or the whole vault); updates the `.querymatter` cache when one is loaded, otherwise behaves like `.reload`. |
 | `.refresh-all` | Force a re-scan of the whole vault; alias for `.refresh` with no path. |
@@ -295,6 +298,10 @@ right-aligned `name: value` lines — the readable way to inspect a wide record,
 as in `SELECT * LIMIT 1\G`. `\g` is accepted as a synonym for `;`. `\G`
 overrides whatever `.format` is set to, and works in `-e` and piped batch mode
 as well as the REPL.
+
+`.format` and `.style` change the current session only; `.set format` and
+`.set table_style` persist to the config file — so you can try a setting, then
+keep it.
 
 ## Accuracy notes / gotchas
 

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 
 use crate::cache;
+use crate::config::{self, Config, ConfigKey};
 use crate::query::{self, ResultTable};
 use crate::render::{self, Format, Output, TableStyle};
 use crate::settings::{Resolved, Settings, Source};
@@ -58,6 +59,66 @@ impl Session {
     /// Every setting, for `.settings`.
     pub fn settings(&self) -> &Settings {
         &self.settings
+    }
+
+    /// Persists `key = value` to the config file and applies it to this
+    /// session when it affects rendering.
+    ///
+    /// Returns the config file's path, for the caller's confirmation message,
+    /// and whether the change takes effect immediately — scan settings do
+    /// not, because the store is already loaded.
+    pub fn persist_set(&mut self, key: ConfigKey, value: &str) -> anyhow::Result<(PathBuf, bool)> {
+        let mut config = config::load()?;
+        config::set(&mut config, key, value)?;
+        let path = config::save(&config)?;
+        let immediate = self.apply(key, &config);
+        Ok((path, immediate))
+    }
+
+    /// Removes `key` from the config file, reverting this session's value to
+    /// whatever applies without it.
+    pub fn persist_unset(&mut self, key: ConfigKey) -> anyhow::Result<(PathBuf, bool)> {
+        let mut config = config::load()?;
+        config::unset(&mut config, key);
+        let path = config::save(&config)?;
+        let immediate = match key {
+            ConfigKey::Format => {
+                self.settings.format = self.fallback.format.clone();
+                true
+            }
+            ConfigKey::TableStyle => {
+                self.settings.table_style = self.fallback.table_style.clone();
+                true
+            }
+            _ => false,
+        };
+        Ok((path, immediate))
+    }
+
+    /// Applies a just-persisted rendering setting to this session. Returns
+    /// whether anything changed now; scan settings take effect next run.
+    fn apply(&mut self, key: ConfigKey, config: &Config) -> bool {
+        match key {
+            ConfigKey::Format => {
+                if let Some(format) = config.format {
+                    self.settings.format = Resolved {
+                        value: format,
+                        source: Source::Config,
+                    };
+                }
+                true
+            }
+            ConfigKey::TableStyle => {
+                if let Some(style) = config.table_style {
+                    self.settings.table_style = Resolved {
+                        value: style,
+                        source: Source::Config,
+                    };
+                }
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Parses and executes `sql`, returning the projected result table.
