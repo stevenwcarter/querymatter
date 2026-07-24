@@ -22,7 +22,7 @@ use rustyline::{Context as RlContext, Editor, Helper, Highlighter, Hinter, Valid
 use crate::config::ConfigKey;
 use crate::model::Value;
 use crate::output::OutputSink;
-use crate::queries;
+use crate::queries::{self, Queries};
 use crate::render::{Format, TableStyle};
 use crate::session::{FieldStat, Session, Statement, Terminator, split_statements};
 use crate::store::LoadReport;
@@ -520,28 +520,32 @@ fn dispatch_dot(cmd: DotCommand, session: &mut Session, sink: &mut OutputSink) -
     false
 }
 
-/// Runs a `.query` dot-command: `.query list` prints every saved query's name
-/// and SQL to stdout; `.query run <name>` resolves `name` via [`queries::load`]
-/// and runs its SQL in-session through [`run_statement`] — since a saved
-/// query may itself contain several `;`-separated statements, each is split
-/// out via [`split_statements`] and run (and rendered to `sink`) in order,
-/// exactly like the REPL's own multi-line statement handling. A malformed
-/// `queries.toml` or an unknown name is reported on stderr, not a panic.
+/// Runs a `.query` dot-command: loads `queries.toml` via [`queries::load`]
+/// and delegates the resolve-and-run decision to [`run_query_cmd`]. A
+/// malformed `queries.toml` is reported on stderr, not a panic.
 fn dispatch_query(cmd: QueryCmd, session: &Session, sink: &mut OutputSink) {
-    let saved = match queries::load() {
-        Ok(saved) => saved,
-        Err(err) => {
-            eprintln!("querymatter: {err:#}");
-            return;
-        }
-    };
+    match queries::load() {
+        Ok(saved) => run_query_cmd(cmd, &saved, session, sink),
+        Err(err) => eprintln!("querymatter: {err:#}"),
+    }
+}
+
+/// The `.query` dot-command's resolve-and-run decision, taking already-loaded
+/// `saved` queries directly rather than reading `queries.toml` itself — split
+/// out from [`dispatch_query`] so it's unit-testable against an in-memory
+/// [`Queries`] map, with no filesystem/env involved.
+///
+/// `.query list` prints every saved query's name and SQL to stdout.
+/// `.query run <name>` resolves `name` in `saved` and runs its SQL in-session
+/// through [`run_statement`] — since a saved query may itself contain several
+/// `;`-separated statements, each is split out via [`split_statements`] and
+/// run (and rendered to `sink`) in order, exactly like the REPL's own
+/// multi-line statement handling. An unknown name is reported on stderr, not
+/// a panic.
+fn run_query_cmd(cmd: QueryCmd, saved: &Queries, session: &Session, sink: &mut OutputSink) {
     match cmd {
-        QueryCmd::List => {
-            for (name, sql) in saved.iter() {
-                println!("{name}\t{sql}");
-            }
-        }
-        QueryCmd::Run(name) => match queries::get(&saved, &name) {
+        QueryCmd::List => print!("{}", query_list_lines(saved)),
+        QueryCmd::Run(name) => match queries::get(saved, &name) {
             Some(sql) => {
                 for statement in split_statements(sql) {
                     run_statement(session, &statement, sink);
@@ -550,6 +554,18 @@ fn dispatch_query(cmd: QueryCmd, session: &Session, sink: &mut OutputSink) {
             None => eprintln!("querymatter: no saved query named '{name}'"),
         },
     }
+}
+
+/// `.query list`'s output: each saved query as one `name\tsql` line
+/// (name-sorted, mirroring [`Queries::iter`]), with a trailing newline after
+/// every line including the last. Pulled out as a pure function — like
+/// [`banner`]/[`help_text`] — so it's unit-tested without capturing stdout.
+fn query_list_lines(saved: &Queries) -> String {
+    let mut out = String::new();
+    for (name, sql) in saved.iter() {
+        writeln!(out, "{name}\t{sql}").expect("String write is infallible");
+    }
+    out
 }
 
 /// Every saved query's name, for [`ReplHelper`]'s tab-completion snapshot. A
@@ -1077,7 +1093,11 @@ impl Completer for ReplHelper {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discover::WalkOpts;
     use crate::render::Format;
+    use crate::settings::Settings;
+    use crate::store::InMemoryStore;
+    use tempfile::tempdir;
 
     #[test]
     fn buffers_until_semicolon() {
@@ -1242,6 +1262,107 @@ mod tests {
     fn query_missing_arguments_are_reported_as_missing() {
         assert_eq!(parse_dot(".query"), DotCommand::MissingArg("query"));
         assert_eq!(parse_dot(".query run"), DotCommand::MissingArg("query"));
+    }
+
+    /// A session over a tiny real store, for the `run_query_cmd` tests below
+    /// (which need an actual queryable session, unlike the parsing tests
+    /// above).
+    fn query_cmd_test_session(dir: &std::path::Path) -> Session {
+        let (store, _report) =
+            InMemoryStore::load(vec![fs::canonicalize(dir).unwrap()], WalkOpts::default());
+        Session::new(
+            Box::new(store),
+            Settings::default(),
+            Settings::default(),
+            None,
+        )
+    }
+
+    /// MUST-FIX: `run_query_cmd`'s `.query run <name>` resolution/execution,
+    /// driven directly against a `Session` + an in-memory `Queries` map — no
+    /// filesystem `queries.toml`, no PTY. Also pins that a saved query
+    /// containing several `;`-separated statements is split and every
+    /// statement's result reaches the sink, in order.
+    #[test]
+    fn run_query_cmd_run_resolves_and_executes_a_multi_statement_saved_query() {
+        let td = tempdir().unwrap();
+        fs::write(td.path().join("a.md"), "---\nstatus: draft\n---\n").unwrap();
+        fs::write(td.path().join("b.md"), "---\nstatus: synced\n---\n").unwrap();
+        let session = query_cmd_test_session(td.path());
+
+        let mut saved = Queries::default();
+        queries::set(
+            &mut saved,
+            "both",
+            "SELECT status WHERE status = 'draft';\nSELECT status WHERE status = 'synced'",
+        )
+        .unwrap();
+
+        let out_path = td.path().join("out.txt");
+        let mut sink = OutputSink::open_file(&out_path).unwrap();
+        run_query_cmd(
+            QueryCmd::Run("both".to_string()),
+            &saved,
+            &session,
+            &mut sink,
+        );
+        drop(sink);
+
+        let body = fs::read_to_string(&out_path).unwrap();
+        assert!(
+            body.contains("draft"),
+            "missing first statement's result: {body}"
+        );
+        assert!(
+            body.contains("synced"),
+            "missing second statement's result: {body}"
+        );
+    }
+
+    /// An unknown `.query run` name must not run anything — the sink stays
+    /// completely untouched (the error itself goes to stderr, matching every
+    /// other REPL error, and is covered by `queries::get_is_none_for_an_unknown_name`
+    /// for the resolution step itself).
+    #[test]
+    fn run_query_cmd_run_unknown_name_touches_neither_session_nor_sink() {
+        let td = tempdir().unwrap();
+        fs::write(td.path().join("a.md"), "---\nstatus: draft\n---\n").unwrap();
+        let session = query_cmd_test_session(td.path());
+        let saved = Queries::default();
+
+        let out_path = td.path().join("out.txt");
+        let mut sink = OutputSink::open_file(&out_path).unwrap();
+        run_query_cmd(
+            QueryCmd::Run("nope".to_string()),
+            &saved,
+            &session,
+            &mut sink,
+        );
+        drop(sink);
+
+        assert_eq!(
+            fs::read_to_string(&out_path).unwrap(),
+            "",
+            "an unknown saved-query name must not write any result"
+        );
+    }
+
+    /// MUST-FIX: `.query list`'s output (via `run_query_cmd` → `query_list_lines`)
+    /// names every saved query, one `name\tsql` line each, sorted by name.
+    #[test]
+    fn query_list_lines_names_every_saved_query() {
+        let mut saved = Queries::default();
+        queries::set(&mut saved, "zeta", "SELECT 1").unwrap();
+        queries::set(&mut saved, "alpha", "SELECT 2").unwrap();
+        assert_eq!(
+            query_list_lines(&saved),
+            "alpha\tSELECT 2\nzeta\tSELECT 1\n"
+        );
+    }
+
+    #[test]
+    fn query_list_lines_is_empty_when_nothing_is_saved() {
+        assert_eq!(query_list_lines(&Queries::default()), "");
     }
 
     #[test]
