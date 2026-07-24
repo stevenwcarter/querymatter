@@ -669,10 +669,17 @@ fn eval_predicate(record: &Record, pred: &Predicate) -> Option<bool> {
             if value.is_null() {
                 return None;
             }
-            let base =
-                Some(literals.iter().any(|lit| {
-                    eval_compare(&value, &CmpOp::Eq, &literal_value(lit)) == Some(true)
-                }));
+            let base = Some(literals.iter().any(|lit| element_equals(&value, lit)));
+            maybe_negate(base, *negated)
+        }
+        Predicate::MemberOf(lit, col, negated) => {
+            let value = resolve_col(record, col);
+            let Value::List(items) = &value else {
+                // Unknown for both a `Null` field and a non-list value —
+                // never a hard `false` — mirroring `In`'s null-column rule.
+                return None;
+            };
+            let base = Some(items.iter().any(|el| element_equals(el, lit)));
             maybe_negate(base, *negated)
         }
         // The only predicate that is determinate — and true — for a NULL field.
@@ -685,6 +692,14 @@ fn eval_predicate(record: &Record, pred: &Predicate) -> Option<bool> {
         }
         Predicate::Not(inner) => three_valued_not(eval_predicate(record, inner)),
     }
+}
+
+/// The element-equality shared by `IN (...)` (comparing the column's value
+/// against each candidate literal) and `MEMBER OF(...)` (comparing each list
+/// element against the target literal): `true` when `value` equals `lit`
+/// under [`eval_compare`]'s `Eq` rule.
+fn element_equals(value: &Value, lit: &Literal) -> bool {
+    eval_compare(value, &CmpOp::Eq, &literal_value(lit)) == Some(true)
 }
 
 /// Applies the 3VL `NOT` to `v` when `negated`, else returns it unchanged.
@@ -1146,6 +1161,48 @@ mod tests {
         assert_eq!(execute(&q, recs().iter()).unwrap().rows.len(), 2);
         let q2 = parse("SELECT status WHERE prd IN ('011')").unwrap();
         assert_eq!(execute(&q2, recs().iter()).unwrap().rows.len(), 1);
+    }
+    #[test]
+    fn member_of_list_field() {
+        // `a.md` carries a list `tags`; `b.md` has no `tags` at all (resolves
+        // to `Value::Null`); `c.md`'s `tags` is a bare string, not a list.
+        let rows = [
+            rec(
+                "s",
+                "s/a.md",
+                &[(
+                    "tags",
+                    Value::List(vec![
+                        Value::Str("mobile".into()),
+                        Value::Str("backend".into()),
+                    ]),
+                )],
+            ),
+            rec("s", "s/b.md", &[]),
+            rec("s", "s/c.md", &[("tags", Value::Str("x".into()))]),
+        ];
+
+        // A member of the list matches; the Null and non-list rows are
+        // unknown, not false, so they're excluded either way.
+        let present = parse("SELECT file.name WHERE 'mobile' MEMBER OF(tags)").unwrap();
+        assert_eq!(
+            execute(&present, rows.iter()).unwrap().rows,
+            vec![vec![Value::Str("a.md".into())]]
+        );
+
+        // A non-member yields no match on the list row either.
+        let absent = parse("SELECT file.name WHERE 'ios' MEMBER OF(tags)").unwrap();
+        assert!(execute(&absent, rows.iter()).unwrap().rows.is_empty());
+
+        // `NOT <lit> MEMBER OF(col)` (sqlparser 0.62 only accepts the prefix
+        // NOT form, not `col NOT MEMBER OF(...)`) flips the list row to a
+        // match, but negating unknown stays unknown — the Null/non-list rows
+        // must NOT be resurrected.
+        let negated = parse("SELECT file.name WHERE NOT 'ios' MEMBER OF(tags)").unwrap();
+        assert_eq!(
+            execute(&negated, rows.iter()).unwrap().rows,
+            vec![vec![Value::Str("a.md".into())]]
+        );
     }
     /// Records for the 3VL / NULL-under-negation tests (Fix 1): two carry a
     /// `status`, one has none — so `status` resolves to `Value::Null` on it.

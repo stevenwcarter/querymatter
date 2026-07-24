@@ -547,13 +547,43 @@ fn lower_predicate(expr: &sql::Expr) -> Result<Predicate, ParseError> {
         }
         sql::Expr::IsNull(inner) => Ok(Predicate::IsNull(lower_col_ref(inner)?, false)),
         sql::Expr::IsNotNull(inner) => Ok(Predicate::IsNull(lower_col_ref(inner)?, true)),
+        sql::Expr::MemberOf(member_of) => lower_member_of(member_of, false),
         sql::Expr::Nested(inner) => lower_predicate(inner),
         sql::Expr::UnaryOp {
             op: sql::UnaryOperator::Not,
             expr,
-        } => Ok(Predicate::Not(Box::new(lower_predicate(expr)?))),
+        } => lower_not(expr),
         _ => Err(unsupported("this WHERE expression")),
     }
+}
+
+/// Lowers `NOT <expr>`. sqlparser 0.62 rejects the postfix `<value> NOT
+/// MEMBER OF(...)` form outright (a syntax error, before lowering ever sees
+/// it), but accepts the prefix `NOT <value> MEMBER OF(...)`, parsing it as a
+/// plain `UnaryOp` wrapping `MemberOf`. That shape is special-cased here —
+/// rather than falling through to a generic `Predicate::Not` wrap — so the
+/// negation lands as a flat flag on `Predicate::MemberOf`, matching how
+/// `In`/`Like` carry theirs.
+fn lower_not(expr: &sql::Expr) -> Result<Predicate, ParseError> {
+    if let sql::Expr::MemberOf(member_of) = expr {
+        return lower_member_of(member_of, true);
+    }
+    Ok(Predicate::Not(Box::new(lower_predicate(expr)?)))
+}
+
+/// Lowers a `<value> MEMBER OF(<array>)` node: `value` must lower to a
+/// [`Literal`] and `array` to a single column reference, else the whole form
+/// is rejected — sqlparser's `MemberOf` node carries no `negated` field of
+/// its own, so `negated` is threaded in by the caller (see
+/// [`lower_predicate`]).
+fn lower_member_of(member_of: &sql::MemberOf, negated: bool) -> Result<Predicate, ParseError> {
+    let (Ok(lit), Ok(col)) = (
+        lower_literal(&member_of.value),
+        lower_col_ref(&member_of.array),
+    ) else {
+        return Err(unsupported("this MEMBER OF form"));
+    };
+    Ok(Predicate::MemberOf(lit, col, negated))
 }
 
 /// Lowers a binary operation: a boolean connective (`AND`/`OR`) or a
@@ -860,6 +890,48 @@ mod tests {
             parse("SELECT jira WHERE epic IS NOT NULL").unwrap().filter,
             Some(Predicate::IsNull(ColRef::Field("epic".into()), true))
         );
+    }
+    #[test]
+    fn member_of_shape() {
+        // `MEMBER OF` carries the literal, the column, and the negation
+        // flag. Only the prefix `NOT <value> MEMBER OF(...)` form is valid
+        // SQL under sqlparser 0.62 (the postfix `<value> NOT MEMBER OF(...)`
+        // is a syntax error at the sqlparser level — see `lower_not`); the
+        // prefix form still lands as a flat negated flag, not a wrapping
+        // `Predicate::Not`.
+        assert_eq!(
+            parse("SELECT jira WHERE 'mobile' MEMBER OF(tags)")
+                .unwrap()
+                .filter,
+            Some(Predicate::MemberOf(
+                Literal::Str("mobile".into()),
+                ColRef::Field("tags".into()),
+                false
+            ))
+        );
+        assert_eq!(
+            parse("SELECT jira WHERE NOT 'mobile' MEMBER OF(tags)")
+                .unwrap()
+                .filter,
+            Some(Predicate::MemberOf(
+                Literal::Str("mobile".into()),
+                ColRef::Field("tags".into()),
+                true
+            ))
+        );
+    }
+
+    #[test]
+    fn member_of_rejects_non_literal_value_or_non_column_array() {
+        // The value side must lower to a `Literal`; the array side must
+        // lower to a single column reference. Neither holds here (a column
+        // on the value side, a `file.*` compound the array side rejects
+        // only via the column path — this covers the value-side rejection,
+        // which is the common misuse: `col MEMBER OF(tags)`).
+        assert!(matches!(
+            parse("SELECT jira WHERE status MEMBER OF(tags)"),
+            Err(ParseError::Unsupported(_))
+        ));
     }
     #[test]
     fn order_and_limit() {

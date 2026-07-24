@@ -149,6 +149,11 @@ pub enum Predicate {
     Like(ColRef, String, /* negated */ bool),
     /// `col [NOT] IN (<literals>)`; the `bool` is `true` when negated.
     In(ColRef, Vec<Literal>, /* negated */ bool),
+    /// `<lit> MEMBER OF(col)` / `NOT <lit> MEMBER OF(col)`; the `bool` is
+    /// `true` when negated. `col` must resolve to a `Value::List` — a `Null`
+    /// or non-list value makes the predicate unknown, mirroring `In`'s
+    /// null-column handling (see `exec::eval_predicate`).
+    MemberOf(Literal, ColRef, /* negated */ bool),
     /// `col IS [NOT] NULL`; the `bool` is `true` for `IS NOT NULL`.
     IsNull(ColRef, /* negated */ bool),
     /// Logical conjunction.
