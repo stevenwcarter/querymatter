@@ -42,8 +42,11 @@ pub enum Line {
     /// A complete statement plus the terminator that ended it (the terminator
     /// itself is stripped).
     Statement(Statement),
-    /// A `.`-prefixed dot-command.
-    Dot(DotCommand),
+    /// A `.`-prefixed dot-command, paired with the original (trimmed) line
+    /// text. [`DotCommand`] alone loses casing and whitespace that parsing
+    /// normalizes away, so the raw text rides along for callers — namely
+    /// [`history_entry`] — that want an exact record of what was typed.
+    Dot(DotCommand, String),
 }
 
 /// A REPL dot-command, parsed from a line beginning with `.`.
@@ -117,7 +120,7 @@ impl LineBuffer {
                 return Line::Blank;
             }
             if trimmed.starts_with('.') {
-                return Line::Dot(parse_dot(trimmed));
+                return Line::Dot(parse_dot(trimmed), trimmed.to_string());
             }
             self.buf.push_str(raw);
         } else {
@@ -246,6 +249,11 @@ pub fn run(mut session: Session) -> anyhow::Result<()> {
         load_history(&mut editor, path);
     }
 
+    println!(
+        "querymatter — {} records. Type .help for commands, .schema for fields.",
+        record_count(&session)
+    );
+
     let mut buffer = LineBuffer::new();
     loop {
         let prompt = if buffer.is_pending() {
@@ -265,15 +273,19 @@ pub fn run(mut session: Session) -> anyhow::Result<()> {
                 break;
             }
         };
-        let _ = editor.add_history_entry(line.as_str());
 
-        match buffer.push(&line) {
+        let resolved = buffer.push(&line);
+        if let Some(entry) = history_entry(&resolved) {
+            let _ = editor.add_history_entry(entry);
+        }
+
+        match resolved {
             Line::Blank | Line::More => {}
             Line::Statement(statement) => match session.render_statement(&statement) {
                 Ok(rendered) => println!("{rendered}"),
                 Err(err) => eprintln!("querymatter: {err:#}"),
             },
-            Line::Dot(cmd) => {
+            Line::Dot(cmd, _) => {
                 if dispatch_dot(cmd, &mut session) {
                     break;
                 }
@@ -290,6 +302,32 @@ pub fn run(mut session: Session) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// What to add to the line editor's history for one resolved [`Line`], or
+/// `None` when nothing should be recorded.
+///
+/// A statement accumulated across several raw lines ([`Line::More`] then
+/// [`Line::Statement`]) records exactly once, as the assembled SQL plus its
+/// terminator — the W5 fix: previously every raw line got its own history
+/// entry, so a statement typed across N lines left N unrunnable fragments in
+/// history instead of one entry that replays the whole thing. A dot-command
+/// records its original line text verbatim, carried on [`Line::Dot`], rather
+/// than a reconstruction from the parsed [`DotCommand`] (which lowercases the
+/// command name and collapses whitespace). Blank lines and mid-statement
+/// continuations record nothing.
+fn history_entry(line: &Line) -> Option<String> {
+    match line {
+        Line::Blank | Line::More => None,
+        Line::Statement(statement) => {
+            let terminator = match statement.terminator {
+                Terminator::Semicolon => ";",
+                Terminator::VerticalG => "\\G",
+            };
+            Some(format!("{}{terminator}", statement.sql))
+        }
+        Line::Dot(_, raw) => Some(raw.clone()),
+    }
 }
 
 /// Runs one dot-command against `session`, returning `true` when the REPL
@@ -638,7 +676,10 @@ mod tests {
     #[test]
     fn dot_line_detected_by_buffer() {
         let mut b = LineBuffer::new();
-        assert!(matches!(b.push(".schema"), Line::Dot(DotCommand::Schema)));
+        assert!(matches!(
+            b.push(".schema"),
+            Line::Dot(DotCommand::Schema, _)
+        ));
     }
     #[test]
     fn refresh_commands_parse() {
@@ -713,5 +754,43 @@ mod tests {
         assert_eq!(parse_dot(".set"), DotCommand::MissingArg("set"));
         assert_eq!(parse_dot(".set table_style"), DotCommand::MissingArg("set"));
         assert_eq!(parse_dot(".unset"), DotCommand::MissingArg("unset"));
+    }
+
+    #[test]
+    fn history_records_one_entry_per_statement_not_per_line() {
+        // Feed a multi-line statement through LineBuffer and assert the
+        // history hook yields exactly one entry equal to the joined statement.
+        let mut b = LineBuffer::new();
+        assert_eq!(history_entry(&b.push("SELECT status")), None); // More
+        assert_eq!(history_entry(&b.push("FROM 'x'")), None); // More
+        let done = b.push("WHERE status = 'draft';"); // Statement
+        let entry = history_entry(&done).expect("a completed statement is recorded");
+        assert!(entry.contains("SELECT status") && entry.contains("WHERE status = 'draft'"));
+        assert!(
+            entry.ends_with(';'),
+            "the terminator is re-appended so the entry is directly re-runnable: {entry:?}"
+        );
+        // a dot-command records one entry; blank records none
+        let mut b2 = LineBuffer::new();
+        assert_eq!(history_entry(&b2.push("")), None);
+        assert!(history_entry(&b2.push(".schema")).is_some());
+    }
+
+    #[test]
+    fn history_entry_for_dot_command_is_the_original_line_verbatim() {
+        // history_entry must not reconstruct dot-command text from the
+        // parsed DotCommand (which lowercases the command and collapses
+        // whitespace) — it should carry the original line through unchanged.
+        let mut b = LineBuffer::new();
+        let entry = history_entry(&b.push("  .FORMAT   json  ")).expect("a dot-command records");
+        assert_eq!(entry, ".FORMAT   json");
+    }
+
+    #[test]
+    fn history_entry_for_vertical_g_statement_reappends_it() {
+        let mut b = LineBuffer::new();
+        let entry =
+            history_entry(&b.push("SELECT 1\\G")).expect("a completed statement is recorded");
+        assert_eq!(entry, "SELECT 1\\G");
     }
 }
