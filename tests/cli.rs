@@ -693,6 +693,65 @@ fn refresh_all_forces_full_rescan_despite_unchanged_mtime_and_size() {
     );
 }
 
+/// MUST-FIX #2 (design W17 + `--refresh` interaction): a narrow one-shot
+/// query's projection push-down `wanted` set must not leak into a
+/// `--refresh <subtree>` alongside it. `build_session` forces `wanted = None`
+/// whenever a refresh flag is present specifically so an out-of-subtree
+/// field a narrow query never asked for still survives in the cache a LATER,
+/// unrelated query reads — this end-to-end run pins that observable
+/// contract; `store::tests::refresh_fallback_preserves_out_of_subtree_fields_when_store_is_unpruned`
+/// (and its loses-the-field companion) pin the exact fallback mechanism the
+/// guard closes.
+#[test]
+fn narrow_query_with_refresh_does_not_lose_out_of_subtree_field_from_cache() {
+    let td = TempDir::new().unwrap();
+    fs::create_dir_all(td.path().join("plans")).unwrap();
+    fs::create_dir_all(td.path().join("product")).unwrap();
+    fs::write(td.path().join("plans/a.md"), "---\nstatus: draft\n---\n").unwrap();
+    fs::write(td.path().join("product/c.md"), "---\nprd: '011'\n---\n").unwrap();
+    let home = TempDir::new().unwrap();
+
+    qm(home.path())
+        .arg("init")
+        .arg(td.path())
+        .assert()
+        .success();
+
+    // A narrow query (`SELECT status` only references "status") combined
+    // with `--refresh plans` — the exact shape whose `wanted` must not reach
+    // `from_cache` un-widened.
+    qm(home.path())
+        .current_dir(td.path())
+        .args([
+            "-e",
+            "SELECT status",
+            "--format",
+            "csv",
+            "--refresh",
+            "plans",
+        ])
+        .assert()
+        .success();
+
+    // A separate, later query for the DIFFERENT, out-of-subtree field must
+    // still find it in the cache the run above left behind.
+    let out = qm(home.path())
+        .current_dir(td.path())
+        .args(["-e", "SELECT prd", "--format", "csv"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    assert_eq!(
+        s.lines().last().unwrap().trim(),
+        "011",
+        "an out-of-subtree field must not be lost from the cache after a \
+         narrow query ran alongside --refresh on a different subtree; got: {s:?}"
+    );
+}
+
 #[test]
 fn refresh_nonexistent_path_exits_nonzero() {
     let td = tree();
@@ -2049,6 +2108,124 @@ fn malformed_queries_file_exits_non_zero_naming_the_path() {
         .assert()
         .failure()
         .stderr(predicates::str::contains("queries.toml"));
+}
+
+// --- Task 3 (W17): projection push-down ---------------------------------
+//
+// A one-shot/`-e`/piped-batch/`query run` invocation knows its statement
+// text before the record store is built, so it materializes only the field
+// VALUES the query references instead of cloning every field of every file.
+// The load-bearing correctness constraint: `store.schema()` (and therefore
+// unknown-column validation + did-you-mean) must stay the FULL field-name
+// union regardless of which values got pruned — see
+// `typo_under_pushdown_still_errors_with_didyoumean` below.
+
+/// THE load-bearing guard: a typo'd column, under push-down, over a vault
+/// whose files have OTHER fields the query never references (`prd`), must
+/// still error naming the typo and suggesting the real field — identical to
+/// pre-push-down behavior. `SELECT staus` references only the literal
+/// (misspelled) field `staus`, so push-down would prune every record down to
+/// zero real values; if validation were derived from the pruned records'
+/// own fields (rather than the store's independently tracked full schema),
+/// the schema would look empty and the typo would silently stop erroring.
+#[test]
+fn typo_under_pushdown_still_errors_with_didyoumean() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["-e", "SELECT staus"])
+        .arg(td.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("unknown column `staus`"))
+        .stderr(predicates::str::contains("did you mean 'status'"));
+}
+
+/// A narrow query's push-down-pruned output must match the SAME column
+/// projected out of a `SELECT *` run, which projects
+/// [`crate::query::ast::SelectExpr::Star`] and so disables push-down
+/// (every field materialized). Same `WHERE`, same fixture -> same rows in
+/// the same order, so this proves pruning `prd`'s value out of every
+/// `Record` never changes what `status` reads as.
+#[test]
+fn pushdown_output_is_byte_identical() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+
+    let narrow = qm(home.path())
+        .args(["-e", "SELECT status WHERE prd = '010'", "--format", "json"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let full = qm(home.path())
+        .args(["-e", "SELECT * WHERE prd = '010'", "--format", "json"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let narrow_rows: Vec<serde_json::Value> = serde_json::from_slice(&narrow).unwrap();
+    let full_rows: Vec<serde_json::Value> = serde_json::from_slice(&full).unwrap();
+    assert_eq!(narrow_rows.len(), full_rows.len());
+    assert!(!narrow_rows.is_empty());
+
+    let projected_from_full: Vec<serde_json::Value> = full_rows
+        .iter()
+        .map(|row| serde_json::json!({ "status": row["status"] }))
+        .collect();
+    assert_eq!(
+        narrow_rows, projected_from_full,
+        "a push-down-pruned narrow query must return the exact same values \
+         a SELECT * run (which disables push-down) returns for that column"
+    );
+}
+
+/// `SELECT *` must disable pruning entirely: every frontmatter field present
+/// on the fixture files (`status`, `prd`) shows up on every row, not just
+/// the columns some OTHER statement in the same run might have referenced.
+#[test]
+fn select_star_disables_pruning() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    let out = qm(home.path())
+        .args(["-e", "SELECT *", "--format", "json"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(&out).unwrap();
+    assert!(!rows.is_empty());
+    for row in &rows {
+        let obj = row.as_object().expect("each row is a JSON object");
+        assert!(obj.contains_key("status"), "row missing status: {row}");
+        assert!(obj.contains_key("prd"), "row missing prd: {row}");
+    }
+}
+
+/// `count(*)` references no field at all, so push-down prunes every value
+/// out of every materialized `Record` — but the row count must still be
+/// correct, since counting rows never needed the field values to begin with.
+#[test]
+fn count_star_pushdown_prunes_all_fields_but_counts_correctly() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    let out = qm(home.path())
+        .args(["-e", "SELECT count(*) AS n", "--format", "csv"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(String::from_utf8(out).unwrap().trim(), "n\n3");
 }
 
 /// Builds a tree with one file each layer of `explain` can attribute an

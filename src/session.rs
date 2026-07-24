@@ -181,10 +181,22 @@ impl Session {
     ///
     /// Parse and execution errors are surfaced as `anyhow` errors carrying
     /// the offending SQL as context.
+    ///
+    /// Validates against `self.store.schema()` — the store's own FULL
+    /// field-name union — rather than [`query::execute`]'s records-derived
+    /// default, since a projection-push-down-pruned store (design W17) may
+    /// hand back records whose own `field_names()` are narrower than the
+    /// store's true schema; see [`query::execute_with_schema`].
     pub fn run(&self, sql: &str) -> anyhow::Result<ResultTable> {
         let query = query::parse(sql).with_context(|| format!("failed to parse query: {sql}"))?;
-        query::execute(&query, self.store.records(), self.settings.lenient.value)
-            .with_context(|| format!("failed to execute query: {sql}"))
+        let schema = self.store.schema();
+        query::execute_with_schema(
+            &query,
+            self.store.records(),
+            &schema,
+            self.settings.lenient.value,
+        )
+        .with_context(|| format!("failed to execute query: {sql}"))
     }
 
     /// Runs `statement` once and returns both its rendered string — in the
@@ -575,7 +587,7 @@ mod tests {
             fs::write(td.path().join(name), body).unwrap();
         }
         let (store, _report) =
-            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default());
+            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default(), None);
         let session = Session::new(
             Box::new(store),
             Settings::default(),
@@ -620,7 +632,7 @@ mod tests {
             fs::write(td.path().join(name), body).unwrap();
         }
         let (store, _report) =
-            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default());
+            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default(), None);
         let session = Session::new(
             Box::new(store),
             Settings::default(),
@@ -661,7 +673,7 @@ mod tests {
             fs::write(td.path().join(name), body).unwrap();
         }
         let (store, _report) =
-            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default());
+            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default(), None);
         let session = Session::new(
             Box::new(store),
             Settings::default(),
@@ -693,7 +705,7 @@ mod tests {
             .unwrap();
         }
         let (store, _report) =
-            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default());
+            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default(), None);
         let session = Session::new(
             Box::new(store),
             Settings::default(),
@@ -726,7 +738,7 @@ mod tests {
             .unwrap();
         }
         let (store, _report) =
-            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default());
+            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default(), None);
         let session = Session::new(
             Box::new(store),
             Settings::default(),
@@ -754,7 +766,7 @@ mod tests {
             fs::write(td.path().join(name), format!("---\ntag: {tag}\n---\n")).unwrap();
         }
         let (store, _report) =
-            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default());
+            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default(), None);
         let session = Session::new(
             Box::new(store),
             Settings::default(),
@@ -782,7 +794,7 @@ mod tests {
         cache::build_vault(td.path(), &WalkOpts::default(), 300).unwrap();
 
         let (store, _report) =
-            InMemoryStore::from_cache(td.path(), WalkOpts::default(), Freshness::PerFile);
+            InMemoryStore::from_cache(td.path(), WalkOpts::default(), Freshness::PerFile, None);
         let mut session = Session::new(
             Box::new(store),
             Settings::default(),
@@ -826,7 +838,7 @@ mod tests {
         fs::write(&a_path, "---\nstatus: draft\n---\n").unwrap();
 
         let (store, _report) =
-            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default());
+            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default(), None);
         let mut session = Session::new(
             Box::new(store),
             Settings::default(),
@@ -863,7 +875,7 @@ mod tests {
         cache::build_vault(&vault, &WalkOpts::default(), 300).unwrap();
 
         let (store, _report) =
-            InMemoryStore::from_cache(&vault, WalkOpts::default(), Freshness::PerFile);
+            InMemoryStore::from_cache(&vault, WalkOpts::default(), Freshness::PerFile, None);
         let mut session = Session::new(
             Box::new(store),
             Settings::default(),
@@ -907,7 +919,7 @@ mod tests {
         cache::build_vault(&vault, &WalkOpts::default(), 300).unwrap();
 
         let (store, _report) =
-            InMemoryStore::from_cache(&vault, WalkOpts::default(), Freshness::PerFile);
+            InMemoryStore::from_cache(&vault, WalkOpts::default(), Freshness::PerFile, None);
         let mut session = Session::new(
             Box::new(store),
             Settings::default(),
@@ -934,7 +946,7 @@ mod tests {
     /// `persist_set_at`/`persist_unset_at` tests below, which exercise the
     /// config-file plumbing rather than querying.
     fn empty_session(settings: Settings, fallback: Settings) -> Session {
-        let (store, _report) = InMemoryStore::load(Vec::new(), WalkOpts::default());
+        let (store, _report) = InMemoryStore::load(Vec::new(), WalkOpts::default(), None);
         Session::new(Box::new(store), settings, fallback, None)
     }
 

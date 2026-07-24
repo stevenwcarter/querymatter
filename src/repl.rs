@@ -1268,8 +1268,11 @@ mod tests {
     /// (which need an actual queryable session, unlike the parsing tests
     /// above).
     fn query_cmd_test_session(dir: &std::path::Path) -> Session {
-        let (store, _report) =
-            InMemoryStore::load(vec![fs::canonicalize(dir).unwrap()], WalkOpts::default());
+        let (store, _report) = InMemoryStore::load(
+            vec![fs::canonicalize(dir).unwrap()],
+            WalkOpts::default(),
+            None,
+        );
         Session::new(
             Box::new(store),
             Settings::default(),

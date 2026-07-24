@@ -8,7 +8,8 @@
 //! `SELECT` item); see [`is_grouped_or_aggregate`] for the dispatch check.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use globset::Glob;
@@ -61,28 +62,48 @@ pub enum ExecError {
 /// Executes `q` against `records`, returning the projected, filtered,
 /// ordered, and limited result.
 ///
-/// Unless `lenient` is set, every column `q` references (see
-/// [`Query::referenced_fields`]) is checked against the schema — the sorted
-/// union of field names across `records` — before the filter/project
-/// pipeline runs, so a typo'd column fails fast with a suggestion rather than
-/// silently reading as `Null` throughout. An empty schema skips this check:
-/// a fresh or empty vault (or one whose only records have explicit-but-empty
-/// frontmatter, e.g. `---\n{}\n---`) has no fields to check against, and
-/// must not fail every query on that account alone.
-///
-/// Dispatches on whether `q` is grouped/aggregate; see
-/// [`is_grouped_or_aggregate`].
+/// Validates against the sorted union of `records`' own field names — see
+/// [`execute_with_schema`], which this delegates to. Suitable whenever every
+/// record passed in still carries every field (direct unit tests below, and
+/// any caller with an unpruned record set); a caller whose records may have
+/// had field VALUES pruned by projection push-down (design W17 — see
+/// [`crate::store`]) must call [`execute_with_schema`] instead, passing the
+/// record store's own [`crate::store::RecordStore::schema`] (always the FULL
+/// field-name union, regardless of pruning) rather than let this function
+/// derive a schema from the (possibly narrowed) `records` it's given.
 pub fn execute<'a>(
     q: &Query,
     records: impl Iterator<Item = &'a Record>,
     lenient: bool,
 ) -> Result<ResultTable, ExecError> {
     let records: Vec<&Record> = records.collect();
-    if !lenient {
-        let schema = sorted_field_union(&records);
-        if !schema.is_empty() {
-            validate_columns(q, &schema)?;
-        }
+    let schema = sorted_field_union(&records);
+    execute_with_schema(q, records.into_iter(), &schema, lenient)
+}
+
+/// Like [`execute`], but validates against an explicit `schema` instead of
+/// one derived from `records`' own field names.
+///
+/// Unless `lenient` is set, every column `q` references (see
+/// [`Query::referenced_fields`]) is checked against `schema` before the
+/// filter/project pipeline runs, so a typo'd column fails fast with a
+/// suggestion rather than silently reading as `Null` throughout. An empty
+/// `schema` skips this check: a fresh or empty vault (or one whose only
+/// records have explicit-but-empty frontmatter, e.g. `---\n{}\n---`) has no
+/// fields to check against, and must not fail every query on that account
+/// alone.
+///
+/// Dispatches on whether `q` is grouped/aggregate; see
+/// [`is_grouped_or_aggregate`].
+pub fn execute_with_schema<'a>(
+    q: &Query,
+    records: impl Iterator<Item = &'a Record>,
+    schema: &[String],
+    lenient: bool,
+) -> Result<ResultTable, ExecError> {
+    let records: Vec<&Record> = records.collect();
+    if !lenient && !schema.is_empty() {
+        validate_columns(q, schema)?;
     }
     if is_grouped_or_aggregate(q) {
         return execute_grouped(q, records.into_iter());
@@ -366,6 +387,27 @@ struct Group<'a> {
 /// Buckets `records` by the tuple of `group_by` column values, in
 /// first-appearance order (the caller sorts for determinism afterward).
 ///
+/// Buckets are found via a `HashMap` keyed on each row's group-by cells,
+/// mapping to the bucket's index in `groups`. Each cell is turned into a
+/// `String` by [`hashable_cell_key`] and the per-cell keys are collected into
+/// a `Vec<String>` rather than joined into one string — this preserves two
+/// boundaries a naive key would lose. Cross-column: e.g. `("ab", "c")` and
+/// `("a", "bc")` never collide, since each cell is hashed separately (same
+/// rationale as [`dedup_rows`]). Cross-variant: e.g. `Value::Int(1)` and
+/// `Value::Str("1")`, or `Value::Null` and `Value::Str("")`, stay in separate
+/// groups even though [`Value::to_cmp_string`] displays them identically,
+/// because [`hashable_cell_key`] also folds in the cell's `Value` variant —
+/// matching the type-distinctness a structural `Vec<Value>` `PartialEq`
+/// comparison would give. [`hashable_cell_key`] also matches that structural
+/// comparison's two other quirks: a `Value::List` cell keys on its elements
+/// recursively rather than `to_cmp_string()`'s lossy `", "`-joined form (so
+/// `[a, b]` and `["a, b"]` land in different groups, like `main`'s `Vec<Value>`
+/// `==` would), and a `Value::Float` cell normalizes `-0.0` to `0.0` before
+/// keying (so `0.0` and `-0.0` land in the SAME group, like `f64`'s `==`).
+/// This keeps bucketing near-linear in `records.len()` even for
+/// high-cardinality group-by columns; a per-row linear scan of existing
+/// groups would be quadratic.
+///
 /// An empty `group_by` means "aggregate over everything": every record —
 /// including none at all — falls into the single group keyed by `[]`, so a
 /// bare `count(*)` still returns one row for an empty input, matching SQL.
@@ -377,20 +419,73 @@ fn group_rows<'a>(records: &[&'a Record], group_by: &[ColRef]) -> Vec<Group<'a>>
         }];
     }
     let mut groups: Vec<Group<'a>> = Vec::new();
+    let mut index: HashMap<Vec<String>, usize> = HashMap::new();
     for &record in records {
         let key: Vec<Value> = group_by
             .iter()
             .map(|col| resolve_col(record, col))
             .collect();
-        match groups.iter_mut().find(|group| group.key == key) {
-            Some(group) => group.rows.push(record),
-            None => groups.push(Group {
-                key,
-                rows: vec![record],
-            }),
+        let hash_key: Vec<String> = key.iter().map(hashable_cell_key).collect();
+        match index.entry(hash_key) {
+            Entry::Occupied(entry) => groups[*entry.get()].rows.push(record),
+            Entry::Vacant(entry) => {
+                entry.insert(groups.len());
+                groups.push(Group {
+                    key,
+                    rows: vec![record],
+                });
+            }
         }
     }
     groups
+}
+
+/// The `HashMap` key for one `GROUP BY` cell, built to agree exactly with
+/// `main`'s structural `Vec<Value>` `PartialEq` over a group-by tuple —
+/// including its two non-obvious cases, `List` and `Float`.
+///
+/// A scalar (`Null`/`Bool`/`Int`/`Str`) keys on its [`Value::variant_name`],
+/// a `\u{1}` separator (which can't appear in a variant name), then its
+/// [`Value::to_cmp_string`] form. The variant prefix is what makes the key
+/// type-distinct: `to_cmp_string()` alone is [`Value::display`], which is
+/// lossy across variants (`Int(1)` and `Str("1")` both display `"1"`; `Null`
+/// and `Str("")` both display `""`), so hashing on it directly would
+/// silently merge groups that structural equality keeps apart.
+///
+/// `Float(f)` normalizes `-0.0` to `0.0` before keying, since `f64`'s
+/// `PartialEq` (and so `Value`'s derived one) treats them as equal —
+/// `to_cmp_string()` alone would key them `"-0"` and `"0"`, splitting one
+/// structural group into two.
+///
+/// `List(items)` recurses into each element's own `hashable_cell_key`
+/// rather than using [`Value::to_cmp_string`]'s `", "`-joined `display()`
+/// form: that join is lossy the same way string concatenation always is —
+/// `[Str("a"), Str("b")]` and `[Str("a, b")]` both display `"a, b"`, so
+/// hashing the joined string would merge two structurally-distinct lists
+/// into one group. Each element's key is instead length-prefixed
+/// (`"<byte-len>\u{1}<key>"`) before being appended, which is what makes the
+/// concatenation collision-free regardless of what characters an element's
+/// own key contains: decoding never needs to guess where one element's key
+/// ends and the next begins.
+fn hashable_cell_key(value: &Value) -> String {
+    match value {
+        Value::List(items) => {
+            let mut key = String::from("List");
+            for item in items {
+                let element = hashable_cell_key(item);
+                key.push('\u{1}');
+                key.push_str(&element.len().to_string());
+                key.push('\u{1}');
+                key.push_str(&element);
+            }
+            key
+        }
+        Value::Float(f) => {
+            let normalized = if *f == 0.0 { 0.0 } else { *f };
+            format!("Float\u{1}{normalized}")
+        }
+        _ => format!("{}\u{1}{}", value.variant_name(), value.to_cmp_string()),
+    }
 }
 
 /// Orders two group-key tuples element-wise via [`order_cmp`] (always
@@ -2116,5 +2211,134 @@ mod agg_tests {
         .unwrap();
         let t = execute(&q, rows.iter(), false).unwrap();
         assert_eq!(t.rows, vec![vec![Value::Str("x".into()), Value::Int(2)]]);
+    }
+    #[test]
+    fn group_by_key_does_not_collide_ambiguous_concatenations() {
+        // Two records whose grouping-column values are ("a","b") and
+        // ("ab","") must form TWO distinct groups, not one — a naive
+        // join-on-empty-sep key would collide them. Pins that the hashed
+        // bucketing keys on the per-cell string vector, not a joined string.
+        let rows = [rec("s/a.md", "a", "b"), rec("s/b.md", "ab", "")];
+        let q = parse("SELECT status, prd, count(*) AS n GROUP BY status, prd").unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec![
+                    Value::Str("a".into()),
+                    Value::Str("b".into()),
+                    Value::Int(1)
+                ],
+                vec![
+                    Value::Str("ab".into()),
+                    Value::Str("".into()),
+                    Value::Int(1)
+                ],
+            ]
+        );
+    }
+    #[test]
+    fn group_by_key_preserves_value_variant_identity() {
+        // Four rows share a single grouping column `n` whose values are
+        // type-distinct but display identically: `Int(1)`/`Str("1")` both
+        // "1", and `Null`/`Str("")` both "". A hash key built from
+        // `Value::to_cmp_string()` alone (display, lossy across variants)
+        // would collapse these into 2 groups; the previous structural
+        // `Vec<Value>` `PartialEq` key — and the fixed hash key — keep all 4
+        // apart.
+        let rows = [
+            rec_n("s/a.md", "x", Value::Int(1)),
+            rec_n("s/b.md", "x", Value::Str("1".into())),
+            rec_n("s/c.md", "x", Value::Null),
+            rec_n("s/d.md", "x", Value::Str("".into())),
+        ];
+        let q = parse("SELECT n, count(*) AS n_count GROUP BY n").unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
+        assert_eq!(t.rows.len(), 4);
+        assert!(t.rows.iter().all(|row| row[1] == Value::Int(1)));
+    }
+
+    /// MUST-FIX #3 (Finding A) characterization: `main`'s GROUP BY key is a
+    /// structural `Vec<Value>` `PartialEq`, under which `[Str("a"),
+    /// Str("b")]` and `[Str("a, b")]` are different — even though
+    /// `Value::display()`'s `", "`-join renders both `"a, b"`, which would
+    /// merge them into one group if `hashable_cell_key` still hashed a
+    /// list's `to_cmp_string()` directly instead of recursing into its
+    /// elements.
+    #[test]
+    fn group_by_list_column_distinguishes_structurally_different_lists() {
+        let rows = [
+            rec_n(
+                "s/a.md",
+                "x",
+                Value::List(vec![Value::Str("a".into()), Value::Str("b".into())]),
+            ),
+            rec_n("s/b.md", "x", Value::List(vec![Value::Str("a, b".into())])),
+        ];
+
+        let q = parse("SELECT n, count(*) AS n_count GROUP BY n").unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
+        assert_eq!(
+            t.rows.len(),
+            2,
+            "[a, b] and [\"a, b\"] must land in different groups, matching \
+             main's structural Vec<Value> equality; got: {:?}",
+            t.rows
+        );
+        assert!(t.rows.iter().all(|row| row[1] == Value::Int(1)));
+    }
+
+    /// MUST-FIX #3 (Finding A) characterization: `f64`'s `PartialEq` (and so
+    /// `Value`'s derived one) treats `0.0 == -0.0`, so `main`'s structural
+    /// GROUP BY key puts them in the SAME group — which `hashable_cell_key`
+    /// would miss without normalizing `-0.0` away, since `"-0"` and `"0"`
+    /// are different strings.
+    #[test]
+    fn group_by_float_column_treats_positive_and_negative_zero_as_one_group() {
+        let rows = [
+            rec_n("s/a.md", "x", Value::Float(0.0)),
+            rec_n("s/b.md", "x", Value::Float(-0.0)),
+        ];
+
+        let q = parse("SELECT n, count(*) AS n_count GROUP BY n").unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
+        assert_eq!(
+            t.rows.len(),
+            1,
+            "0.0 and -0.0 must land in the SAME group, matching main's \
+             structural Value PartialEq; got: {:?}",
+            t.rows
+        );
+        assert_eq!(t.rows[0][1], Value::Int(2));
+    }
+
+    #[test]
+    fn group_by_many_distinct_groups_partitions_all_rows() {
+        // High-cardinality guard for the hash-keyed bucketing: 500 records
+        // each with a unique `status` plus 500 more sharing one `status`
+        // must land in 501 groups with none dropped or merged wrongly, as
+        // cardinality grows past what a linear scan would handle cheaply.
+        let mut rows: Vec<Record> = (0..500)
+            .map(|i| rec(&format!("s/u{i}.md"), &format!("status-{i}"), "010"))
+            .collect();
+        rows.extend((0..500).map(|i| rec(&format!("s/d{i}.md"), "dup", "010")));
+
+        let q = parse("SELECT status, count(*) AS n GROUP BY status").unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
+
+        assert_eq!(t.rows.len(), 501);
+        let total: i64 = t
+            .rows
+            .iter()
+            .filter_map(|row| match &row[1] {
+                Value::Int(n) => Some(*n),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(total, 1000);
+        assert!(
+            t.rows
+                .contains(&vec![Value::Str("dup".into()), Value::Int(500)])
+        );
     }
 }

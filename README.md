@@ -437,6 +437,17 @@ directory that isn't already part of the cached vault matches nothing; it is
 not live-scanned as a fallback. Point `init` at the tree you want covered, or
 pass `--no-cache` for an ad-hoc scan outside it.
 
+### Performance
+
+Two optimizations are transparent — they change speed, never results. A
+large-vault scan (`init`, a live scan, or a cache refresh) spreads each file's
+read+parse across all available cores instead of one, in deterministic
+path-sorted order regardless of thread timing. And a narrow one-shot/batch/
+`query run` query (`-e`, piped stdin, or `query run`) — e.g. `SELECT
+count(*)` or `SELECT status` — materializes only the frontmatter fields it
+actually references, skipping the rest; the full schema (every field name, for
+column validation and `SELECT *`) is still tracked regardless.
+
 ## Configuration
 
 Persistent settings live in a single user-global TOML file. `querymatter config
