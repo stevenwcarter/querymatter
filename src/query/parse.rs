@@ -89,7 +89,7 @@ fn lower_query(query: &sql::Query) -> Result<Query, ParseError> {
         .collect();
 
     let filter = select.selection.as_ref().map(lower_predicate).transpose()?;
-    let group_by = lower_group_by(&select.group_by)?;
+    let group_by = lower_group_by(&select.group_by, &select_items)?;
     let having = lower_having(select.having.as_ref(), &group_by)?;
     let order_by = lower_order_by(query.order_by.as_ref(), &aliases)?;
     let (limit, offset) = lower_limit(query.limit_clause.as_ref())?;
@@ -696,17 +696,54 @@ fn string_literal(expr: &sql::Expr) -> Result<String, ParseError> {
     }
 }
 
-/// Lowers a `GROUP BY` clause into an ordered list of column references.
-fn lower_group_by(group_by: &sql::GroupByExpr) -> Result<Vec<ColRef>, ParseError> {
+/// Lowers a `GROUP BY` clause into an ordered list of column references,
+/// resolving identifiers that match a projection alias via
+/// [`lower_group_by_expr`].
+fn lower_group_by(
+    group_by: &sql::GroupByExpr,
+    select_items: &[SelectItem],
+) -> Result<Vec<ColRef>, ParseError> {
     match group_by {
         sql::GroupByExpr::Expressions(exprs, modifiers) => {
             if !modifiers.is_empty() {
                 return Err(unsupported("GROUP BY modifiers (ROLLUP / CUBE / …)"));
             }
-            exprs.iter().map(lower_col_ref).collect()
+            exprs
+                .iter()
+                .map(|expr| lower_group_by_expr(expr, select_items))
+                .collect()
         }
         sql::GroupByExpr::All(_) => Err(unsupported("GROUP BY ALL")),
     }
+}
+
+/// Lowers a single `GROUP BY` expression. A bare identifier that matches a
+/// `SELECT` alias resolves to that item's underlying column — mirroring
+/// [`lower_order_expr`], the alias wins even when a real field shares the
+/// same name. An alias on an aggregate or a computed expression is not a
+/// valid grouping key, since there is no single column to group rows by.
+/// Anything else (including a `file.*` compound identifier) falls back to
+/// [`lower_col_ref`], so a real frontmatter field is still grouped on
+/// directly.
+fn lower_group_by_expr(
+    expr: &sql::Expr,
+    select_items: &[SelectItem],
+) -> Result<ColRef, ParseError> {
+    if let sql::Expr::Identifier(ident) = expr
+        && let Some(item) = select_items
+            .iter()
+            .find(|item| item.alias.as_deref() == Some(ident.value.as_str()))
+    {
+        return match &item.expr {
+            SelectExpr::Expr(Expr::Col(col)) => Ok(col.clone()),
+            _ => Err(ParseError::BadColumn(format!(
+                "GROUP BY alias `{}` refers to an aggregate or computed \
+                 expression, not a plain column",
+                ident.value
+            ))),
+        };
+    }
+    lower_col_ref(expr)
 }
 
 /// Lowers a `HAVING` clause into a [`Having`] tree, or `None` when the query
@@ -1080,6 +1117,28 @@ mod tests {
         );
         assert_eq!(q.limit, Some(5));
         assert_eq!(q.offset, Some(2));
+    }
+    #[test]
+    fn group_by_resolves_select_alias() {
+        // GROUP BY s resolves through the `status AS s` alias, exactly as
+        // `GROUP BY status` would.
+        let q = parse("SELECT status AS s, count(*) AS n GROUP BY s ORDER BY s").unwrap();
+        assert_eq!(q.group_by, vec![ColRef::Field("status".into())]);
+    }
+    #[test]
+    fn group_by_alias_precedence_over_same_named_field() {
+        // A name that is both a real field and a SELECT alias resolves to
+        // the alias, matching how ORDER BY resolves the same ambiguity.
+        let q = parse("SELECT jira AS status, count(*) AS n GROUP BY status").unwrap();
+        assert_eq!(q.group_by, vec![ColRef::Field("jira".into())]);
+    }
+    #[test]
+    fn group_by_alias_on_aggregate_or_expr_is_rejected() {
+        assert!(parse("SELECT count(*) AS n GROUP BY n").is_err());
+    }
+    #[test]
+    fn group_by_alias_on_computed_expr_is_rejected() {
+        assert!(parse("SELECT lower(status) AS lx GROUP BY lx").is_err());
     }
     #[test]
     fn from_quoted_glob_is_stripped() {
