@@ -9,6 +9,7 @@
 
 pub mod cache;
 mod cli;
+mod config;
 pub mod discover;
 pub mod frontmatter;
 mod gitignore;
