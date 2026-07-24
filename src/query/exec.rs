@@ -8,7 +8,8 @@
 //! `SELECT` item); see [`is_grouped_or_aggregate`] for the dispatch check.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use globset::Glob;
@@ -366,6 +367,14 @@ struct Group<'a> {
 /// Buckets `records` by the tuple of `group_by` column values, in
 /// first-appearance order (the caller sorts for determinism afterward).
 ///
+/// Buckets are found via a `HashMap` keyed on each row's group-by cells'
+/// [`Value::to_cmp_string`] form — collected per-cell into a `Vec<String>`
+/// rather than joined into one string, same rationale as [`dedup_rows`], so
+/// e.g. `("ab", "c")` and `("a", "bc")` never collide — mapping to the
+/// bucket's index in `groups`. This keeps bucketing near-linear in
+/// `records.len()` even for high-cardinality group-by columns; a per-row
+/// linear scan of existing groups would be quadratic.
+///
 /// An empty `group_by` means "aggregate over everything": every record —
 /// including none at all — falls into the single group keyed by `[]`, so a
 /// bare `count(*)` still returns one row for an empty input, matching SQL.
@@ -377,17 +386,22 @@ fn group_rows<'a>(records: &[&'a Record], group_by: &[ColRef]) -> Vec<Group<'a>>
         }];
     }
     let mut groups: Vec<Group<'a>> = Vec::new();
+    let mut index: HashMap<Vec<String>, usize> = HashMap::new();
     for &record in records {
         let key: Vec<Value> = group_by
             .iter()
             .map(|col| resolve_col(record, col))
             .collect();
-        match groups.iter_mut().find(|group| group.key == key) {
-            Some(group) => group.rows.push(record),
-            None => groups.push(Group {
-                key,
-                rows: vec![record],
-            }),
+        let hash_key: Vec<String> = key.iter().map(Value::to_cmp_string).collect();
+        match index.entry(hash_key) {
+            Entry::Occupied(entry) => groups[*entry.get()].rows.push(record),
+            Entry::Vacant(entry) => {
+                entry.insert(groups.len());
+                groups.push(Group {
+                    key,
+                    rows: vec![record],
+                });
+            }
         }
     }
     groups
@@ -2116,5 +2130,59 @@ mod agg_tests {
         .unwrap();
         let t = execute(&q, rows.iter(), false).unwrap();
         assert_eq!(t.rows, vec![vec![Value::Str("x".into()), Value::Int(2)]]);
+    }
+    #[test]
+    fn group_by_key_does_not_collide_ambiguous_concatenations() {
+        // Two records whose grouping-column values are ("a","b") and
+        // ("ab","") must form TWO distinct groups, not one — a naive
+        // join-on-empty-sep key would collide them. Pins that the hashed
+        // bucketing keys on the per-cell string vector, not a joined string.
+        let rows = [rec("s/a.md", "a", "b"), rec("s/b.md", "ab", "")];
+        let q = parse("SELECT status, prd, count(*) AS n GROUP BY status, prd").unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec![
+                    Value::Str("a".into()),
+                    Value::Str("b".into()),
+                    Value::Int(1)
+                ],
+                vec![
+                    Value::Str("ab".into()),
+                    Value::Str("".into()),
+                    Value::Int(1)
+                ],
+            ]
+        );
+    }
+    #[test]
+    fn group_by_many_distinct_groups_partitions_all_rows() {
+        // High-cardinality guard for the hash-keyed bucketing: 500 records
+        // each with a unique `status` plus 500 more sharing one `status`
+        // must land in 501 groups with none dropped or merged wrongly, as
+        // cardinality grows past what a linear scan would handle cheaply.
+        let mut rows: Vec<Record> = (0..500)
+            .map(|i| rec(&format!("s/u{i}.md"), &format!("status-{i}"), "010"))
+            .collect();
+        rows.extend((0..500).map(|i| rec(&format!("s/d{i}.md"), "dup", "010")));
+
+        let q = parse("SELECT status, count(*) AS n GROUP BY status").unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
+
+        assert_eq!(t.rows.len(), 501);
+        let total: i64 = t
+            .rows
+            .iter()
+            .filter_map(|row| match &row[1] {
+                Value::Int(n) => Some(*n),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(total, 1000);
+        assert!(
+            t.rows
+                .contains(&vec![Value::Str("dup".into()), Value::Int(500)])
+        );
     }
 }
