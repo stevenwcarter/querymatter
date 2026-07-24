@@ -71,7 +71,7 @@ fn lower_query(query: &sql::Query) -> Result<Query, ParseError> {
         sql::SetExpr::SetOperation { .. } => {
             return Err(unsupported("set operations (UNION / INTERSECT / EXCEPT)"));
         }
-        other => return Err(unsupported(format!("query body: {other:?}"))),
+        _ => return Err(unsupported("this query form")),
     };
 
     reject_unsupported_select_clauses(select)?;
@@ -169,9 +169,7 @@ fn lower_from(from: &[sql::TableWithJoins]) -> Result<Option<String>, ParseError
             }
             match &single.relation {
                 sql::TableFactor::Table { name, .. } => Ok(Some(object_name_to_string(name))),
-                other => Err(unsupported(format!(
-                    "FROM must be a bare identifier or quoted glob, found {other:?}"
-                ))),
+                _ => Err(unsupported("FROM must be a bare identifier or quoted glob")),
             }
         }
         _ => Err(unsupported("multiple tables in FROM")),
@@ -254,7 +252,7 @@ fn lower_count(func: &sql::Function) -> Result<Aggregate, ParseError> {
         sql::FunctionArg::Unnamed(sql::FunctionArgExpr::Expr(expr)) => {
             Ok(Aggregate::Count(lower_col_ref(expr)?, distinct))
         }
-        other => Err(unsupported(format!("count argument: {other:?}"))),
+        _ => Err(unsupported("this count(...) argument")),
     }
 }
 
@@ -266,7 +264,7 @@ fn single_col_arg(func: &sql::Function, name: &str) -> Result<ColRef, ParseError
     };
     match arg {
         sql::FunctionArg::Unnamed(sql::FunctionArgExpr::Expr(expr)) => lower_col_ref(expr),
-        other => Err(unsupported(format!("{name} argument: {other:?}"))),
+        _ => Err(unsupported(format!("this {name}(...) argument"))),
     }
 }
 
@@ -294,7 +292,7 @@ fn lower_col_ref(expr: &sql::Expr) -> Result<ColRef, ParseError> {
         sql::Expr::Identifier(ident) => Ok(ColRef::Field(ident.value.clone())),
         sql::Expr::CompoundIdentifier(parts) => lower_compound(parts),
         other => Err(ParseError::BadColumn(format!(
-            "expected a column reference, found {other}"
+            "expected a column reference, found unsupported expression `{other}`"
         ))),
     }
 }
@@ -358,7 +356,7 @@ fn lower_predicate(expr: &sql::Expr) -> Result<Predicate, ParseError> {
             op: sql::UnaryOperator::Not,
             expr,
         } => Ok(Predicate::Not(Box::new(lower_predicate(expr)?))),
-        other => Err(unsupported(format!("WHERE expression: {other:?}"))),
+        _ => Err(unsupported("this WHERE expression")),
     }
 }
 
@@ -410,7 +408,7 @@ fn lower_literal(expr: &sql::Expr) -> Result<Literal, ParseError> {
             op: sql::UnaryOperator::Plus,
             expr,
         } => lower_literal(expr),
-        other => Err(unsupported(format!("expected a literal, found {other:?}"))),
+        _ => Err(unsupported("this literal value")),
     }
 }
 
@@ -419,7 +417,7 @@ fn negate_literal(expr: &sql::Expr) -> Result<Literal, ParseError> {
     match lower_literal(expr)? {
         Literal::Int(i) => Ok(Literal::Int(-i)),
         Literal::Float(f) => Ok(Literal::Float(-f)),
-        other => Err(unsupported(format!("cannot negate {other:?}"))),
+        _ => Err(unsupported("negating a non-numeric literal")),
     }
 }
 
@@ -436,7 +434,7 @@ fn value_to_literal(value: &sql::Value) -> Result<Literal, ParseError> {
         | sql::Value::NationalStringLiteral(s) => Ok(Literal::Str(s.clone())),
         sql::Value::Boolean(b) => Ok(Literal::Bool(*b)),
         sql::Value::Null => Ok(Literal::Null),
-        other => Err(unsupported(format!("value literal: {other:?}"))),
+        _ => Err(unsupported("this literal value")),
     }
 }
 
@@ -456,9 +454,7 @@ fn parse_number(n: &str) -> Result<Literal, ParseError> {
 fn string_literal(expr: &sql::Expr) -> Result<String, ParseError> {
     match lower_literal(expr)? {
         Literal::Str(s) => Ok(s),
-        other => Err(unsupported(format!(
-            "LIKE pattern must be a string, found {other:?}"
-        ))),
+        _ => Err(unsupported("LIKE pattern must be a string")),
     }
 }
 
@@ -539,9 +535,7 @@ fn lower_limit(
 fn expr_to_usize(expr: &sql::Expr) -> Result<usize, ParseError> {
     match lower_literal(expr)? {
         Literal::Int(i) if i >= 0 => Ok(i as usize),
-        other => Err(unsupported(format!(
-            "expected a non-negative integer, found {other:?}"
-        ))),
+        _ => Err(unsupported("expected a non-negative integer")),
     }
 }
 
@@ -836,5 +830,29 @@ mod tests {
     fn prewhere_and_qualify_are_rejected() {
         assert!(parse("SELECT jira PREWHERE status = 'x'").is_err());
         assert!(parse("SELECT jira QUALIFY prd = 1").is_err());
+    }
+
+    /// Unsupported constructs must produce a human phrase, never a raw
+    /// sqlparser AST Debug dump (which contains struct-literal braces).
+    #[test]
+    fn unsupported_messages_have_no_ast_debug_dump() {
+        // A CAST in WHERE, a subquery, and a non-literal IN value all route
+        // through catch-all arms that used to `{:?}` the node.
+        for sql in [
+            "SELECT status WHERE CAST(prd AS INT) = 1",
+            "SELECT status WHERE status IN (SELECT status)",
+            "SELECT status WHERE status = status + 1",
+        ] {
+            let err = crate::query::parse(sql).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                !msg.contains('{') && !msg.contains('}'),
+                "message leaked an AST dump for {sql:?}: {msg}"
+            );
+            assert!(
+                msg.to_lowercase().contains("support"),
+                "message should say what isn't supported for {sql:?}: {msg}"
+            );
+        }
     }
 }
