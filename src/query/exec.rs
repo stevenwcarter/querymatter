@@ -9,15 +9,17 @@
 
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use globset::Glob;
+use indexmap::IndexMap;
 use regex::Regex;
 
 use crate::model::{FileAttr, Record, Value, compare_values};
 use crate::query::ResultTable;
 use crate::query::ast::{
-    Aggregate, CmpOp, ColRef, Literal, OrderKey, OrderTarget, Predicate, Query, SelectExpr,
-    SelectItem,
+    Aggregate, BinOp, CmpOp, ColRef, Expr, Literal, OrderKey, OrderTarget, Predicate, Query,
+    ScalarFn, SelectExpr, SelectItem,
 };
 
 /// An error that can occur while executing a parsed [`Query`].
@@ -95,7 +97,7 @@ fn execute_ungrouped<'a>(
         .map(|record| {
             let row = columns
                 .iter()
-                .map(|(_, col)| resolve_col(record, col))
+                .map(|(_, expr)| eval_expr(record, expr))
                 .collect();
             (record, row)
         })
@@ -176,17 +178,23 @@ fn execute_grouped<'a>(
     Ok(ResultTable { headers, rows })
 }
 
-/// A validated grouped `SELECT` item: SQL only allows projecting a grouping
-/// key or an aggregate once `GROUP BY` (or a bare aggregate) is in play.
+/// A validated grouped `SELECT` item: SQL only allows projecting a
+/// non-aggregate expression built entirely from grouping-key columns (and
+/// literals), or an aggregate, once `GROUP BY` (or a bare aggregate) is in
+/// play.
 enum GroupedSelectItem {
-    /// Index into `group_by` (and thus into a group's key tuple).
-    Key(usize),
+    /// A non-aggregate expression, evaluated over the group's representative
+    /// row (see [`project_group`]); every column it references is one of
+    /// `group_by`'s keys, so any row in the group yields the same value.
+    Expr(Expr),
     /// An aggregate to compute over the group's rows.
     Agg(Aggregate),
 }
 
-/// Validates `q.select` for the grouped path: every non-aggregate item must
-/// be a `ColRef` that also appears in `q.group_by`; anything else — a column
+/// Validates `q.select` for the grouped path: every non-aggregate item's
+/// expression must reference only columns that also appear in `q.group_by`
+/// (a bare grouping-key column trivially satisfies this, and so does a
+/// column-free literal/computed expression); anything else — a column
 /// outside the grouping keys, or `*` — is rejected, since neither reduces to
 /// a single value per group.
 fn validate_grouped_select(q: &Query) -> Result<Vec<GroupedSelectItem>, ExecError> {
@@ -194,15 +202,32 @@ fn validate_grouped_select(q: &Query) -> Result<Vec<GroupedSelectItem>, ExecErro
         .iter()
         .map(|item| match &item.expr {
             SelectExpr::Agg(agg) => Ok(GroupedSelectItem::Agg(agg.clone())),
-            SelectExpr::Col(col) => q
-                .group_by
-                .iter()
-                .position(|key| key == col)
-                .map(GroupedSelectItem::Key)
-                .ok_or_else(|| ExecError::NonGroupedColumn(item.header())),
+            SelectExpr::Expr(expr) => {
+                if expr_columns(expr)
+                    .into_iter()
+                    .all(|col| q.group_by.contains(col))
+                {
+                    Ok(GroupedSelectItem::Expr(expr.clone()))
+                } else {
+                    Err(ExecError::NonGroupedColumn(item.header()))
+                }
+            }
             SelectExpr::Star => Err(ExecError::NonGroupedColumn(item.header())),
         })
         .collect()
+}
+
+/// Every column (frontmatter field or `file.*`) that `expr` references,
+/// walking scalar-function arguments and binary operands. Used by
+/// [`validate_grouped_select`] to check that a non-aggregate `SELECT`
+/// expression is composed entirely of grouping-key columns.
+fn expr_columns(expr: &Expr) -> Vec<&ColRef> {
+    match expr {
+        Expr::Col(col) => vec![col],
+        Expr::Lit(_) => Vec::new(),
+        Expr::Scalar(_, args) => args.iter().flat_map(expr_columns).collect(),
+        Expr::Binary(_, l, r) => expr_columns(l).into_iter().chain(expr_columns(r)).collect(),
+    }
 }
 
 /// One `GROUP BY` bucket: its key tuple (the `group_by` columns' shared
@@ -253,16 +278,36 @@ fn compare_key_tuple(a: &[Value], b: &[Value]) -> Ordering {
         .unwrap_or(Ordering::Equal)
 }
 
-/// Projects one group's row: a grouping key becomes its key-tuple value, an
-/// aggregate is computed over the group's records.
+/// Projects one group's row: a non-aggregate expression is evaluated over
+/// the group's representative row, an aggregate is computed over the
+/// group's records.
 fn project_group(group: &Group<'_>, items: &[GroupedSelectItem]) -> Vec<Value> {
     items
         .iter()
         .map(|item| match item {
-            GroupedSelectItem::Key(idx) => group.key[*idx].clone(),
+            GroupedSelectItem::Expr(expr) => eval_group_expr(&group.rows, expr),
             GroupedSelectItem::Agg(agg) => compute_aggregate(agg, &group.rows),
         })
         .collect()
+}
+
+/// Evaluates a validated grouped-`SELECT` expression against the group's
+/// representative row (its first record). `rows` is empty only for the
+/// zero-row "aggregate over nothing" bucket (empty `GROUP BY`, no matching
+/// records — see [`group_rows`]); [`validate_grouped_select`] guarantees a
+/// `SELECT` expression surviving that bucket references no columns, so
+/// evaluating it against a fieldless stand-in record is safe.
+fn eval_group_expr(rows: &[&Record], expr: &Expr) -> Value {
+    match rows.first() {
+        Some(record) => eval_expr(record, expr),
+        None => eval_expr(&empty_record(), expr),
+    }
+}
+
+/// A fieldless record with no `file.*` identity, used only as the
+/// evaluation context in [`eval_group_expr`]'s zero-row fallback.
+fn empty_record() -> Record {
+    Record::new(Path::new(""), Path::new(""), IndexMap::new())
 }
 
 /// Computes one aggregate function's value over a group's rows.
@@ -367,7 +412,7 @@ fn resolve_group_order_targets(
 /// header, for a `NonGroupedColumn` message about an `ORDER BY` column.
 fn col_header(col: &ColRef) -> String {
     SelectItem {
-        expr: SelectExpr::Col(col.clone()),
+        expr: SelectExpr::Expr(Expr::Col(col.clone())),
         alias: None,
     }
     .header()
@@ -402,21 +447,22 @@ fn filter_by_glob<'a>(
         .collect())
 }
 
-/// Expands `q.select` into a flat list of `(header, column)` pairs, resolving
-/// `SelectExpr::Star` to the sorted union of `filtered`'s field names.
+/// Expands `q.select` into a flat list of `(header, expr)` pairs, resolving
+/// `SelectExpr::Star` to the sorted union of `filtered`'s field names (each
+/// becoming a bare `Expr::Col`).
 ///
 /// Aggregate select items cannot appear here: [`execute`] routes queries
 /// containing one to the grouped path before this function runs.
-fn expand_select(q: &Query, filtered: &[&Record]) -> Vec<(String, ColRef)> {
+fn expand_select(q: &Query, filtered: &[&Record]) -> Vec<(String, Expr)> {
     let mut columns = Vec::with_capacity(q.select.len());
     for item in &q.select {
         match &item.expr {
             SelectExpr::Star => {
                 for name in sorted_field_union(filtered) {
-                    columns.push((name.clone(), ColRef::Field(name)));
+                    columns.push((name.clone(), Expr::Col(ColRef::Field(name))));
                 }
             }
-            SelectExpr::Col(col) => columns.push((item.header(), col.clone())),
+            SelectExpr::Expr(expr) => columns.push((item.header(), expr.clone())),
             SelectExpr::Agg(_) => {
                 unreachable!("execute() routes aggregate SELECT items to execute_grouped")
             }
@@ -436,6 +482,142 @@ fn resolve_col(record: &Record, col: &ColRef) -> Value {
     match col {
         ColRef::Field(name) => record.field(name),
         ColRef::File(attr) => record.file_attr(*attr),
+    }
+}
+
+/// Evaluates a scalar expression against `record`: a column/`file.*`
+/// pseudo-column resolves via [`resolve_col`], a literal evaluates to its
+/// `Value`, a scalar-function call evaluates its arguments first then
+/// applies [`apply_scalar`], and a binary op evaluates both sides then
+/// applies [`apply_binary`]. Used by both the ungrouped projection (per row,
+/// [`expand_select`]) and the grouped projection (over a group's
+/// representative row, [`eval_group_expr`]).
+pub(crate) fn eval_expr(record: &Record, expr: &Expr) -> Value {
+    match expr {
+        Expr::Col(col) => resolve_col(record, col),
+        Expr::Lit(lit) => literal_value(lit),
+        Expr::Scalar(f, args) => {
+            let values: Vec<Value> = args.iter().map(|arg| eval_expr(record, arg)).collect();
+            apply_scalar(f.clone(), &values)
+        }
+        Expr::Binary(op, left, right) => {
+            let l = eval_expr(record, left);
+            let r = eval_expr(record, right);
+            apply_binary(op.clone(), &l, &r)
+        }
+    }
+}
+
+/// Converts a literal constant to the `Value` it evaluates to.
+fn literal_value(lit: &Literal) -> Value {
+    match lit {
+        Literal::Str(s) => Value::Str(s.clone()),
+        Literal::Int(i) => Value::Int(*i),
+        Literal::Float(f) => Value::Float(*f),
+        Literal::Bool(b) => Value::Bool(*b),
+        Literal::Null => Value::Null,
+    }
+}
+
+/// Applies a scalar string function to its already-evaluated arguments.
+///
+/// A non-string argument stringifies via [`Value::display`] first — the same
+/// conversion the renderer uses — so a field renders identically whether
+/// selected bare or wrapped in e.g. `lower(...)`. Any `Null` argument
+/// short-circuits the whole call to `Null` (SQL-standard scalar null
+/// propagation). Argument count is validated at parse time
+/// (`parse::check_scalar_arity`), so a mismatch reaching here is a bug
+/// upstream rather than bad user input.
+pub(crate) fn apply_scalar(f: ScalarFn, args: &[Value]) -> Value {
+    if args.iter().any(Value::is_null) {
+        return Value::Null;
+    }
+    match (f, args) {
+        (ScalarFn::Lower, [s]) => Value::Str(s.display().to_lowercase()),
+        (ScalarFn::Upper, [s]) => Value::Str(s.display().to_uppercase()),
+        (ScalarFn::Length, [s]) => Value::Int(s.display().chars().count() as i64),
+        (ScalarFn::Trim, [s]) => Value::Str(s.display().trim().to_string()),
+        (ScalarFn::Ltrim, [s]) => Value::Str(s.display().trim_start().to_string()),
+        (ScalarFn::Rtrim, [s]) => Value::Str(s.display().trim_end().to_string()),
+        (ScalarFn::Substr, [s, start]) => substr(&s.display(), start, None),
+        (ScalarFn::Substr, [s, start, len]) => substr(&s.display(), start, Some(len)),
+        (ScalarFn::Replace, [s, from, to]) => {
+            Value::Str(s.display().replace(&from.display(), &to.display()))
+        }
+        (f, args) => unreachable!("apply_scalar: {f:?} called with {} argument(s)", args.len()),
+    }
+}
+
+/// `substr(s, start[, len])`: 1-based, char-indexed, clamped to `s`'s
+/// bounds; an out-of-range or non-numeric `start` yields `""`, and so does a
+/// non-numeric `len`.
+fn substr(s: &str, start: &Value, len: Option<&Value>) -> Value {
+    let Some(start) = start.as_number() else {
+        return Value::Str(String::new());
+    };
+    let chars: Vec<char> = s.chars().collect();
+    let from = (start as i64 - 1).max(0) as usize;
+    if from >= chars.len() {
+        return Value::Str(String::new());
+    }
+    let to = match len {
+        None => chars.len(),
+        Some(len) => match len.as_number() {
+            Some(n) => (from + (n.max(0.0) as usize)).min(chars.len()),
+            None => from,
+        },
+    };
+    Value::Str(chars[from..to.max(from)].iter().collect())
+}
+
+/// Applies an arithmetic or concatenation operator to two already-evaluated
+/// operands, under SQL 3-valued null propagation.
+///
+/// **Concat** (`||`) stringifies each operand via [`Value::display`] — the
+/// same conversion the renderer uses — and joins them; either operand
+/// `Null` yields `Null`.
+///
+/// **Arithmetic** (`+ - * / %`) coerces both operands to numbers the same
+/// way [`eval_compare`]'s numeric-literal comparison does; a non-numeric
+/// operand yields `Null` rather than a type error, and so does either
+/// operand being `Null`. Two `Int`s stay `Int` for `+ - * %`; `/` always
+/// promotes to `Float`; either operand being `Float` also promotes the
+/// result to `Float`. Divide/modulo by zero yields `Null` rather than
+/// panicking.
+pub(crate) fn apply_binary(op: BinOp, l: &Value, r: &Value) -> Value {
+    if op == BinOp::Concat {
+        return match (l.is_null(), r.is_null()) {
+            (false, false) => Value::Str(format!("{}{}", l.display(), r.display())),
+            _ => Value::Null,
+        };
+    }
+    if l.is_null() || r.is_null() {
+        return Value::Null;
+    }
+    let (Some(lv), Some(rv)) = (l.as_number(), r.as_number()) else {
+        return Value::Null;
+    };
+    let is_float = matches!(l, Value::Float(_)) || matches!(r, Value::Float(_));
+    match op {
+        BinOp::Add => numeric_result(lv + rv, is_float),
+        BinOp::Sub => numeric_result(lv - rv, is_float),
+        BinOp::Mul => numeric_result(lv * rv, is_float),
+        BinOp::Div if rv == 0.0 => Value::Null,
+        BinOp::Div => Value::Float(lv / rv),
+        BinOp::Mod if rv == 0.0 => Value::Null,
+        BinOp::Mod => numeric_result(lv % rv, is_float),
+        BinOp::Concat => unreachable!("apply_binary routes Concat separately, above"),
+    }
+}
+
+/// Wraps an arithmetic result as `Int` when both operands were integral,
+/// else `Float` — mirrors SQL's type-promotion rule that any `Float`
+/// operand promotes the result.
+fn numeric_result(v: f64, is_float: bool) -> Value {
+    if is_float {
+        Value::Float(v)
+    } else {
+        Value::Int(v as i64)
     }
 }
 
@@ -630,6 +812,7 @@ fn order_cmp(a: &Value, b: &Value, desc: bool) -> Ordering {
 mod tests {
     use super::*;
     use crate::model::{Record, Value};
+    use crate::query::ast::{BinOp, ScalarFn};
     use crate::query::parse::parse;
     use indexmap::IndexMap;
     use std::path::Path;
@@ -668,6 +851,130 @@ mod tests {
                 ],
             ),
         ]
+    }
+
+    #[test]
+    fn scalar_string_functions() {
+        let s = |t: &str| Value::Str(t.into());
+        assert_eq!(apply_scalar(ScalarFn::Lower, &[s("DrAfT")]), s("draft"));
+        assert_eq!(apply_scalar(ScalarFn::Upper, &[s("draft")]), s("DRAFT"));
+        assert_eq!(apply_scalar(ScalarFn::Length, &[s("héllo")]), Value::Int(5));
+        assert_eq!(apply_scalar(ScalarFn::Trim, &[s("  x  ")]), s("x"));
+        assert_eq!(apply_scalar(ScalarFn::Ltrim, &[s("  x  ")]), s("x  "));
+        assert_eq!(apply_scalar(ScalarFn::Rtrim, &[s("  x  ")]), s("  x"));
+        assert_eq!(
+            apply_scalar(
+                ScalarFn::Substr,
+                &[s("abcdef"), Value::Int(2), Value::Int(3)]
+            ),
+            s("bcd")
+        );
+        assert_eq!(
+            apply_scalar(ScalarFn::Substr, &[s("abcdef"), Value::Int(4)]),
+            s("def")
+        );
+        assert_eq!(
+            apply_scalar(ScalarFn::Replace, &[s("a-b-c"), s("-"), s("_")]),
+            s("a_b_c")
+        );
+    }
+
+    #[test]
+    fn scalar_null_propagates_and_stringifies_numbers() {
+        assert_eq!(apply_scalar(ScalarFn::Lower, &[Value::Null]), Value::Null);
+        // a non-string arg stringifies first (same conversion the renderer uses)
+        assert_eq!(
+            apply_scalar(ScalarFn::Length, &[Value::Int(100)]),
+            Value::Int(3)
+        );
+    }
+
+    #[test]
+    fn substr_clamps_out_of_range() {
+        let s = |t: &str| Value::Str(t.into());
+        assert_eq!(
+            apply_scalar(ScalarFn::Substr, &[s("abc"), Value::Int(10)]),
+            s("")
+        );
+        assert_eq!(
+            apply_scalar(ScalarFn::Substr, &[s("abc"), Value::Int(1), Value::Int(99)]),
+            s("abc")
+        );
+    }
+
+    #[test]
+    fn arithmetic_types_and_null_safety() {
+        assert_eq!(
+            apply_binary(BinOp::Add, &Value::Int(2), &Value::Int(3)),
+            Value::Int(5)
+        );
+        assert_eq!(
+            apply_binary(BinOp::Div, &Value::Int(3), &Value::Int(2)),
+            Value::Float(1.5)
+        );
+        assert_eq!(
+            apply_binary(BinOp::Mul, &Value::Int(2), &Value::Float(1.5)),
+            Value::Float(3.0)
+        );
+        assert_eq!(
+            apply_binary(BinOp::Div, &Value::Int(1), &Value::Int(0)),
+            Value::Null
+        );
+        assert_eq!(
+            apply_binary(BinOp::Mod, &Value::Int(1), &Value::Int(0)),
+            Value::Null
+        );
+        assert_eq!(
+            apply_binary(BinOp::Add, &Value::Null, &Value::Int(1)),
+            Value::Null
+        );
+        assert_eq!(
+            apply_binary(BinOp::Add, &Value::Str("x".into()), &Value::Int(1)),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn concat_joins_and_propagates_null() {
+        assert_eq!(
+            apply_binary(BinOp::Concat, &Value::Str("a".into()), &Value::Int(1)),
+            Value::Str("a1".into())
+        );
+        assert_eq!(
+            apply_binary(BinOp::Concat, &Value::Str("a".into()), &Value::Null),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn select_scalar_and_arithmetic_round_trip() {
+        let rows = [rec(
+            "s",
+            "s/a.md",
+            &[
+                ("status", Value::Str("Draft".into())),
+                ("a", Value::Int(3)),
+                ("b", Value::Int(2)),
+            ],
+        )];
+
+        let lower = parse("SELECT lower(status)").unwrap();
+        assert_eq!(
+            execute(&lower, rows.iter()).unwrap().rows,
+            vec![vec![Value::Str("draft".into())]]
+        );
+
+        let div = parse("SELECT (a / b) AS r").unwrap();
+        assert_eq!(
+            execute(&div, rows.iter()).unwrap().rows,
+            vec![vec![Value::Float(1.5)]]
+        );
+
+        let concat = parse("SELECT a || '-' || status").unwrap();
+        assert_eq!(
+            execute(&concat, rows.iter()).unwrap().rows,
+            vec![vec![Value::Str("3-Draft".into())]]
+        );
     }
 
     #[test]
@@ -886,6 +1193,41 @@ mod agg_tests {
             execute(&q, recs().iter()),
             Err(ExecError::NonGroupedColumn(_))
         ));
+    }
+    #[test]
+    fn grouped_select_expr_over_grouping_key() {
+        // `lower(status)` is valid because `status` is a GROUP BY key;
+        // it's evaluated over each group's representative row.
+        let q =
+            parse("SELECT lower(status), count(*) AS n GROUP BY status ORDER BY status").unwrap();
+        let t = execute(&q, recs().iter()).unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec![Value::Str("draft".into()), Value::Int(1)],
+                vec![Value::Str("synced".into()), Value::Int(2)],
+            ]
+        );
+    }
+    #[test]
+    fn grouped_select_expr_referencing_non_group_key_errors() {
+        // `prd` isn't a GROUP BY key; wrapping it in `lower(...)` must still
+        // be rejected — validation walks into scalar/arithmetic
+        // sub-expressions, not just bare columns.
+        let q = parse("SELECT lower(prd), count(*) GROUP BY status").unwrap();
+        assert!(matches!(
+            execute(&q, recs().iter()),
+            Err(ExecError::NonGroupedColumn(_))
+        ));
+    }
+    #[test]
+    fn grouped_literal_expr_survives_zero_row_aggregate_bucket() {
+        // A columnless computed expression must still evaluate correctly
+        // even when the implicit single group (empty GROUP BY) has zero
+        // rows to use as a representative.
+        let q = parse("SELECT 1 + 1 AS two, count(*) AS n WHERE status = 'nope'").unwrap();
+        let t = execute(&q, recs().iter()).unwrap();
+        assert_eq!(t.rows, vec![vec![Value::Int(2), Value::Int(0)]]);
     }
     #[test]
     fn sum_and_avg_over_numeric_column() {

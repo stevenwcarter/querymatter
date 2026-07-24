@@ -23,8 +23,8 @@ use sqlparser::parser::Parser;
 
 use crate::model::FileAttr;
 use crate::query::ast::{
-    Aggregate, CmpOp, ColRef, Literal, OrderKey, OrderTarget, Predicate, Query, SelectExpr,
-    SelectItem,
+    Aggregate, BinOp, CmpOp, ColRef, Expr, Literal, OrderKey, OrderTarget, Predicate, Query,
+    ScalarFn, SelectExpr, SelectItem,
 };
 
 /// An error produced while parsing or lowering a query.
@@ -198,13 +198,28 @@ fn lower_select_item(item: &sql::SelectItem) -> Result<SelectItem, ParseError> {
     }
 }
 
-/// Lowers a projection expression to a [`SelectExpr`] (a column or aggregate;
-/// the `*` wildcard is handled one level up in [`lower_select_item`]).
+/// Lowers a projection expression to a [`SelectExpr`]: a bare aggregate call
+/// stays [`SelectExpr::Agg`]; everything else — a column, literal, scalar
+/// function, or arithmetic/concat expression — lowers via [`lower_expr`].
+/// The `*` wildcard is handled one level up in [`lower_select_item`].
 fn lower_select_expr(expr: &sql::Expr) -> Result<SelectExpr, ParseError> {
-    match expr {
-        sql::Expr::Function(func) => Ok(SelectExpr::Agg(lower_aggregate(func)?)),
-        other => Ok(SelectExpr::Col(lower_col_ref(other)?)),
+    if let sql::Expr::Function(func) = expr {
+        let name = object_name_to_string(&func.name).to_ascii_lowercase();
+        if is_aggregate_name(&name) {
+            return Ok(SelectExpr::Agg(lower_aggregate(func)?));
+        }
     }
+    Ok(SelectExpr::Expr(lower_expr(expr)?))
+}
+
+/// True for the six aggregate function names, shared between the top-level
+/// `SELECT` dispatch ([`lower_select_expr`]) and the "aggregate nested
+/// inside an expression" rejection in [`lower_scalar_call`].
+fn is_aggregate_name(name: &str) -> bool {
+    matches!(
+        name,
+        "count" | "min" | "max" | "sum" | "avg" | "group_concat"
+    )
 }
 
 /// Lowers an aggregate function call.
@@ -229,6 +244,186 @@ fn lower_aggregate(func: &sql::Function) -> Result<Aggregate, ParseError> {
         )?)),
         other => Err(unsupported(format!("function `{other}`"))),
     }
+}
+
+/// Lowers a scalar expression: a column, literal, scalar-function call, or
+/// arithmetic/concat operation. Used for `SELECT` items that aren't a bare
+/// aggregate ([`lower_select_expr`]) and for their nested sub-expressions
+/// (scalar-function arguments, binary operands).
+fn lower_expr(expr: &sql::Expr) -> Result<Expr, ParseError> {
+    match expr {
+        sql::Expr::Identifier(_) | sql::Expr::CompoundIdentifier(_) => {
+            Ok(Expr::Col(lower_col_ref(expr)?))
+        }
+        sql::Expr::Value(_)
+        | sql::Expr::UnaryOp {
+            op: sql::UnaryOperator::Minus | sql::UnaryOperator::Plus,
+            ..
+        } => Ok(Expr::Lit(lower_literal(expr)?)),
+        sql::Expr::Function(func) => lower_scalar_call(func),
+        sql::Expr::Trim {
+            trim_where,
+            trim_what,
+            trim_characters,
+            expr,
+        } => lower_trim(trim_where, trim_what, trim_characters, expr),
+        sql::Expr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => lower_substr(expr, substring_from, substring_for),
+        sql::Expr::BinaryOp { left, op, right } => lower_expr_binary(left, op, right),
+        sql::Expr::Nested(inner) => lower_expr(inner),
+        _ => Err(unsupported("this SELECT expression")),
+    }
+}
+
+/// Lowers a scalar-function call (`lower(...)`, `ltrim(...)`, `replace(...)`,
+/// …). An aggregate name here means an aggregate nested inside a larger
+/// expression (e.g. `count(*) + 1`), which this batch does not support —
+/// mixing agg and scalar in one tree needs group-context threading beyond
+/// this scope.
+///
+/// `trim`/`substr` never reach this function: `sqlparser` intercepts those
+/// keywords as the dedicated [`sql::Expr::Trim`]/[`sql::Expr::Substring`]
+/// nodes (see [`lower_trim`]/[`lower_substr`]) rather than a plain function
+/// call, regardless of dialect.
+fn lower_scalar_call(func: &sql::Function) -> Result<Expr, ParseError> {
+    if func.over.is_some() {
+        return Err(unsupported("window functions (OVER clause)"));
+    }
+    if func.filter.is_some() {
+        return Err(unsupported("aggregate FILTER clause"));
+    }
+
+    let name = object_name_to_string(&func.name).to_ascii_lowercase();
+    let Some(scalar) = scalar_fn_from_name(&name) else {
+        if is_aggregate_name(&name) {
+            return Err(unsupported("an aggregate inside an expression"));
+        }
+        return Err(unsupported(format!("function `{name}`")));
+    };
+
+    let list = arg_list(func, &name)?;
+    if list.duplicate_treatment.is_some() {
+        return Err(unsupported(format!("DISTINCT inside {name}(...)")));
+    }
+    let args = list
+        .args
+        .iter()
+        .map(scalar_arg)
+        .collect::<Result<Vec<_>, _>>()?;
+    check_scalar_arity(&scalar, &name, args.len())?;
+    Ok(Expr::Scalar(scalar, args))
+}
+
+/// Maps a lowercased function name to the [`ScalarFn`] it calls, or `None`
+/// for anything else (an aggregate, or an unknown function).
+fn scalar_fn_from_name(name: &str) -> Option<ScalarFn> {
+    match name {
+        "lower" => Some(ScalarFn::Lower),
+        "upper" => Some(ScalarFn::Upper),
+        "length" => Some(ScalarFn::Length),
+        "ltrim" => Some(ScalarFn::Ltrim),
+        "rtrim" => Some(ScalarFn::Rtrim),
+        "replace" => Some(ScalarFn::Replace),
+        _ => None,
+    }
+}
+
+/// Validates a scalar function call's argument count, producing a
+/// parse-time error naming the function on mismatch.
+fn check_scalar_arity(f: &ScalarFn, name: &str, argc: usize) -> Result<(), ParseError> {
+    let arity_ok = match f {
+        ScalarFn::Lower
+        | ScalarFn::Upper
+        | ScalarFn::Length
+        | ScalarFn::Trim
+        | ScalarFn::Ltrim
+        | ScalarFn::Rtrim => argc == 1,
+        ScalarFn::Substr => (2..=3).contains(&argc),
+        ScalarFn::Replace => argc == 3,
+    };
+    if arity_ok {
+        Ok(())
+    } else {
+        Err(unsupported(format!(
+            "{name}() called with {argc} argument(s)"
+        )))
+    }
+}
+
+/// Extracts a scalar-function argument's expression, rejecting the wildcard
+/// and named-argument forms (neither applies to these functions).
+fn scalar_arg(arg: &sql::FunctionArg) -> Result<Expr, ParseError> {
+    match arg {
+        sql::FunctionArg::Unnamed(sql::FunctionArgExpr::Expr(expr)) => lower_expr(expr),
+        _ => Err(unsupported("this function argument")),
+    }
+}
+
+/// Lowers a `TRIM(...)` expression to `trim`/`ltrim`/`rtrim` based on
+/// `trim_where` (no qualifier, or `BOTH`, maps to `trim`). Custom trim
+/// characters (`TRIM('x' FROM s)`, the PostgreSQL comma form) are outside
+/// this batch's whitespace-only scalar functions.
+fn lower_trim(
+    trim_where: &Option<sql::TrimWhereField>,
+    trim_what: &Option<Box<sql::Expr>>,
+    trim_characters: &Option<Vec<sql::Expr>>,
+    expr: &sql::Expr,
+) -> Result<Expr, ParseError> {
+    if trim_what.is_some() || trim_characters.is_some() {
+        return Err(unsupported("trimming custom characters"));
+    }
+    let scalar = match trim_where {
+        None | Some(sql::TrimWhereField::Both) => ScalarFn::Trim,
+        Some(sql::TrimWhereField::Leading) => ScalarFn::Ltrim,
+        Some(sql::TrimWhereField::Trailing) => ScalarFn::Rtrim,
+    };
+    Ok(Expr::Scalar(scalar, vec![lower_expr(expr)?]))
+}
+
+/// Lowers a `SUBSTR`/`SUBSTRING` expression — either the `substr(s, start[,
+/// len])` shorthand or the ANSI `SUBSTRING(s FROM start [FOR len])` form
+/// (both parse to the same `sqlparser` node) — to `Expr::Scalar(Substr, ...)`.
+fn lower_substr(
+    expr: &sql::Expr,
+    from: &Option<Box<sql::Expr>>,
+    for_len: &Option<Box<sql::Expr>>,
+) -> Result<Expr, ParseError> {
+    let Some(from) = from else {
+        return Err(unsupported("substr() without a start position"));
+    };
+    let mut args = vec![lower_expr(expr)?, lower_expr(from)?];
+    if let Some(len) = for_len {
+        args.push(lower_expr(len)?);
+    }
+    Ok(Expr::Scalar(ScalarFn::Substr, args))
+}
+
+/// Lowers a `sqlparser` binary operator node to `Expr::Binary`, for the
+/// subset a `SELECT` expression supports: arithmetic and `||` concat.
+fn lower_expr_binary(
+    left: &sql::Expr,
+    op: &sql::BinaryOperator,
+    right: &sql::Expr,
+) -> Result<Expr, ParseError> {
+    use sql::BinaryOperator as B;
+    let op = match op {
+        B::Plus => BinOp::Add,
+        B::Minus => BinOp::Sub,
+        B::Multiply => BinOp::Mul,
+        B::Divide => BinOp::Div,
+        B::Modulo => BinOp::Mod,
+        B::StringConcat => BinOp::Concat,
+        other => return Err(unsupported(format!("operator `{other}`"))),
+    };
+    Ok(Expr::Binary(
+        op,
+        Box::new(lower_expr(left)?),
+        Box::new(lower_expr(right)?),
+    ))
 }
 
 /// Lowers a `count(...)` call, distinguishing `count(*)`, `count(col)`, and
@@ -566,7 +761,7 @@ mod tests {
         assert_eq!(
             q.select[0],
             SelectItem {
-                expr: SelectExpr::Col(ColRef::Field("status".into())),
+                expr: SelectExpr::Expr(Expr::Col(ColRef::Field("status".into()))),
                 alias: None
             }
         );
@@ -585,11 +780,11 @@ mod tests {
         let q = parse("SELECT file.name, file.folder WHERE file.ext = 'md'").unwrap();
         assert_eq!(
             q.select[0].expr,
-            SelectExpr::Col(ColRef::File(FileAttr::Name))
+            SelectExpr::Expr(Expr::Col(ColRef::File(FileAttr::Name)))
         );
         assert_eq!(
             q.select[1].expr,
-            SelectExpr::Col(ColRef::File(FileAttr::Folder))
+            SelectExpr::Expr(Expr::Col(ColRef::File(FileAttr::Folder)))
         );
         match q.filter.unwrap() {
             Predicate::Compare(ColRef::File(FileAttr::Ext), CmpOp::Eq, Literal::Str(s)) => {
@@ -745,6 +940,135 @@ mod tests {
             header("SELECT count(distinct status)"),
             "count(distinct status)"
         );
+    }
+
+    #[test]
+    fn header_derivation_for_computed_expr() {
+        // A computed expression with no alias falls back to a rendered form;
+        // a bare column (even through `lower_expr`) still keeps its plain
+        // field label (pinned separately by `header_derivation` above).
+        let header = |sql: &str| parse(sql).unwrap().select[0].header();
+        assert_eq!(header("SELECT lower(status)"), "lower(status)");
+        assert_eq!(header("SELECT a + b"), "a + b");
+        assert_eq!(header("SELECT a || '-' || status"), "a || '-' || status");
+    }
+
+    #[test]
+    fn lower_expr_scalar_and_arithmetic_shapes() {
+        let q = parse("SELECT lower(status), a + b, a || '-' || status").unwrap();
+        assert_eq!(
+            q.select[0].expr,
+            SelectExpr::Expr(Expr::Scalar(
+                ScalarFn::Lower,
+                vec![Expr::Col(ColRef::Field("status".into()))]
+            ))
+        );
+        assert_eq!(
+            q.select[1].expr,
+            SelectExpr::Expr(Expr::Binary(
+                BinOp::Add,
+                Box::new(Expr::Col(ColRef::Field("a".into()))),
+                Box::new(Expr::Col(ColRef::Field("b".into())))
+            ))
+        );
+        assert_eq!(
+            q.select[2].expr,
+            SelectExpr::Expr(Expr::Binary(
+                BinOp::Concat,
+                Box::new(Expr::Binary(
+                    BinOp::Concat,
+                    Box::new(Expr::Col(ColRef::Field("a".into()))),
+                    Box::new(Expr::Lit(Literal::Str("-".into())))
+                )),
+                Box::new(Expr::Col(ColRef::Field("status".into())))
+            ))
+        );
+    }
+
+    #[test]
+    fn lower_expr_trim_and_substr_forms() {
+        // `trim`/`ltrim`/`rtrim`/`substr` each parse through a different
+        // sqlparser AST shape (a plain `Function`, or the dedicated
+        // `Trim`/`Substring` nodes) — pin that all four land on the right
+        // `ScalarFn`.
+        let col = || Expr::Col(ColRef::Field("status".into()));
+        assert_eq!(
+            parse("SELECT trim(status)").unwrap().select[0].expr,
+            SelectExpr::Expr(Expr::Scalar(ScalarFn::Trim, vec![col()]))
+        );
+        assert_eq!(
+            parse("SELECT ltrim(status)").unwrap().select[0].expr,
+            SelectExpr::Expr(Expr::Scalar(ScalarFn::Ltrim, vec![col()]))
+        );
+        assert_eq!(
+            parse("SELECT rtrim(status)").unwrap().select[0].expr,
+            SelectExpr::Expr(Expr::Scalar(ScalarFn::Rtrim, vec![col()]))
+        );
+        assert_eq!(
+            parse("SELECT substr(status, 2, 3)").unwrap().select[0].expr,
+            SelectExpr::Expr(Expr::Scalar(
+                ScalarFn::Substr,
+                vec![
+                    col(),
+                    Expr::Lit(Literal::Int(2)),
+                    Expr::Lit(Literal::Int(3))
+                ]
+            ))
+        );
+        assert_eq!(
+            parse("SELECT substr(status, 2)").unwrap().select[0].expr,
+            SelectExpr::Expr(Expr::Scalar(
+                ScalarFn::Substr,
+                vec![col(), Expr::Lit(Literal::Int(2))]
+            ))
+        );
+    }
+
+    #[test]
+    fn trim_custom_characters_is_unsupported() {
+        // `TRIM('x' FROM s)` is outside the whitespace-only scalar set.
+        assert!(matches!(
+            parse("SELECT trim('x' from status)"),
+            Err(ParseError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn aggregate_inside_expression_is_unsupported() {
+        // `count(*)` alone stays a bare aggregate; wrapped in arithmetic it
+        // needs group-context threading this batch doesn't do.
+        assert!(matches!(
+            parse("SELECT count(*)").unwrap().select[0].expr,
+            SelectExpr::Agg(Aggregate::CountStar)
+        ));
+        assert!(matches!(
+            parse("SELECT count(*) + 1"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse("SELECT lower(status) + min(status)"),
+            Err(ParseError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn unknown_scalar_function_is_unsupported() {
+        assert!(matches!(
+            parse("SELECT frobnicate(status)"),
+            Err(ParseError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn scalar_function_wrong_arity_is_unsupported() {
+        assert!(matches!(
+            parse("SELECT lower(status, status)"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse("SELECT replace(status, status)"),
+            Err(ParseError::Unsupported(_))
+        ));
     }
 
     #[test]

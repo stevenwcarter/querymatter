@@ -41,13 +41,14 @@ pub struct SelectItem {
     pub alias: Option<String>,
 }
 
-/// A projectable expression: `*`, a column, or an aggregate.
+/// A projectable expression: `*`, a scalar expression, or an aggregate.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SelectExpr {
     /// The `*` wildcard, expanding to every frontmatter field.
     Star,
-    /// A single column reference.
-    Col(ColRef),
+    /// A scalar expression: a column, literal, scalar-fn call, or
+    /// arithmetic/concat. A bare column is `Expr(Expr::Col(_))`.
+    Expr(Expr),
     /// An aggregate over the current group.
     Agg(Aggregate),
 }
@@ -60,6 +61,62 @@ pub enum ColRef {
     Field(String),
     /// A `file.*` pseudo-column (`file.name`, `file.path`, …).
     File(FileAttr),
+}
+
+/// A scalar expression: evaluates to one [`crate::model::Value`] per row
+/// (ungrouped) or per group cell (grouped, over the group's representative
+/// row — see `exec::eval_expr`). This is the operand type for `SELECT`
+/// projections (`SelectExpr::Expr`); an aggregate *containing* one of these
+/// (e.g. `count(*) + 1`) is rejected at parse time rather than represented
+/// here.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Expr {
+    /// A column or `file.*` pseudo-column.
+    Col(ColRef),
+    /// A literal constant.
+    Lit(Literal),
+    /// A scalar function applied to argument expressions.
+    Scalar(ScalarFn, Vec<Expr>),
+    /// A binary arithmetic or string-concat operation.
+    Binary(BinOp, Box<Expr>, Box<Expr>),
+}
+
+/// A scalar string function, as it may appear in a `SELECT` expression.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScalarFn {
+    /// `lower(s)` — ASCII-aware lowercase.
+    Lower,
+    /// `upper(s)` — ASCII-aware uppercase.
+    Upper,
+    /// `length(s)` — character count.
+    Length,
+    /// `trim(s)` — whitespace trimmed from both ends.
+    Trim,
+    /// `ltrim(s)` — whitespace trimmed from the start.
+    Ltrim,
+    /// `rtrim(s)` — whitespace trimmed from the end.
+    Rtrim,
+    /// `substr(s, start[, len])` — 1-based, char-indexed, clamped.
+    Substr,
+    /// `replace(s, from, to)` — all non-overlapping occurrences.
+    Replace,
+}
+
+/// A binary operator in a `SELECT` expression: arithmetic or string concat.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BinOp {
+    /// `+`
+    Add,
+    /// `-`
+    Sub,
+    /// `*`
+    Mul,
+    /// `/`
+    Div,
+    /// `%`
+    Mod,
+    /// `||` — string concatenation.
+    Concat,
 }
 
 /// An aggregate function applied to the rows of a group.
@@ -167,10 +224,14 @@ impl SelectItem {
 
 impl SelectExpr {
     /// The header used when a projection item carries no explicit alias.
+    ///
+    /// A bare column keeps its plain field/`file.*` label; any other
+    /// expression falls back to a rendered form (see [`expr_label`]).
     fn default_header(&self) -> String {
         match self {
             SelectExpr::Star => "*".to_string(),
-            SelectExpr::Col(col) => col.label(),
+            SelectExpr::Expr(Expr::Col(col)) => col.label(),
+            SelectExpr::Expr(expr) => expr_label(expr),
             SelectExpr::Agg(agg) => agg.default_header(),
         }
     }
@@ -201,6 +262,61 @@ impl Aggregate {
             Aggregate::Avg(col) => format!("avg({})", col.label()),
             Aggregate::GroupConcat(col) => format!("group_concat({})", col.label()),
         }
+    }
+}
+
+/// A SQL-ish rendering of a computed [`Expr`], used as a projection's
+/// default header when it has no alias (mirrors [`Aggregate::default_header`]).
+/// A bare `Expr::Col` never reaches here — [`SelectExpr::default_header`]
+/// handles it directly so it keeps its plain field/`file.*` label.
+fn expr_label(expr: &Expr) -> String {
+    match expr {
+        Expr::Col(col) => col.label(),
+        Expr::Lit(lit) => literal_label(lit),
+        Expr::Scalar(f, args) => {
+            let rendered: Vec<String> = args.iter().map(expr_label).collect();
+            format!("{}({})", scalar_fn_name(f), rendered.join(", "))
+        }
+        Expr::Binary(op, l, r) => {
+            format!("{} {} {}", expr_label(l), bin_op_symbol(op), expr_label(r))
+        }
+    }
+}
+
+/// A SQL-ish rendering of a literal constant, for [`expr_label`].
+fn literal_label(lit: &Literal) -> String {
+    match lit {
+        Literal::Str(s) => format!("'{s}'"),
+        Literal::Int(i) => i.to_string(),
+        Literal::Float(f) => f.to_string(),
+        Literal::Bool(b) => b.to_string(),
+        Literal::Null => "NULL".to_string(),
+    }
+}
+
+/// The SQL function name for a [`ScalarFn`], for [`expr_label`].
+fn scalar_fn_name(f: &ScalarFn) -> &'static str {
+    match f {
+        ScalarFn::Lower => "lower",
+        ScalarFn::Upper => "upper",
+        ScalarFn::Length => "length",
+        ScalarFn::Trim => "trim",
+        ScalarFn::Ltrim => "ltrim",
+        ScalarFn::Rtrim => "rtrim",
+        ScalarFn::Substr => "substr",
+        ScalarFn::Replace => "replace",
+    }
+}
+
+/// The infix symbol for a [`BinOp`], for [`expr_label`].
+fn bin_op_symbol(op: &BinOp) -> &'static str {
+    match op {
+        BinOp::Add => "+",
+        BinOp::Sub => "-",
+        BinOp::Mul => "*",
+        BinOp::Div => "/",
+        BinOp::Mod => "%",
+        BinOp::Concat => "||",
     }
 }
 
