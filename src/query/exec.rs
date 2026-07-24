@@ -62,28 +62,48 @@ pub enum ExecError {
 /// Executes `q` against `records`, returning the projected, filtered,
 /// ordered, and limited result.
 ///
-/// Unless `lenient` is set, every column `q` references (see
-/// [`Query::referenced_fields`]) is checked against the schema — the sorted
-/// union of field names across `records` — before the filter/project
-/// pipeline runs, so a typo'd column fails fast with a suggestion rather than
-/// silently reading as `Null` throughout. An empty schema skips this check:
-/// a fresh or empty vault (or one whose only records have explicit-but-empty
-/// frontmatter, e.g. `---\n{}\n---`) has no fields to check against, and
-/// must not fail every query on that account alone.
-///
-/// Dispatches on whether `q` is grouped/aggregate; see
-/// [`is_grouped_or_aggregate`].
+/// Validates against the sorted union of `records`' own field names — see
+/// [`execute_with_schema`], which this delegates to. Suitable whenever every
+/// record passed in still carries every field (direct unit tests below, and
+/// any caller with an unpruned record set); a caller whose records may have
+/// had field VALUES pruned by projection push-down (design W17 — see
+/// [`crate::store`]) must call [`execute_with_schema`] instead, passing the
+/// record store's own [`crate::store::RecordStore::schema`] (always the FULL
+/// field-name union, regardless of pruning) rather than let this function
+/// derive a schema from the (possibly narrowed) `records` it's given.
 pub fn execute<'a>(
     q: &Query,
     records: impl Iterator<Item = &'a Record>,
     lenient: bool,
 ) -> Result<ResultTable, ExecError> {
     let records: Vec<&Record> = records.collect();
-    if !lenient {
-        let schema = sorted_field_union(&records);
-        if !schema.is_empty() {
-            validate_columns(q, &schema)?;
-        }
+    let schema = sorted_field_union(&records);
+    execute_with_schema(q, records.into_iter(), &schema, lenient)
+}
+
+/// Like [`execute`], but validates against an explicit `schema` instead of
+/// one derived from `records`' own field names.
+///
+/// Unless `lenient` is set, every column `q` references (see
+/// [`Query::referenced_fields`]) is checked against `schema` before the
+/// filter/project pipeline runs, so a typo'd column fails fast with a
+/// suggestion rather than silently reading as `Null` throughout. An empty
+/// `schema` skips this check: a fresh or empty vault (or one whose only
+/// records have explicit-but-empty frontmatter, e.g. `---\n{}\n---`) has no
+/// fields to check against, and must not fail every query on that account
+/// alone.
+///
+/// Dispatches on whether `q` is grouped/aggregate; see
+/// [`is_grouped_or_aggregate`].
+pub fn execute_with_schema<'a>(
+    q: &Query,
+    records: impl Iterator<Item = &'a Record>,
+    schema: &[String],
+    lenient: bool,
+) -> Result<ResultTable, ExecError> {
+    let records: Vec<&Record> = records.collect();
+    if !lenient && !schema.is_empty() {
+        validate_columns(q, schema)?;
     }
     if is_grouped_or_aggregate(q) {
         return execute_grouped(q, records.into_iter());

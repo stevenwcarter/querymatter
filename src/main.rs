@@ -25,6 +25,7 @@ mod session;
 mod settings;
 pub mod store;
 
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
@@ -40,6 +41,7 @@ use crate::cli::{
 };
 use crate::config::Config;
 use crate::output::OutputSink;
+use crate::query::ast::SelectExpr;
 use crate::session::{Session, split_statements};
 use crate::settings::Settings;
 use crate::store::{InMemoryStore, RecordStore};
@@ -448,6 +450,10 @@ fn run_query_action(action: &QueryAction) -> anyhow::Result<ExitCode> {
 /// single positional `[DIRS]` entry would in query mode. Dispatched from
 /// [`dispatch`] after `config::load()`, since (unlike its `query` siblings)
 /// it builds a session.
+///
+/// `name`'s resolved SQL is known before the store is built, so — like `-e`
+/// and piped batch mode — it computes projection push-down's `wanted` field
+/// set ([`compute_wanted`]) up front and threads it into [`build_session`].
 fn run_query_run(
     name: &str,
     dir: Option<&Path>,
@@ -459,7 +465,8 @@ fn run_query_run(
     let sql =
         queries::get(&saved, name).with_context(|| format!("no saved query named '{name}'"))?;
     let dirs: Vec<PathBuf> = dir.map(Path::to_path_buf).into_iter().collect();
-    let session = build_session(cli, config, matches, &dirs)?;
+    let wanted = compute_wanted(sql);
+    let session = build_session(cli, config, matches, &dirs, wanted.as_ref())?;
     run_batch(&session, sql, cli.exit_code, cli.output.as_deref())
 }
 
@@ -472,24 +479,76 @@ fn run_query_run(
 /// more than zero, [`ExitCode::from(1)`] otherwise. Without the flag, or in
 /// the interactive REPL — which has no single "total rows" to report — a
 /// clean run is always [`ExitCode::SUCCESS`], matching today's behavior.
+///
+/// The store is built AFTER the query text is known for every branch except
+/// the REPL: a one-shot `-e`/`-e -`/piped-batch run's statement text is
+/// parsed up front to compute projection push-down's `wanted` field set
+/// ([`compute_wanted`]), which [`build_session`] then threads into the
+/// store's materialization. The REPL's store outlives any one query, so it
+/// always builds with `wanted = None` (every field) — matching today's
+/// behavior exactly. Reading stdin still only ever happens in the same
+/// branch it always did (right before that branch's `run_batch`), so a
+/// non-piped, `-e`-less invocation never blocks on stdin any earlier than
+/// before.
 fn run_query(cli: &Cli, config: &Config, matches: &ArgMatches) -> anyhow::Result<ExitCode> {
-    let session = build_session(cli, config, matches, &cli.dirs)?;
-
     let output = cli.output.as_deref();
     match cli.query.as_deref() {
         // `-e -`: read the query text from stdin, then run it.
-        Some("-") => run_batch(&session, &read_stdin()?, cli.exit_code, output),
+        Some("-") => {
+            let sql = read_stdin()?;
+            let wanted = compute_wanted(&sql);
+            let session = build_session(cli, config, matches, &cli.dirs, wanted.as_ref())?;
+            run_batch(&session, &sql, cli.exit_code, output)
+        }
         // `-e <sql>`: run the given query text.
-        Some(sql) => run_batch(&session, sql, cli.exit_code, output),
+        Some(sql) => {
+            let wanted = compute_wanted(sql);
+            let session = build_session(cli, config, matches, &cli.dirs, wanted.as_ref())?;
+            run_batch(&session, sql, cli.exit_code, output)
+        }
         // No `-e`: batch mode when stdin is piped, otherwise the REPL.
         None if !io::stdin().is_terminal() => {
-            run_batch(&session, &read_stdin()?, cli.exit_code, output)
+            let input = read_stdin()?;
+            let wanted = compute_wanted(&input);
+            let session = build_session(cli, config, matches, &cli.dirs, wanted.as_ref())?;
+            run_batch(&session, &input, cli.exit_code, output)
         }
         None => {
+            let session = build_session(cli, config, matches, &cli.dirs, None)?;
             repl::run(session)?;
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+/// Computes projection push-down's field set (design W17) for a one-shot/
+/// batch/`query run` invocation, where every statement's SQL is known before
+/// the record store is built: the union of [`Query::referenced_fields`]
+/// across every statement in `input`.
+///
+/// Returns `None` — disabling push-down, so the store keeps every field
+/// (today's behavior) — when any statement projects `SELECT *`
+/// ([`SelectExpr::Star`], which needs every field), or when any statement
+/// fails to parse. A parse failure is not reported here: the same text gets
+/// parsed again, and its real error surfaced, when [`run_statements`]
+/// actually runs it — silently keeping every field in that case just costs
+/// the optimization, never correctness.
+///
+/// [`Query::referenced_fields`]: crate::query::ast::Query::referenced_fields
+fn compute_wanted(input: &str) -> Option<BTreeSet<String>> {
+    let mut wanted = BTreeSet::new();
+    for statement in split_statements(input) {
+        let parsed = query::parse(&statement.sql).ok()?;
+        let has_star = parsed
+            .select
+            .iter()
+            .any(|item| matches!(item.expr, SelectExpr::Star));
+        if has_star {
+            return None;
+        }
+        wanted.extend(parsed.referenced_fields());
+    }
+    Some(wanted)
 }
 
 /// Builds the queryable [`Session`] shared by [`run_query`] (`-e`/stdin/the
@@ -506,11 +565,17 @@ fn run_query(cli: &Cli, config: &Config, matches: &ArgMatches) -> anyhow::Result
 /// `query run <name> [DIR]`'s single-element override (or an empty slice when
 /// `[DIR]` was omitted) — rather than this function reading `cli.dirs`
 /// itself, so the two callers' independent positionals can't be conflated.
+///
+/// `wanted` is projection push-down's field set ([`compute_wanted`]),
+/// threaded straight into the store's materialization
+/// ([`InMemoryStore::load`]/[`InMemoryStore::from_cache`]); `None` (the REPL,
+/// always) keeps every field, matching pre-push-down behavior.
 fn build_session(
     cli: &Cli,
     config: &Config,
     matches: &ArgMatches,
     dirs: &[PathBuf],
+    wanted: Option<&BTreeSet<String>>,
 ) -> anyhow::Result<Session> {
     cli.validate()?;
 
@@ -535,7 +600,8 @@ fn build_session(
 
     let (store, report, session_vault) = match vault {
         Some(vault) => {
-            let (mut store, mut report) = InMemoryStore::from_cache(&vault, opts, cli.freshness());
+            let (mut store, mut report) =
+                InMemoryStore::from_cache(&vault, opts, cli.freshness(), wanted);
             // A forced refresh runs against the just-loaded cache; only its
             // warnings need surfacing (the counts are informational and the
             // store already reflects the refreshed records).
@@ -564,7 +630,7 @@ fn build_session(
                 !cli.force_cache,
                 "--force-cache: no .querymatter cache found (run `querymatter init` first)"
             );
-            let (store, report) = InMemoryStore::load(cli::canonicalize_roots(dirs)?, opts);
+            let (store, report) = InMemoryStore::load(cli::canonicalize_roots(dirs)?, opts, wanted);
             (store, report, None)
         }
     };

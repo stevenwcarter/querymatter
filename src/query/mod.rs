@@ -8,7 +8,7 @@ pub mod ast;
 pub mod exec;
 pub mod parse;
 
-pub use exec::{ExecError, execute};
+pub use exec::{ExecError, execute, execute_with_schema};
 pub use parse::{ParseError, parse};
 
 /// The output of running a query: column headers plus the projected rows, in

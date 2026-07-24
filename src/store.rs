@@ -47,6 +47,18 @@ pub struct DirSlice {
     pub root: PathBuf,
     pub records: Vec<Record>,
     pub scanned_at: SystemTime,
+    /// The full frontmatter field-NAME union for this slice, independent of
+    /// which field VALUES `records` actually carry.
+    ///
+    /// Populated during scan ([`scan_root`]) or cache materialization
+    /// ([`cache::records_from`]) from every discovered file's real fields,
+    /// before projection push-down (design W17) narrows `records`' own value
+    /// maps to only the fields a known-in-advance query references. Keeping
+    /// this separate from `records` is what lets [`RecordStore::schema`]
+    /// report the FULL schema even when most values were pruned away —
+    /// load-bearing for W12's unknown-column validation/did-you-mean, which
+    /// checks a query's referenced columns against `schema()`.
+    field_names: BTreeSet<String>,
 }
 
 /// A queryable collection of [`Record`]s, grouped into directory-keyed
@@ -86,19 +98,32 @@ pub struct InMemoryStore {
 impl InMemoryStore {
     /// Loads every root in `roots` with `opts`, returning the populated
     /// store and a [`LoadReport`] combined across all roots.
-    pub fn load(roots: Vec<PathBuf>, opts: WalkOpts) -> (Self, LoadReport) {
+    ///
+    /// `wanted` implements projection push-down (design W17): `None` keeps
+    /// every field's value on every [`Record`] (today's behavior, and always
+    /// what the interactive REPL passes — its store outlives any one query);
+    /// `Some(set)` keeps only the values whose key is in `set`, for a
+    /// one-shot/batch/`query run` invocation whose statement(s) are known
+    /// before the store is built. [`RecordStore::schema`] stays the FULL
+    /// field-name union regardless — see [`DirSlice::field_names`].
+    pub fn load(
+        roots: Vec<PathBuf>,
+        opts: WalkOpts,
+        wanted: Option<&BTreeSet<String>>,
+    ) -> (Self, LoadReport) {
         let mut store = InMemoryStore {
             slices: Vec::new(),
             opts,
         };
         let mut report = LoadReport::default();
         for root in roots {
-            let (records, slice_report) = scan_root(&root, &store.opts);
+            let (records, field_names, slice_report) = scan_root(&root, &store.opts, wanted);
             report.merge(slice_report);
             store.slices.push(DirSlice {
                 root,
                 records,
                 scanned_at: SystemTime::now(),
+                field_names,
             });
         }
         (store, report)
@@ -123,7 +148,18 @@ impl InMemoryStore {
     /// report — `main` prints report warnings to stderr — so the user sees
     /// *why* every run is doing a slow full rebuild. With no manifest at all
     /// (a fresh vault, or the unit-test path) the rebuild stays silent.
-    pub fn from_cache(vault: &Path, opts: WalkOpts, mode: Freshness) -> (Self, LoadReport) {
+    ///
+    /// `wanted` is the same projection push-down parameter [`InMemoryStore::load`]
+    /// takes — see its doc comment. It only affects which field VALUES end up
+    /// on the returned store's [`Record`]s; the on-disk cache written by
+    /// [`cache::save_cache`] above is built from `fresh` (every field,
+    /// straight from [`cache::refresh_against_cache`]) and is never pruned.
+    pub fn from_cache(
+        vault: &Path,
+        opts: WalkOpts,
+        mode: Freshness,
+        wanted: Option<&BTreeSet<String>>,
+    ) -> (Self, LoadReport) {
         let (cached, ttl_secs, incompatible) = match cache::load_cache(vault) {
             Some((body, dirs)) => (dirs, body.ttl_secs, false),
             // A `None` with a manifest present means it's unreadable; without
@@ -151,7 +187,7 @@ impl InMemoryStore {
             report.warnings.push(format!("saving cache: {err}"));
         }
 
-        let slices = slices_from_cached(vault, &fresh);
+        let slices = slices_from_cached(vault, &fresh, wanted);
         (InMemoryStore { slices, opts }, report)
     }
 
@@ -188,6 +224,19 @@ impl InMemoryStore {
     /// refreshed, where it's carried through unread rather than compared
     /// against — so its stat accuracy doesn't matter, only that it
     /// round-trips through [`cache::save_cache`] cleanly.
+    ///
+    /// Invariant this depends on: `self.slices`' records must carry every
+    /// field, not a projection-push-down-pruned subset (design W17) — a
+    /// pruned record's missing fields would round-trip through
+    /// [`cache::save_cache`] as genuinely lost, not merely re-derivable,
+    /// corrupting the on-disk cache for directories outside the refreshed
+    /// subtree. Holds today because every caller that can reach this
+    /// fallback (this crate's `RecordStore::refresh` callers) only does so
+    /// for a store built with `wanted = None`: push-down is confined to
+    /// [`crate::main`]'s one-shot/batch/`query run` construction, and those
+    /// never chain into this no-on-disk-cache fallback within the same run
+    /// (`InMemoryStore::from_cache` always repairs/persists a valid manifest
+    /// before any subsequent [`RecordStore::refresh`] call can need it).
     fn cached_dirs_from_slices(&self) -> Vec<CachedDir> {
         let mut by_dir: BTreeMap<PathBuf, Vec<CachedFile>> = BTreeMap::new();
         for slice in &self.slices {
@@ -231,14 +280,22 @@ impl InMemoryStore {
 /// [`cache::records_from`], stamping each with the current time. Shared by
 /// [`InMemoryStore::from_cache`] and [`RecordStore::refresh`], both of
 /// which rebuild the store's slices from a freshly refreshed `Vec<CachedDir>`.
-fn slices_from_cached(vault: &Path, dirs: &[CachedDir]) -> Vec<DirSlice> {
+///
+/// `wanted` is forwarded straight to [`cache::records_from`] — see its doc
+/// comment for what it prunes and why `schema()` stays complete regardless.
+fn slices_from_cached(
+    vault: &Path,
+    dirs: &[CachedDir],
+    wanted: Option<&BTreeSet<String>>,
+) -> Vec<DirSlice> {
     let now = SystemTime::now();
-    cache::records_from(vault, dirs)
+    cache::records_from(vault, dirs, wanted)
         .into_iter()
-        .map(|(root, records)| DirSlice {
+        .map(|(root, records, field_names)| DirSlice {
             root,
             records,
             scanned_at: now,
+            field_names,
         })
         .collect()
 }
@@ -248,24 +305,33 @@ impl RecordStore for InMemoryStore {
         Box::new(self.slices.iter().flat_map(|slice| slice.records.iter()))
     }
 
+    /// The full field-name union across every slice's [`DirSlice::field_names`]
+    /// — tracked independently of `records`' own (possibly push-down-pruned)
+    /// field values, so this stays complete even when most VALUES were
+    /// pruned away for a narrow one-shot query.
     fn schema(&self) -> Vec<String> {
         let mut names = BTreeSet::new();
-        for record in self.records() {
-            names.extend(record.field_names().map(String::from));
+        for slice in &self.slices {
+            names.extend(slice.field_names.iter().cloned());
         }
         names.into_iter().collect()
     }
 
+    /// REPL-only in practice ([`Session::reload`](crate::session::Session::reload));
+    /// always passes `wanted = None` to [`scan_root`] — push-down never
+    /// applies to a store that outlives a single query.
     fn reload_dir(&mut self, root: &Path) -> LoadReport {
-        let (records, report) = scan_root(root, &self.opts);
+        let (records, field_names, report) = scan_root(root, &self.opts, None);
         if let Some(slice) = self.slices.iter_mut().find(|slice| slice.root == root) {
             slice.records = records;
+            slice.field_names = field_names;
             slice.scanned_at = SystemTime::now();
         } else {
             self.slices.push(DirSlice {
                 root: root.to_path_buf(),
                 records,
                 scanned_at: SystemTime::now(),
+                field_names,
             });
         }
         report
@@ -295,6 +361,13 @@ impl RecordStore for InMemoryStore {
     /// re-scan `--refresh <path>` and `--refresh-all` both promise (spec §4);
     /// the incremental freshness shortcuts live on the read path
     /// ([`InMemoryStore::from_cache`]), not here.
+    ///
+    /// Always rematerializes with `wanted = None` (every field): projection
+    /// push-down only ever prunes a store's INITIAL construction
+    /// ([`InMemoryStore::load`]/[`from_cache`](InMemoryStore::from_cache)),
+    /// not a later refresh — see
+    /// [`cached_dirs_from_slices`](InMemoryStore::cached_dirs_from_slices)'s
+    /// doc comment for why that invariant matters here.
     fn refresh(&mut self, vault: &Path, subtree: Option<&Path>) -> LoadReport {
         let (mut cached, ttl_secs) = match cache::load_cache(vault) {
             Some((body, dirs)) => (dirs, body.ttl_secs),
@@ -311,7 +384,7 @@ impl RecordStore for InMemoryStore {
             report.warnings.push(format!("saving cache: {err}"));
         }
 
-        self.slices = slices_from_cached(vault, &cached);
+        self.slices = slices_from_cached(vault, &cached, None);
         report
     }
 }
@@ -330,16 +403,37 @@ impl RecordStore for InMemoryStore {
 /// `discover`'s path-sorted order (the order `map_paths` returns them in),
 /// so the outcome is byte-for-byte identical to the old serial loop — just
 /// not bottlenecked on one core.
-fn scan_root(root: &Path, opts: &WalkOpts) -> (Vec<Record>, LoadReport) {
+///
+/// `wanted` implements projection push-down (design W17): `None` keeps every
+/// field's value on each [`Record`] (today's behavior); `Some(set)` keeps
+/// only the values whose key is in `set`. Either way, the returned
+/// `BTreeSet<String>` is the FULL field-name union this scan discovered —
+/// every key seen in a parsed file's frontmatter, before pruning — so a
+/// caller can retain it as the store's true schema regardless of `wanted`.
+fn scan_root(
+    root: &Path,
+    opts: &WalkOpts,
+    wanted: Option<&BTreeSet<String>>,
+) -> (Vec<Record>, BTreeSet<String>, LoadReport) {
     let paths = discover::discover(root, opts);
     let scanned = parallel::map_paths(paths, |path| cache::scan_file(root, path));
 
     let mut records = Vec::new();
+    let mut field_names = BTreeSet::new();
     let mut report = LoadReport::default();
     for (path, result) in scanned {
         match result {
             ScanResult::Cached(file) => {
-                records.push(Record::new(root, &path, file.fields));
+                field_names.extend(file.fields.keys().cloned());
+                let fields = match wanted {
+                    None => file.fields,
+                    Some(set) => file
+                        .fields
+                        .into_iter()
+                        .filter(|(name, _)| set.contains(name))
+                        .collect(),
+                };
+                records.push(Record::new(root, &path, fields));
                 report.loaded += 1;
             }
             ScanResult::NoFrontmatter => {}
@@ -350,7 +444,7 @@ fn scan_root(root: &Path, opts: &WalkOpts) -> (Vec<Record>, LoadReport) {
         }
     }
 
-    (records, report)
+    (records, field_names, report)
 }
 
 #[cfg(test)]
@@ -375,11 +469,11 @@ mod tests {
         cache::build_vault(td.path(), &WalkOpts::default(), 300).unwrap();
 
         let (cached_store, report) =
-            InMemoryStore::from_cache(td.path(), WalkOpts::default(), Freshness::PerFile);
+            InMemoryStore::from_cache(td.path(), WalkOpts::default(), Freshness::PerFile, None);
         assert_eq!(report.skipped, 0);
 
         let (live_store, _report) =
-            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default());
+            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default(), None);
 
         let mut cached: Vec<&Record> = cached_store.records().collect();
         let mut live: Vec<&Record> = live_store.records().collect();
@@ -399,7 +493,7 @@ mod tests {
         cache::build_vault(td.path(), &WalkOpts::default(), 300).unwrap();
 
         let (mut store, _report) =
-            InMemoryStore::from_cache(td.path(), WalkOpts::default(), Freshness::PerFile);
+            InMemoryStore::from_cache(td.path(), WalkOpts::default(), Freshness::PerFile, None);
         assert_eq!(
             store.records().next().unwrap().field("status"),
             Value::Str("draft".into())
@@ -454,7 +548,7 @@ mod tests {
         cache::build_vault(td.path(), &WalkOpts::default(), 300).unwrap();
 
         let (mut store, _report) =
-            InMemoryStore::from_cache(td.path(), WalkOpts::default(), Freshness::PerFile);
+            InMemoryStore::from_cache(td.path(), WalkOpts::default(), Freshness::PerFile, None);
         assert_eq!(
             store.records().next().unwrap().field("status"),
             Value::Str("draft".into())
@@ -492,7 +586,7 @@ mod tests {
         write(td.path(), "a.md", "---\nstatus: final\n---\n");
 
         let (store, report) =
-            InMemoryStore::from_cache(td.path(), WalkOpts::default(), Freshness::ForceCache);
+            InMemoryStore::from_cache(td.path(), WalkOpts::default(), Freshness::ForceCache, None);
         assert_eq!(report.skipped, 0);
         assert_eq!(
             store.records().next().unwrap().field("status"),
@@ -523,11 +617,11 @@ mod tests {
         assert!(cache::load_cache(td.path()).is_none());
 
         let (cached_store, report) =
-            InMemoryStore::from_cache(td.path(), WalkOpts::default(), Freshness::PerFile);
+            InMemoryStore::from_cache(td.path(), WalkOpts::default(), Freshness::PerFile, None);
         assert_eq!(report.skipped, 0);
 
         let (live_store, _report) =
-            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default());
+            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default(), None);
 
         let mut cached: Vec<&Record> = cached_store.records().collect();
         let mut live: Vec<&Record> = live_store.records().collect();
@@ -554,7 +648,7 @@ mod tests {
         // reconstructing a starting point from this store's own in-memory
         // slices rather than the (nonexistent) on-disk cache.
         let (mut store, _report) =
-            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default());
+            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default(), None);
         assert!(cache::load_cache(td.path()).is_none());
 
         write(td.path(), "a.md", "---\nstatus: in-progress\n---\n");
@@ -589,7 +683,7 @@ mod tests {
         assert!(cache::load_cache(td.path()).is_none());
 
         let (store, report) =
-            InMemoryStore::from_cache(td.path(), WalkOpts::default(), Freshness::PerFile);
+            InMemoryStore::from_cache(td.path(), WalkOpts::default(), Freshness::PerFile, None);
         assert!(
             report.warnings.iter().any(|w| w.contains("incompatible")),
             "an incompatible on-disk manifest must warn, got: {:?}",
@@ -607,7 +701,7 @@ mod tests {
         assert!(cache::load_cache(td2.path()).is_none());
 
         let (_store, report2) =
-            InMemoryStore::from_cache(td2.path(), WalkOpts::default(), Freshness::PerFile);
+            InMemoryStore::from_cache(td2.path(), WalkOpts::default(), Freshness::PerFile, None);
         assert!(
             !report2.warnings.iter().any(|w| w.contains("incompatible")),
             "a missing cache must rebuild silently, got: {:?}",
@@ -621,7 +715,7 @@ mod tests {
         write(td.path(), "a.md", "---\nstatus: draft\n---\n");
         write(td.path(), "b.md", "no frontmatter here\n");
         let (store, report) =
-            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default());
+            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default(), None);
         assert_eq!(report.loaded, 1);
         assert_eq!(store.records().count(), 1);
     }
@@ -630,9 +724,55 @@ mod tests {
         let td = TempDir::new().unwrap();
         write(td.path(), "a.md", "---\nstatus: draft\njira: X\n---\n");
         write(td.path(), "b.md", "---\nepic: E\nstatus: synced\n---\n");
-        let (store, _) = InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default());
+        let (store, _) =
+            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default(), None);
         assert_eq!(store.schema(), vec!["epic", "jira", "status"]);
     }
+
+    /// Load-bearing (Task 3, projection push-down): materializing with
+    /// `wanted = Some({"status"})` must keep ONLY `status`'s value on each
+    /// `Record` — `prd`/`tags` absent from `field_names()` — while
+    /// `store.schema()` still reports the FULL field-name union (`prd`,
+    /// `status`, `tags`), proving the schema is tracked independently of
+    /// which values got pruned, not derived from the pruned records
+    /// themselves. This is what lets W12's unknown-column/did-you-mean
+    /// validation keep working under push-down (see
+    /// `tests/cli.rs::typo_under_pushdown_still_errors_with_didyoumean`).
+    #[test]
+    fn pruning_keeps_only_wanted_field_values_but_full_schema() {
+        let td = TempDir::new().unwrap();
+        write(
+            td.path(),
+            "a.md",
+            "---\nstatus: draft\nprd: '010'\ntags: [a, b]\n---\n",
+        );
+        write(
+            td.path(),
+            "b.md",
+            "---\nstatus: synced\nprd: '011'\ntags: [c]\n---\n",
+        );
+
+        let wanted: BTreeSet<String> = ["status".to_string()].into_iter().collect();
+        let (store, _report) = InMemoryStore::load(
+            vec![td.path().to_path_buf()],
+            WalkOpts::default(),
+            Some(&wanted),
+        );
+
+        for record in store.records() {
+            assert_eq!(
+                record.field_names().collect::<Vec<_>>(),
+                vec!["status"],
+                "a pruned record must carry only the wanted field"
+            );
+        }
+        assert_eq!(
+            store.schema(),
+            vec!["prd", "status", "tags"],
+            "schema() must stay the FULL field-name union regardless of pruning"
+        );
+    }
+
     #[test]
     fn reload_dir_overwrites_only_that_slice() {
         let a = TempDir::new().unwrap();
@@ -642,6 +782,7 @@ mod tests {
         let (mut store, _) = InMemoryStore::load(
             vec![a.path().to_path_buf(), b.path().to_path_buf()],
             WalkOpts::default(),
+            None,
         );
         assert_eq!(store.records().count(), 2);
         // add a file to A, reload only A
@@ -655,7 +796,7 @@ mod tests {
         let td = TempDir::new().unwrap();
         write(td.path(), "bad.md", "---\n: : broken\n  x\n---\n");
         let (_store, report) =
-            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default());
+            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default(), None);
         assert_eq!(report.skipped, 1);
         assert_eq!(report.warnings.len(), 1);
     }
@@ -694,7 +835,7 @@ mod tests {
         }
 
         let (store, report) =
-            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default());
+            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default(), None);
 
         let got_paths: Vec<PathBuf> = store
             .records()
@@ -733,7 +874,7 @@ mod tests {
         let mut runs = Vec::new();
         for _ in 0..5 {
             let (store, _report) =
-                InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default());
+                InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default(), None);
             let result = crate::query::execute(&parsed, store.records(), false).unwrap();
             runs.push(result.rows);
         }

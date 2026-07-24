@@ -2051,6 +2051,124 @@ fn malformed_queries_file_exits_non_zero_naming_the_path() {
         .stderr(predicates::str::contains("queries.toml"));
 }
 
+// --- Task 3 (W17): projection push-down ---------------------------------
+//
+// A one-shot/`-e`/piped-batch/`query run` invocation knows its statement
+// text before the record store is built, so it materializes only the field
+// VALUES the query references instead of cloning every field of every file.
+// The load-bearing correctness constraint: `store.schema()` (and therefore
+// unknown-column validation + did-you-mean) must stay the FULL field-name
+// union regardless of which values got pruned — see
+// `typo_under_pushdown_still_errors_with_didyoumean` below.
+
+/// THE load-bearing guard: a typo'd column, under push-down, over a vault
+/// whose files have OTHER fields the query never references (`prd`), must
+/// still error naming the typo and suggesting the real field — identical to
+/// pre-push-down behavior. `SELECT staus` references only the literal
+/// (misspelled) field `staus`, so push-down would prune every record down to
+/// zero real values; if validation were derived from the pruned records'
+/// own fields (rather than the store's independently tracked full schema),
+/// the schema would look empty and the typo would silently stop erroring.
+#[test]
+fn typo_under_pushdown_still_errors_with_didyoumean() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["-e", "SELECT staus"])
+        .arg(td.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("unknown column `staus`"))
+        .stderr(predicates::str::contains("did you mean 'status'"));
+}
+
+/// A narrow query's push-down-pruned output must match the SAME column
+/// projected out of a `SELECT *` run, which projects
+/// [`crate::query::ast::SelectExpr::Star`] and so disables push-down
+/// (every field materialized). Same `WHERE`, same fixture -> same rows in
+/// the same order, so this proves pruning `prd`'s value out of every
+/// `Record` never changes what `status` reads as.
+#[test]
+fn pushdown_output_is_byte_identical() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+
+    let narrow = qm(home.path())
+        .args(["-e", "SELECT status WHERE prd = '010'", "--format", "json"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let full = qm(home.path())
+        .args(["-e", "SELECT * WHERE prd = '010'", "--format", "json"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let narrow_rows: Vec<serde_json::Value> = serde_json::from_slice(&narrow).unwrap();
+    let full_rows: Vec<serde_json::Value> = serde_json::from_slice(&full).unwrap();
+    assert_eq!(narrow_rows.len(), full_rows.len());
+    assert!(!narrow_rows.is_empty());
+
+    let projected_from_full: Vec<serde_json::Value> = full_rows
+        .iter()
+        .map(|row| serde_json::json!({ "status": row["status"] }))
+        .collect();
+    assert_eq!(
+        narrow_rows, projected_from_full,
+        "a push-down-pruned narrow query must return the exact same values \
+         a SELECT * run (which disables push-down) returns for that column"
+    );
+}
+
+/// `SELECT *` must disable pruning entirely: every frontmatter field present
+/// on the fixture files (`status`, `prd`) shows up on every row, not just
+/// the columns some OTHER statement in the same run might have referenced.
+#[test]
+fn select_star_disables_pruning() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    let out = qm(home.path())
+        .args(["-e", "SELECT *", "--format", "json"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(&out).unwrap();
+    assert!(!rows.is_empty());
+    for row in &rows {
+        let obj = row.as_object().expect("each row is a JSON object");
+        assert!(obj.contains_key("status"), "row missing status: {row}");
+        assert!(obj.contains_key("prd"), "row missing prd: {row}");
+    }
+}
+
+/// `count(*)` references no field at all, so push-down prunes every value
+/// out of every materialized `Record` — but the row count must still be
+/// correct, since counting rows never needed the field values to begin with.
+#[test]
+fn count_star_pushdown_prunes_all_fields_but_counts_correctly() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    let out = qm(home.path())
+        .args(["-e", "SELECT count(*) AS n", "--format", "csv"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(String::from_utf8(out).unwrap().trim(), "n\n3");
+}
+
 /// Builds a tree with one file each layer of `explain` can attribute an
 /// exclusion to: a plain included markdown file, a wrong-extension file, and
 /// a file inside a hidden directory.

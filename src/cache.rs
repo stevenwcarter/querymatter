@@ -9,8 +9,8 @@
 //! record and a freshly scanned one never disagree.
 
 use indexmap::IndexMap;
-use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -648,18 +648,45 @@ fn content_equal(a: &[CachedDir], b: &[CachedDir]) -> bool {
 /// since a live scan ([`crate::store::scan_root`]) resolves every record's
 /// `file.*` attributes relative to that same root, not to a file's
 /// immediate containing directory.
-pub fn records_from(root: &Path, dirs: &[CachedDir]) -> Vec<(PathBuf, Vec<Record>)> {
+///
+/// `wanted` implements projection push-down (design W17): `None` keeps every
+/// field's value on each `Record` (today's behavior); `Some(set)` keeps only
+/// the values whose key is in `set`, cloning just those entries rather than
+/// every field. Either way, the returned `BTreeSet<String>` alongside each
+/// directory's records is the FULL field-name union read from the cache —
+/// computed from every [`CachedFile::fields`] key regardless of `wanted` —
+/// so a caller can retain it as the store's true schema even when the
+/// records themselves carry only a pruned subset of values. This on-disk
+/// cache data is never itself pruned (only [`build_vault`]/`refresh_*`,
+/// which write it, run over every field), so a later query for a different
+/// field still finds it here.
+pub fn records_from(
+    root: &Path,
+    dirs: &[CachedDir],
+    wanted: Option<&BTreeSet<String>>,
+) -> Vec<(PathBuf, Vec<Record>, BTreeSet<String>)> {
     dirs.iter()
         .map(|cached_dir| {
+            let mut field_names = BTreeSet::new();
             let records = cached_dir
                 .files
                 .iter()
                 .map(|file| {
+                    field_names.extend(file.fields.keys().cloned());
                     let path = cached_dir.dir.join(&file.rel_path);
-                    Record::new(root, &path, file.fields.clone())
+                    let fields = match wanted {
+                        None => file.fields.clone(),
+                        Some(set) => file
+                            .fields
+                            .iter()
+                            .filter(|(name, _)| set.contains(name.as_str()))
+                            .map(|(name, value)| (name.clone(), value.clone()))
+                            .collect(),
+                    };
+                    Record::new(root, &path, fields)
                 })
                 .collect();
-            (cached_dir.dir.clone(), records)
+            (cached_dir.dir.clone(), records, field_names)
         })
         .collect()
 }
@@ -1210,13 +1237,13 @@ mod tests {
         write_file(td.path(), "plans/a.md", "---\nstatus: draft\n---\n");
 
         let cached = build_initial_cache(td.path());
-        let cached_records: Vec<Record> = records_from(td.path(), &cached)
+        let cached_records: Vec<Record> = records_from(td.path(), &cached, None)
             .into_iter()
-            .flat_map(|(_, records)| records)
+            .flat_map(|(_, records, _field_names)| records)
             .collect();
 
         let (live_store, _report) =
-            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default());
+            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default(), None);
         let live_records: Vec<&Record> = live_store.records().collect();
 
         assert_eq!(cached_records.len(), 1);
