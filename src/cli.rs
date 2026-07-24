@@ -16,7 +16,6 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
-use globset::Glob;
 
 use crate::cache::Freshness;
 use crate::config::ConfigKey;
@@ -25,12 +24,15 @@ use crate::render::{Format, TableStyle};
 /// Every flag that shapes a directory walk, shared verbatim between query
 /// mode and `querymatter init` via `#[command(flatten)]`.
 ///
-/// Grouping them here keeps [`validate_excludes`](WalkFlags::validate_excludes)
-/// and [`ignore_files`](WalkFlags::ignore_files) — which only ever read these
-/// fields — off [`Cli`], so `init` reuses the exact same discovery semantics.
-/// Turning the raw flags into a [`WalkOpts`](crate::discover::WalkOpts) is
+/// Grouping them here keeps [`ignore_files`](WalkFlags::ignore_files) — which
+/// only ever reads these fields — off [`Cli`], so `init` reuses the exact
+/// same discovery semantics. Turning the raw flags into a
+/// [`WalkOpts`](crate::discover::WalkOpts) is
 /// [`Settings::walk_opts`](crate::settings::Settings::walk_opts)'s job, since
-/// only the resolver knows which layer won for each field.
+/// only the resolver knows which layer won for each field. Exclude-glob
+/// validation ([`crate::discover::validate_excludes`]) runs on the
+/// *resolved* setting, not the flag alone, so a bad glob from the config
+/// file is caught too — see `run_query`/`run_init` in `main.rs`.
 #[derive(Debug, Args)]
 pub struct WalkFlags {
     /// File extensions (without the leading dot) to include. [default: md,markdown]
@@ -69,16 +71,6 @@ pub struct WalkFlags {
 }
 
 impl WalkFlags {
-    /// Rejects any `--exclude` glob that `globset` cannot compile, naming the
-    /// bad pattern, so invalid input surfaces up front instead of being
-    /// silently ignored deeper in discovery.
-    pub fn validate_excludes(&self) -> anyhow::Result<()> {
-        for pat in &self.exclude {
-            Glob::new(pat).with_context(|| format!("invalid --exclude glob {pat:?}"))?;
-        }
-        Ok(())
-    }
-
     /// Ordered list of gitignore-style ignore files to apply, earliest first:
     /// the cwd `.querymatterignore` (unless `--no-ignore-file`) followed by each
     /// `--ignore-file` in order. This is the single seam the `.querymatter`

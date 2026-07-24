@@ -310,9 +310,14 @@ so the asymmetry is deliberate rather than accidental).
 
 - **`.querymatterignore` remains the project-local exclusion mechanism.** The
   config's `exclude` key is user-global and does not replace it; both apply.
-- **The config file is read exactly once, at startup.** A `config set` run in
-  another shell cannot change a running session mid-query. The REPL's `.set`
-  mutates the in-memory `Settings` directly, not by re-reading the file.
+- **The config file is read once per session, at resolution time.** A
+  `config set` run in another shell cannot change an already-running
+  session's resolved `Settings`. This is narrower than "read exactly once
+  overall": *within* a session, the REPL's `.set`/`.unset` re-read the file on
+  every call rather than reusing an in-memory snapshot, precisely so a prior
+  `.set` to a sibling key earlier in the same session isn't clobbered (see
+  `Session::persist_set_at`) — that governs what gets written to the file, not
+  what a different, already-resolved session sees.
 - **`Settings::default()` is the single source of truth for built-in
   defaults.** Removing clap's `default_value` means `--help` text and the
   resolver could drift; a test asserts the defaults named in the help output

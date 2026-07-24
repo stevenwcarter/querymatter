@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use clap::{ArgMatches, CommandFactory, FromArgMatches};
 
-use crate::cli::{Cli, Command, CompletionsArgs, ConfigAction, InitArgs};
+use crate::cli::{Cli, Command, CompletionsArgs, ConfigAction, ConfigArgs, InitArgs};
 use crate::config::Config;
 use crate::session::{Session, split_statements};
 use crate::settings::Settings;
@@ -39,11 +39,22 @@ use crate::store::{InMemoryStore, RecordStore};
 fn main() -> anyhow::Result<()> {
     let matches = Cli::command().get_matches();
     let cli = Cli::from_arg_matches(&matches)?;
-    // Completions must work even with a broken config file — it is how a user
-    // installs the completion that helps them type `config set` correctly.
-    if let Some(Command::Completions(args)) = &cli.command {
-        run_completions(args);
-        return Ok(());
+    // Completions and `config path` must both work even with a broken config
+    // file: completions is how a user installs the completion that helps
+    // them type `config set` correctly, and `config path` is the one command
+    // a user with a broken config reaches for to find the file worth fixing.
+    // Neither needs config *content* — completions only needs the parser
+    // shape, and `path` only reports where the file would be — so both are
+    // dispatched here, before `config::load()` can fail on them.
+    match &cli.command {
+        Some(Command::Completions(args)) => {
+            run_completions(args);
+            return Ok(());
+        }
+        Some(Command::Config(ConfigArgs {
+            action: ConfigAction::Path,
+        })) => return run_config_path(),
+        _ => {}
     }
     let config = config::load()?;
     match &cli.command {
@@ -82,14 +93,18 @@ fn run_completions(args: &CompletionsArgs) {
 /// All summary output goes to stderr; `init` produces no stdout so it composes
 /// cleanly in scripts.
 fn run_init(args: &InitArgs, config: &Config, matches: &ArgMatches) -> anyhow::Result<()> {
-    args.walk.validate_excludes()?;
+    let settings = Settings::resolve_walk(&args.walk, config, matches);
+    // Validated on the RESOLVED exclude list (flag, config, or default —
+    // whichever won), not `args.walk.exclude` alone, so a bad glob from a
+    // hand-edited config file is caught too, not just one typed on the
+    // command line (IMPORTANT 1).
+    discover::validate_excludes(&settings.exclude.value)?;
 
     let cwd = env::current_dir().context("failed to determine the current directory")?;
     let target = args.dir.clone().unwrap_or(cwd);
     let base = fs::canonicalize(&target)
         .with_context(|| format!("cannot access directory {}", target.display()))?;
 
-    let settings = Settings::resolve_walk(&args.walk, config, matches);
     let mut opts = settings.walk_opts();
     opts.ignore_files = args.walk.ignore_files()?;
 
@@ -211,12 +226,21 @@ fn run_config(
                 );
             }
         }
-        ConfigAction::Path => {
-            let path = config::config_path()
-                .context("cannot determine a config directory for this user")?;
-            println!("{}", path.display());
-        }
+        ConfigAction::Path => unreachable!("dispatched in main before config::load"),
     }
+    Ok(())
+}
+
+/// Prints the config file's path to stdout, whether or not it exists or is
+/// valid. Dispatched from `main` before `config::load()` (alongside
+/// completions), since `config path` needs no config *content* — only its
+/// location — and must keep working even when the file is malformed, matching
+/// the README's promise that a broken config is always recoverable via
+/// `querymatter config path`.
+fn run_config_path() -> anyhow::Result<()> {
+    let path =
+        config::config_path().context("cannot determine a config directory for this user")?;
+    println!("{}", path.display());
     Ok(())
 }
 
@@ -225,9 +249,16 @@ fn run_config(
 /// then dispatches to one-shot, batch, or interactive mode.
 fn run_query(cli: &Cli, config: &Config, matches: &ArgMatches) -> anyhow::Result<()> {
     cli.validate()?;
-    cli.walk.validate_excludes()?;
 
     let settings = Settings::resolve(cli, config, matches);
+    // Validated on the RESOLVED exclude list (flag, config, or default —
+    // whichever won), not `cli.walk.exclude` alone: a hand-edited config
+    // file's `exclude` must be rejected here too. `config::set` already
+    // rejects a bad glob up front for the normal `config set exclude` path,
+    // but a hand-edited file bypasses that, and `discover`'s own glob
+    // compiler has no error channel and would otherwise silently drop it
+    // (IMPORTANT 1).
+    discover::validate_excludes(&settings.exclude.value)?;
     let mut opts = settings.walk_opts();
     opts.ignore_files = cli.walk.ignore_files()?;
 

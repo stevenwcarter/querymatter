@@ -297,7 +297,7 @@ fn enum_name<T: clap::ValueEnum>(value: &T) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::Cli;
+    use crate::cli::{Cli, Command};
     use crate::config::Config;
     use crate::render::{Format, TableStyle};
     use clap::{CommandFactory, FromArgMatches};
@@ -453,6 +453,35 @@ mod tests {
         assert!(opts.respect_gitignore);
         assert_eq!(opts.excludes, vec!["**/x/**".to_string()]);
         assert!(opts.ignore_files.is_empty(), "filled by the caller");
+    }
+
+    /// `Settings::resolve_walk` — what `init` actually calls, per
+    /// `main::run_init` — must pick up a configured `hidden = true` on its
+    /// own. Every other precedence test above goes through `Settings::resolve`
+    /// (query mode), which just delegates the scan fields to `resolve_walk`
+    /// via `..Settings::resolve_walk(...)`; nothing pinned `resolve_walk`
+    /// directly against `init`'s own nested `ArgMatches` until now (RECOMMENDED 5).
+    #[test]
+    fn resolve_walk_picks_up_a_configured_hidden_true() {
+        let mut command = Cli::command().mut_arg("table_style", |a| a.env(None::<&str>));
+        let matches = command
+            .try_get_matches_from_mut(["querymatter", "init"])
+            .unwrap();
+        let cli = Cli::from_arg_matches(&matches).unwrap();
+        let Some(Command::Init(init_args)) = &cli.command else {
+            panic!("expected an Init subcommand");
+        };
+        let sub_matches = matches
+            .subcommand_matches("init")
+            .expect("Command::Init parsed implies the init subcommand matched");
+        let config = config_with(|c| c.hidden = Some(true));
+
+        let settings = Settings::resolve_walk(&init_args.walk, &config, sub_matches);
+        assert!(
+            settings.hidden.value,
+            "config hidden = true must reach init's walk"
+        );
+        assert_eq!(settings.hidden.source, Source::Config);
     }
 
     #[test]

@@ -16,6 +16,7 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
 use crate::cache::write_atomic;
+use crate::discover;
 use crate::render::{Format, TableStyle};
 
 /// The persisted settings, as read from and written to `config.toml`.
@@ -179,9 +180,21 @@ pub fn set(config: &mut Config, key: ConfigKey, value: &str) -> anyhow::Result<(
         ConfigKey::RespectGitignore => config.respect_gitignore = Some(parse_bool(key, value)?),
         ConfigKey::Hidden => config.hidden = Some(parse_bool(key, value)?),
         ConfigKey::Ext => config.ext = Some(split_list(value)),
-        ConfigKey::Exclude => config.exclude = Some(split_list(value)),
+        ConfigKey::Exclude => config.exclude = Some(parse_exclude_list(value)?),
     }
     Ok(())
+}
+
+/// Splits `value` into glob patterns and validates each one via
+/// [`discover::validate_excludes`], so a `config set exclude` with a pattern
+/// `globset` cannot compile is rejected here — at write time, naming the
+/// offending pattern — rather than silently doing nothing at scan time
+/// (`discover`'s own glob compiler has no error channel back to its caller
+/// and drops what doesn't compile).
+fn parse_exclude_list(value: &str) -> anyhow::Result<Vec<String>> {
+    let patterns = split_list(value);
+    discover::validate_excludes(&patterns)?;
+    Ok(patterns)
 }
 
 /// Removes `key` from `config`, returning it to the next precedence layer.
@@ -408,6 +421,43 @@ mod tests {
         let before = config.clone();
         assert!(set(&mut config, ConfigKey::RespectGitignore, "yes").is_err());
         assert_eq!(config, before);
+    }
+
+    /// A `config set exclude` with a glob `globset` cannot compile must be
+    /// rejected up front, naming the offending pattern, and must not mutate
+    /// `config` — otherwise a config-supplied `exclude` silently does
+    /// nothing at scan time instead of failing loudly (IMPORTANT 1).
+    #[test]
+    fn set_rejects_an_invalid_exclude_glob_leaving_config_untouched() {
+        let mut config = Config::default();
+        let before = config.clone();
+        let err = format!(
+            "{:#}",
+            set(&mut config, ConfigKey::Exclude, "[plans/**").unwrap_err()
+        );
+        assert!(
+            err.contains("[plans/**"),
+            "must name the bad pattern, got: {err}"
+        );
+        assert_eq!(config, before, "a rejected set must not mutate");
+    }
+
+    #[test]
+    fn set_accepts_a_mix_of_valid_exclude_globs() {
+        let mut config = Config::default();
+        set(
+            &mut config,
+            ConfigKey::Exclude,
+            "**/templates/**,*.draft.md",
+        )
+        .unwrap();
+        assert_eq!(
+            config.exclude,
+            Some(vec![
+                "**/templates/**".to_string(),
+                "*.draft.md".to_string()
+            ])
+        );
     }
 
     #[test]

@@ -37,9 +37,10 @@ piped stdin.
 `-e`/`--query` always wins if given; otherwise piped (non-TTY) stdin means
 batch mode; otherwise you get the REPL.
 
-**stdout carries query results only.** Warnings (e.g. a file with malformed
-frontmatter), reload reports, and prompts all go to stderr, so
-`querymatter -e '…' --format json | jq` always sees pure JSON.
+**stdout carries data** — query results, `config list`/`get`/`path` output,
+and completion scripts. Every diagnostic, warning, confirmation, and prompt
+goes to stderr, so `querymatter -e '…' --format json | jq` always sees pure
+JSON.
 
 ## The query DSL
 
@@ -270,8 +271,19 @@ exclude            (none)       (default)
 ```
 
 A malformed config file, an unknown key, or an invalid value is a hard error
-naming the file — a typo must not silently do nothing. The file is read once,
-at startup.
+naming the file — a typo must not silently do nothing. The file is read once
+per session, at resolution time: a `config set` run in another shell cannot
+change an already-running session's resolved settings. (Inside a single
+session, the REPL's `.set`/`.unset` re-read the file on every call rather than
+a cached snapshot, so a prior `.set` to a sibling key earlier in that same
+session survives a later one — but that governs what gets written to the
+file, not what a different, already-running session resolved.)
+
+`config set`/`config unset` rewrite the whole file from the parsed settings,
+so any comments, blank lines, or key order you added by hand are **not**
+preserved. If you hand-edit `config.toml` (e.g. to add the comments in the
+example above), keep documentation like that in a separate note rather than
+relying on it surviving the next `config set`/`config unset`.
 
 ## Shell completions
 
@@ -293,8 +305,9 @@ querymatter completions zsh > "${fpath[1]}/_querymatter"
 querymatter completions fish > ~/.config/fish/completions/querymatter.fish
 ```
 
-Completions work even when the config file is malformed, so you can always
-tab-complete your way to `querymatter config path`.
+Completions — and `config path` itself — work even when the config file is
+malformed, so you can always tab-complete your way to `querymatter config
+path` and find the file worth fixing.
 
 ## REPL dot-commands
 
