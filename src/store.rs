@@ -8,6 +8,7 @@ use std::time::SystemTime;
 use crate::cache::{self, CachedDir, CachedFile, Freshness, ScanResult};
 use crate::discover::{self, WalkOpts};
 use crate::model::{FileAttr, Record};
+use crate::parallel;
 
 /// Summary of a load/reload operation: how many files became records, how
 /// many were skipped (no valid frontmatter, or unreadable), and a
@@ -323,12 +324,20 @@ impl RecordStore for InMemoryStore {
 /// discarding the on-disk stat it carries, since a live scan doesn't need
 /// it. A file that fails to read from disk is treated like invalid
 /// frontmatter: it's counted as skipped and warned about, not a hard error.
+///
+/// The read+parse itself runs across [`parallel::map_paths`]'s worker
+/// threads, but the results are folded into `records`/`report` in
+/// `discover`'s path-sorted order (the order `map_paths` returns them in),
+/// so the outcome is byte-for-byte identical to the old serial loop — just
+/// not bottlenecked on one core.
 fn scan_root(root: &Path, opts: &WalkOpts) -> (Vec<Record>, LoadReport) {
+    let paths = discover::discover(root, opts);
+    let scanned = parallel::map_paths(paths, |path| cache::scan_file(root, path));
+
     let mut records = Vec::new();
     let mut report = LoadReport::default();
-
-    for path in discover::discover(root, opts) {
-        match cache::scan_file(root, &path) {
+    for (path, result) in scanned {
+        match result {
             ScanResult::Cached(file) => {
                 records.push(Record::new(root, &path, file.fields));
                 report.loaded += 1;
@@ -649,5 +658,91 @@ mod tests {
             InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default());
         assert_eq!(report.skipped, 1);
         assert_eq!(report.warnings.len(), 1);
+    }
+
+    /// Guard for Task 2 (parallel scan): the read+parse of each file happens
+    /// across worker threads, but `InMemoryStore::load`'s records and the
+    /// load report's warnings must come out in exactly the order a serial
+    /// scan would produce — `discover`'s path-sorted order — regardless of
+    /// which worker finishes first.
+    #[test]
+    fn parallel_scan_matches_serial_records_and_order() {
+        let td = TempDir::new().unwrap();
+        for i in 0..20 {
+            write(
+                td.path(),
+                &format!("dir{}/file{i:02}.md", i % 4),
+                &format!("---\nstatus: s{i:02}\n---\n"),
+            );
+        }
+        write(td.path(), "no_fm_a.md", "no frontmatter here\n");
+        write(td.path(), "no_fm_b.md", "also no frontmatter\n");
+        write(td.path(), "bad.md", "---\n: : broken\n  x\n---\n");
+
+        // Independently derive the expected order from `discover`'s (already
+        // path-sorted) output and the pure `cache::scan_file`, rather than
+        // reusing `scan_root` itself, so this doesn't just check the
+        // parallel code against a copy of itself.
+        let mut expected_paths = Vec::new();
+        let mut expected_warnings = Vec::new();
+        for path in discover::discover(td.path(), &WalkOpts::default()) {
+            match cache::scan_file(td.path(), &path) {
+                ScanResult::Cached(_) => expected_paths.push(path),
+                ScanResult::NoFrontmatter => {}
+                ScanResult::Warning(msg) => expected_warnings.push(msg),
+            }
+        }
+
+        let (store, report) =
+            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default());
+
+        let got_paths: Vec<PathBuf> = store
+            .records()
+            .map(|r| match r.file_attr(FileAttr::Path) {
+                Value::Str(rel) => td.path().join(rel),
+                other => panic!("file.path must be a string, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            got_paths, expected_paths,
+            "records must come out in path-sorted (serial) order"
+        );
+        assert_eq!(
+            report.warnings, expected_warnings,
+            "warnings must come out in path-sorted (serial) order"
+        );
+        assert_eq!(report.loaded, 20);
+        assert_eq!(report.skipped, 1);
+    }
+
+    /// Guard for Task 2: loading the same tree twice must yield identical row
+    /// order for a query with no `ORDER BY` — the parallel scan must not
+    /// introduce run-to-run nondeterminism.
+    #[test]
+    fn scan_is_deterministic_across_runs() {
+        let td = TempDir::new().unwrap();
+        for i in 0..20 {
+            write(
+                td.path(),
+                &format!("dir{}/file{i:02}.md", i % 4),
+                &format!("---\nstatus: s{i:02}\n---\n"),
+            );
+        }
+
+        let parsed = crate::query::parse("SELECT file.path").unwrap();
+        let mut runs = Vec::new();
+        for _ in 0..5 {
+            let (store, _report) =
+                InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default());
+            let result = crate::query::execute(&parsed, store.records(), false).unwrap();
+            runs.push(result.rows);
+        }
+
+        for run in &runs[1..] {
+            assert_eq!(
+                run, &runs[0],
+                "row order with no ORDER BY must be identical run-to-run"
+            );
+        }
     }
 }

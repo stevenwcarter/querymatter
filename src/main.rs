@@ -16,6 +16,7 @@ pub mod frontmatter;
 mod gitignore;
 pub mod model;
 mod output;
+mod parallel;
 mod queries;
 pub mod query;
 pub mod render;

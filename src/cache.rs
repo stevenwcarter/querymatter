@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::discover::{self, WalkOpts};
 use crate::frontmatter::{self, Extract};
 use crate::model::{Record, Value};
+use crate::parallel;
 use crate::store::LoadReport;
 
 /// The on-disk directory (relative to a vault root) holding `manifest.bin`
@@ -415,7 +416,24 @@ pub fn refresh_against_cache(
     }
 }
 
+/// The parent directory `path` lives directly under, for a scan rooted at
+/// `vault`: `path`'s parent, or `vault` itself when `path` has none (a file
+/// directly at the vault root, given as a relative single-component path).
+/// Shared by every function that groups discovered files by their
+/// containing directory.
+fn file_dir(vault: &Path, path: &Path) -> PathBuf {
+    path.parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| vault.to_path_buf())
+}
+
 /// The accurate per-file freshness check (see [`Freshness::PerFile`]).
+///
+/// The per-file work — [`refresh_one_file`] for every discovered path — runs
+/// across [`parallel::map_paths`]'s worker threads; the results come back
+/// sorted by path, so folding them into `by_dir`/`report` below reproduces
+/// exactly the order the old serial `for path in discover(...)` loop
+/// produced, regardless of which worker finished first.
 fn refresh_per_file(
     vault: &Path,
     cached: &[CachedDir],
@@ -431,15 +449,18 @@ fn refresh_per_file(
         })
         .collect();
 
+    let paths = discover::discover(vault, opts);
+    let outcomes = parallel::map_paths(paths, |path| {
+        let dir = file_dir(vault, path);
+        let previous = cached_by_path.get(path).copied();
+        refresh_one_file(&dir, path, previous)
+    });
+
     let mut report = LoadReport::default();
     let mut by_dir: BTreeMap<PathBuf, Vec<CachedFile>> = BTreeMap::new();
-    for path in discover::discover(vault, opts) {
-        let dir = path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| vault.to_path_buf());
-        let previous = cached_by_path.get(&path).copied();
-        if let Some(file) = refresh_one_file(&dir, &path, previous, &mut report) {
+    for (path, outcome) in outcomes {
+        let dir = file_dir(vault, &path);
+        if let Some(file) = fold_refresh_outcome(outcome, &mut report) {
             by_dir.entry(dir).or_default().push(file);
         }
     }
@@ -461,32 +482,52 @@ fn refresh_per_file(
     (dirs, report, changed)
 }
 
+/// The outcome of refreshing one file against its previous cached entry:
+/// mirrors [`ScanResult`], but the "unchanged" case reuses `previous` instead
+/// of re-reading the file's content.
+///
+/// Kept separate from [`LoadReport`] bookkeeping (see [`fold_refresh_outcome`])
+/// so [`refresh_one_file`] stays a pure `(dir, path, previous) -> outcome`
+/// function with no shared mutable state — safe to run for many paths at once
+/// across [`parallel::map_paths`]'s worker threads.
+enum RefreshOutcome {
+    /// Loaded, whether reused verbatim from `previous` or freshly scanned.
+    Loaded(CachedFile),
+    /// No frontmatter fence: silently skipped.
+    NoFrontmatter,
+    /// Unreadable file or invalid frontmatter, with a reason for the report.
+    Warning(String),
+}
+
 /// Refreshes one current file against its previous cached entry (if any):
 /// reuses the cached fields when `(mtime, size)` are unchanged, otherwise
-/// re-scans. Returns `None` when the file has no frontmatter or couldn't be
-/// read/parsed — already folded into `report` in that case.
-fn refresh_one_file(
-    dir: &Path,
-    path: &Path,
-    previous: Option<&CachedFile>,
-    report: &mut LoadReport,
-) -> Option<CachedFile> {
+/// re-scans via [`scan_file`].
+fn refresh_one_file(dir: &Path, path: &Path, previous: Option<&CachedFile>) -> RefreshOutcome {
     if let Some(previous) = previous
         && let Ok((mtime, size)) = stat_file(path)
         && mtime == previous.mtime
         && size == previous.size
     {
-        report.loaded += 1;
-        return Some(previous.clone());
+        return RefreshOutcome::Loaded(previous.clone());
     }
 
     match scan_file(dir, path) {
-        ScanResult::Cached(file) => {
+        ScanResult::Cached(file) => RefreshOutcome::Loaded(file),
+        ScanResult::NoFrontmatter => RefreshOutcome::NoFrontmatter,
+        ScanResult::Warning(msg) => RefreshOutcome::Warning(msg),
+    }
+}
+
+/// Folds a [`RefreshOutcome`] into `report` (a loaded file, or a skip with
+/// its warning), returning the file when one was loaded.
+fn fold_refresh_outcome(outcome: RefreshOutcome, report: &mut LoadReport) -> Option<CachedFile> {
+    match outcome {
+        RefreshOutcome::Loaded(file) => {
             report.loaded += 1;
             Some(file)
         }
-        ScanResult::NoFrontmatter => None,
-        ScanResult::Warning(msg) => {
+        RefreshOutcome::NoFrontmatter => None,
+        RefreshOutcome::Warning(msg) => {
             report.skipped += 1;
             report.warnings.push(msg);
             None
@@ -512,7 +553,9 @@ fn stat_dir_mtime(dir: &Path, report: &mut LoadReport) -> SystemTime {
 /// `dir_mtime` still matches the cached value and it's still within
 /// `ttl_secs` of its last scan; otherwise falls back to [`refresh_one_file`]
 /// (the same per-file check [`refresh_per_file`] uses) for that directory's
-/// files only.
+/// files only, run in parallel across [`parallel::map_paths`]'s worker
+/// threads (sorted back to that directory's original file order — the same
+/// order [`discover`] found them in — before building its [`CachedDir`]).
 fn refresh_fast(
     vault: &Path,
     cached: &[CachedDir],
@@ -533,11 +576,10 @@ fn refresh_fast(
 
     let mut paths_by_dir: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
     for path in discover::discover(vault, opts) {
-        let dir = path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| vault.to_path_buf());
-        paths_by_dir.entry(dir).or_default().push(path);
+        paths_by_dir
+            .entry(file_dir(vault, &path))
+            .or_default()
+            .push(path);
     }
 
     let now = SystemTime::now();
@@ -557,12 +599,13 @@ fn refresh_fast(
                 return (*previous).clone();
             }
 
-            let files: Vec<CachedFile> = paths
-                .iter()
-                .filter_map(|path| {
-                    let previous = cached_by_path.get(path).copied();
-                    refresh_one_file(&dir, path, previous, &mut report)
-                })
+            let outcomes = parallel::map_paths(paths, |path| {
+                let previous = cached_by_path.get(path).copied();
+                refresh_one_file(&dir, path, previous)
+            });
+            let files: Vec<CachedFile> = outcomes
+                .into_iter()
+                .filter_map(|(_, outcome)| fold_refresh_outcome(outcome, &mut report))
                 .collect();
             CachedDir {
                 dir,
@@ -653,13 +696,11 @@ pub fn refresh_subtree(
         if !path.starts_with(subtree) {
             continue;
         }
-        let dir = path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| vault.to_path_buf());
+        let dir = file_dir(vault, &path);
         // `previous: None` forces `refresh_one_file` straight to `scan_file`
         // for every file, ignoring any cached (mtime, size) shortcut.
-        if let Some(file) = refresh_one_file(&dir, &path, None, &mut report) {
+        let outcome = refresh_one_file(&dir, &path, None);
+        if let Some(file) = fold_refresh_outcome(outcome, &mut report) {
             by_dir.entry(dir).or_default().push(file);
         }
     }
@@ -1181,5 +1222,173 @@ mod tests {
         assert_eq!(cached_records.len(), 1);
         assert_eq!(live_records.len(), 1);
         assert_eq!(&cached_records[0], live_records[0]);
+    }
+
+    /// Every directory's `rel_path`s, in the order they appear in `dirs` and
+    /// within each `CachedDir` — used by the Task 2 (parallel scan)
+    /// determinism/order tests below to compare two refreshes' shapes
+    /// without `scanned_at`, which always advances, getting in the way.
+    fn dirs_snapshot(dirs: &[CachedDir]) -> Vec<(PathBuf, Vec<String>)> {
+        dirs.iter()
+            .map(|d| {
+                (
+                    d.dir.clone(),
+                    d.files.iter().map(|f| f.rel_path.clone()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// Writes `n` frontmatter files spread across 4 subdirectories (so a
+    /// scan interleaves root-adjacent and nested paths), plus a malformed
+    /// file (alongside `dir0`'s other files, so it doesn't leave `dir0` with
+    /// zero loaded files — `refresh_fast` still emits an empty `CachedDir`
+    /// for a directory whose only file warned, an existing quirk of its
+    /// eager per-directory grouping that's out of scope here) — the shared
+    /// fixture for the Task 2 (parallel scan) order/determinism guard tests
+    /// below.
+    fn write_scan_fixture(dir: &Path, n: usize) {
+        for i in 0..n {
+            write_file(
+                dir,
+                &format!("dir{}/file{i:02}.md", i % 4),
+                &format!("---\nstatus: s{i:02}\n---\n"),
+            );
+        }
+        write_file(dir, "dir0/bad.md", "---\n: : broken\n  x\n---\n");
+    }
+
+    /// Independently derives the per-directory file order and warnings a
+    /// serial scan of `dir` would produce, by iterating `discover`'s
+    /// (already path-sorted) output directly and calling the pure
+    /// [`scan_file`] — i.e. without going through [`refresh_per_file`] or
+    /// [`refresh_fast`] at all, so the guard tests below aren't just
+    /// checking the parallel code against a copy of itself. The shape
+    /// matches [`dirs_snapshot`]'s so the two can be compared directly.
+    fn expected_scan_shape(dir: &Path) -> (Vec<(PathBuf, Vec<String>)>, Vec<String>) {
+        let mut by_dir: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
+        let mut warnings = Vec::new();
+        for path in discover::discover(dir, &WalkOpts::default()) {
+            let parent = file_dir(dir, &path);
+            match scan_file(&parent, &path) {
+                ScanResult::Cached(file) => {
+                    by_dir.entry(parent).or_default().push(file.rel_path);
+                }
+                ScanResult::NoFrontmatter => {}
+                ScanResult::Warning(msg) => warnings.push(msg),
+            }
+        }
+        (by_dir.into_iter().collect(), warnings)
+    }
+
+    /// Guard for Task 2: `refresh_per_file`'s per-file read+parse runs
+    /// across worker threads, but the returned `CachedDir`s' file order and
+    /// the report's warnings must match a serial scan exactly.
+    #[test]
+    fn refresh_per_file_matches_serial_order_and_content() {
+        let td = TempDir::new().unwrap();
+        write_scan_fixture(td.path(), 20);
+        let (expected_by_dir, expected_warnings) = expected_scan_shape(td.path());
+
+        let (dirs, report, _changed) = refresh_against_cache(
+            td.path(),
+            &[],
+            &WalkOpts::default(),
+            Freshness::PerFile,
+            300,
+        );
+
+        assert_eq!(
+            dirs_snapshot(&dirs),
+            expected_by_dir,
+            "per-directory file order must match a serial scan"
+        );
+        assert_eq!(
+            report.warnings, expected_warnings,
+            "warnings must be in path-sorted order"
+        );
+        assert_eq!(report.loaded, 20);
+        assert_eq!(report.skipped, 1);
+    }
+
+    /// Guard for Task 2: reloading the same tree with `Freshness::PerFile`
+    /// repeatedly must yield an identical shape every time — the parallel
+    /// scan must not introduce run-to-run nondeterminism.
+    #[test]
+    fn refresh_per_file_is_deterministic_across_runs() {
+        let td = TempDir::new().unwrap();
+        write_scan_fixture(td.path(), 20);
+
+        let (first, _, _) = refresh_against_cache(
+            td.path(),
+            &[],
+            &WalkOpts::default(),
+            Freshness::PerFile,
+            300,
+        );
+        let baseline = dirs_snapshot(&first);
+        for _ in 0..4 {
+            let (dirs, _, _) = refresh_against_cache(
+                td.path(),
+                &[],
+                &WalkOpts::default(),
+                Freshness::PerFile,
+                300,
+            );
+            assert_eq!(
+                dirs_snapshot(&dirs),
+                baseline,
+                "PerFile refresh order must be stable run-to-run"
+            );
+        }
+    }
+
+    /// Guard for Task 2: `refresh_fast`'s per-directory rescan branch (the
+    /// one whose files it now refreshes in parallel) must match a serial
+    /// scan's file order and warnings exactly. An empty `cached` makes every
+    /// directory's `dir_mtime` lookup miss, forcing every directory through
+    /// that branch.
+    #[test]
+    fn refresh_fast_matches_serial_order_when_rescanning() {
+        let td = TempDir::new().unwrap();
+        write_scan_fixture(td.path(), 20);
+        let (expected_by_dir, expected_warnings) = expected_scan_shape(td.path());
+
+        let (dirs, report, _changed) =
+            refresh_against_cache(td.path(), &[], &WalkOpts::default(), Freshness::Fast, 300);
+
+        assert_eq!(
+            dirs_snapshot(&dirs),
+            expected_by_dir,
+            "per-directory file order must match a serial scan"
+        );
+        assert_eq!(
+            report.warnings, expected_warnings,
+            "warnings must be in path-sorted order"
+        );
+        assert_eq!(report.loaded, 20);
+        assert_eq!(report.skipped, 1);
+    }
+
+    /// Guard for Task 2: reloading the same tree with `Freshness::Fast`
+    /// repeatedly (each run forced through the per-directory rescan branch,
+    /// since `cached` is empty) must yield an identical shape every time.
+    #[test]
+    fn refresh_fast_is_deterministic_across_runs() {
+        let td = TempDir::new().unwrap();
+        write_scan_fixture(td.path(), 20);
+
+        let (first, _, _) =
+            refresh_against_cache(td.path(), &[], &WalkOpts::default(), Freshness::Fast, 300);
+        let baseline = dirs_snapshot(&first);
+        for _ in 0..4 {
+            let (dirs, _, _) =
+                refresh_against_cache(td.path(), &[], &WalkOpts::default(), Freshness::Fast, 300);
+            assert_eq!(
+                dirs_snapshot(&dirs),
+                baseline,
+                "Fast refresh order must be stable run-to-run"
+            );
+        }
     }
 }
