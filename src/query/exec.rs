@@ -526,8 +526,9 @@ fn literal_value(lit: &Literal) -> Value {
 /// selected bare or wrapped in e.g. `lower(...)`. Any `Null` argument
 /// short-circuits the whole call to `Null` (SQL-standard scalar null
 /// propagation). Argument count is validated at parse time
-/// (`parse::check_scalar_arity`), so a mismatch reaching here is a bug
-/// upstream rather than bad user input.
+/// (`parse::check_scalar_arity`), so a mismatch reaching here can only come
+/// from an in-crate caller building a bad-arity `Expr::Scalar` directly —
+/// that falls back to `Null` rather than panicking.
 pub(crate) fn apply_scalar(f: ScalarFn, args: &[Value]) -> Value {
     if args.iter().any(Value::is_null) {
         return Value::Null;
@@ -544,26 +545,37 @@ pub(crate) fn apply_scalar(f: ScalarFn, args: &[Value]) -> Value {
         (ScalarFn::Replace, [s, from, to]) => {
             Value::Str(s.display().replace(&from.display(), &to.display()))
         }
-        (f, args) => unreachable!("apply_scalar: {f:?} called with {} argument(s)", args.len()),
+        // Wrong arity can't come from the parser (see doc comment above);
+        // return `Null` rather than panicking on a hand-built bad call.
+        _ => Value::Null,
     }
 }
 
 /// `substr(s, start[, len])`: 1-based, char-indexed, clamped to `s`'s
-/// bounds; an out-of-range or non-numeric `start` yields `""`, and so does a
-/// non-numeric `len`.
+/// bounds; a non-numeric `start` or `len` yields `""`. A `start` at or
+/// before the first character clamps to it (e.g. `substr("ab", -2)` is
+/// `"ab"`, not `""`); only a `start` past the last character yields `""`.
+///
+/// All index arithmetic is saturating rather than raw `-`/`+`, so a
+/// wildly out-of-`i64`/`usize`-range `start` or `len` (e.g. a numeric
+/// literal like `-99999999999999999999`) clamps to the nearest in-bounds
+/// index instead of overflowing.
 fn substr(s: &str, start: &Value, len: Option<&Value>) -> Value {
     let Some(start) = start.as_number() else {
         return Value::Str(String::new());
     };
     let chars: Vec<char> = s.chars().collect();
-    let from = (start as i64 - 1).max(0) as usize;
+    // `start as i64` already saturates for an out-of-range `f64` (including
+    // NaN, which casts to 0); `saturating_sub` then keeps the following
+    // "make 1-based 0-based" step from overflowing at `i64::MIN`.
+    let from = (start as i64).saturating_sub(1).max(0) as usize;
     if from >= chars.len() {
         return Value::Str(String::new());
     }
     let to = match len {
         None => chars.len(),
         Some(len) => match len.as_number() {
-            Some(n) => (from + (n.max(0.0) as usize)).min(chars.len()),
+            Some(n) => from.saturating_add(n.max(0.0) as usize).min(chars.len()),
             None => from,
         },
     };
@@ -580,10 +592,11 @@ fn substr(s: &str, start: &Value, len: Option<&Value>) -> Value {
 /// **Arithmetic** (`+ - * / %`) coerces both operands to numbers the same
 /// way [`eval_compare`]'s numeric-literal comparison does; a non-numeric
 /// operand yields `Null` rather than a type error, and so does either
-/// operand being `Null`. Two `Int`s stay `Int` for `+ - * %`; `/` always
-/// promotes to `Float`; either operand being `Float` also promotes the
-/// result to `Float`. Divide/modulo by zero yields `Null` rather than
-/// panicking.
+/// operand being `Null`. `/` always promotes to `Float`. For `+ - * %`, the
+/// result is `Float` when either operand is a `Value::Float(_)` *or* either
+/// operand's coerced number is non-integral (e.g. a quoted numeric field
+/// like `"3.5"`) — otherwise it stays `Int`. Divide/modulo by zero yields
+/// `Null` rather than panicking.
 pub(crate) fn apply_binary(op: BinOp, l: &Value, r: &Value) -> Value {
     if op == BinOp::Concat {
         return match (l.is_null(), r.is_null()) {
@@ -597,7 +610,14 @@ pub(crate) fn apply_binary(op: BinOp, l: &Value, r: &Value) -> Value {
     let (Some(lv), Some(rv)) = (l.as_number(), r.as_number()) else {
         return Value::Null;
     };
-    let is_float = matches!(l, Value::Float(_)) || matches!(r, Value::Float(_));
+    // The result type is decided from the coerced numbers, not the
+    // pre-coercion `Value` tag alone: a quoted-numeric string operand
+    // (`Value::Str`) with a fractional value must still promote the
+    // result to `Float`, or a fractional result silently truncates.
+    let is_float = matches!(l, Value::Float(_))
+        || matches!(r, Value::Float(_))
+        || lv.fract() != 0.0
+        || rv.fract() != 0.0;
     match op {
         BinOp::Add => numeric_result(lv + rv, is_float),
         BinOp::Sub => numeric_result(lv - rv, is_float),
@@ -610,9 +630,8 @@ pub(crate) fn apply_binary(op: BinOp, l: &Value, r: &Value) -> Value {
     }
 }
 
-/// Wraps an arithmetic result as `Int` when both operands were integral,
-/// else `Float` — mirrors SQL's type-promotion rule that any `Float`
-/// operand promotes the result.
+/// Wraps an arithmetic result as `Float` when the caller determined either
+/// operand was a `Float` or non-integral (see [`apply_binary`]), else `Int`.
 fn numeric_result(v: f64, is_float: bool) -> Value {
     if is_float {
         Value::Float(v)
@@ -900,6 +919,93 @@ mod tests {
     }
 
     #[test]
+    fn substr_negative_or_zero_start_clamps_to_full_string() {
+        // A start at or before the first character clamps to it — it does
+        // NOT yield "" (only a start past the last character does; see
+        // `substr_clamps_out_of_range` above).
+        let s = |t: &str| Value::Str(t.into());
+        assert_eq!(
+            apply_scalar(ScalarFn::Substr, &[s("ab"), Value::Int(-2)]),
+            s("ab")
+        );
+        assert_eq!(
+            apply_scalar(ScalarFn::Substr, &[s("ab"), Value::Int(0)]),
+            s("ab")
+        );
+    }
+
+    #[test]
+    fn substr_overflow_safe_for_extreme_start_and_len() {
+        // Regression: an over-long numeric literal used to panic via a raw
+        // `-`/`+` on the saturated-but-extreme `i64`/`usize` index. All
+        // three cases must clamp to an in-bounds substring, never panic.
+        let s = |t: &str| Value::Str(t.into());
+
+        // Huge negative start: clamps to the first character.
+        assert_eq!(
+            apply_scalar(
+                ScalarFn::Substr,
+                &[s("hello"), Value::Float(-99999999999999999999.0)]
+            ),
+            s("hello")
+        );
+        // Huge positive len: clamps to the end of the string.
+        assert_eq!(
+            apply_scalar(
+                ScalarFn::Substr,
+                &[
+                    s("hello"),
+                    Value::Int(2),
+                    Value::Float(99999999999999999999.0)
+                ]
+            ),
+            s("ello")
+        );
+        // Huge positive start: past the end, yields "".
+        assert_eq!(
+            apply_scalar(
+                ScalarFn::Substr,
+                &[s("hello"), Value::Float(99999999999999999999.0)]
+            ),
+            s("")
+        );
+    }
+
+    #[test]
+    fn substr_select_survives_extreme_literals_without_panicking() {
+        // Same regression as `substr_overflow_safe_for_extreme_start_and_len`,
+        // pinned at the actual seam the bug was reported against: a real SQL
+        // literal parsed and executed end-to-end, not just the raw `Value`.
+        let rows = [rec("s", "s/a.md", &[("name", Value::Str("hello".into()))])];
+
+        let neg_start = parse("SELECT substr(name, -99999999999999999999)").unwrap();
+        assert_eq!(
+            execute(&neg_start, rows.iter()).unwrap().rows,
+            vec![vec![Value::Str("hello".into())]]
+        );
+
+        let huge_len = parse("SELECT substr(name, 2, 99999999999999999999)").unwrap();
+        assert_eq!(
+            execute(&huge_len, rows.iter()).unwrap().rows,
+            vec![vec![Value::Str("ello".into())]]
+        );
+
+        let huge_start = parse("SELECT substr(name, 99999999999999999999)").unwrap();
+        assert_eq!(
+            execute(&huge_start, rows.iter()).unwrap().rows,
+            vec![vec![Value::Str("".into())]]
+        );
+    }
+
+    #[test]
+    fn apply_scalar_wrong_arity_returns_null_not_panic() {
+        // apply_scalar is pub(crate); an in-crate caller hand-building a
+        // bad-arity Expr::Scalar must get Null, not a panic (the parser
+        // still rejects wrong arity up front for real queries).
+        assert_eq!(apply_scalar(ScalarFn::Lower, &[]), Value::Null);
+    }
+
+    #[test]
     fn arithmetic_types_and_null_safety() {
         assert_eq!(
             apply_binary(BinOp::Add, &Value::Int(2), &Value::Int(3)),
@@ -928,6 +1034,23 @@ mod tests {
         assert_eq!(
             apply_binary(BinOp::Add, &Value::Str("x".into()), &Value::Int(1)),
             Value::Null
+        );
+    }
+
+    #[test]
+    fn arithmetic_promotes_float_from_numeric_string_operand() {
+        // Regression: promotion used to be keyed on the operand's `Value`
+        // variant, so a quoted-numeric frontmatter field (`Value::Str`)
+        // never tripped the Float promotion and a fractional result
+        // truncated. It must now be keyed on the coerced number itself.
+        assert_eq!(
+            apply_binary(BinOp::Add, &Value::Str("3.5".into()), &Value::Int(1)),
+            Value::Float(4.5)
+        );
+        // A numeric string with an integral value still stays `Int`.
+        assert_eq!(
+            apply_binary(BinOp::Add, &Value::Str("4".into()), &Value::Int(1)),
+            Value::Int(5)
         );
     }
 
@@ -971,6 +1094,20 @@ mod tests {
         assert_eq!(
             execute(&concat, rows.iter()).unwrap().rows,
             vec![vec![Value::Str("3-Draft".into())]]
+        );
+    }
+
+    #[test]
+    fn select_arithmetic_promotes_float_from_numeric_string_field() {
+        // Same regression as `arithmetic_promotes_float_from_numeric_string_operand`,
+        // pinned end-to-end: a quoted-numeric frontmatter field (`Value::Str`,
+        // as `frontmatter.rs::pod_to_value` produces for `x: "3.5"`) must
+        // still promote `x + 1` to a `Float`, not truncate it.
+        let rows = [rec("s", "s/a.md", &[("x", Value::Str("3.5".into()))])];
+        let q = parse("SELECT x + 1").unwrap();
+        assert_eq!(
+            execute(&q, rows.iter()).unwrap().rows,
+            vec![vec![Value::Float(4.5)]]
         );
     }
 

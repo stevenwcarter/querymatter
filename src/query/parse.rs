@@ -333,23 +333,24 @@ fn scalar_fn_from_name(name: &str) -> Option<ScalarFn> {
 }
 
 /// Validates a scalar function call's argument count, producing a
-/// parse-time error naming the function on mismatch.
+/// parse-time error that names both the function and its expected arity on
+/// mismatch (e.g. `lower() takes 1 argument, got 2`).
 fn check_scalar_arity(f: &ScalarFn, name: &str, argc: usize) -> Result<(), ParseError> {
-    let arity_ok = match f {
+    let (arity_ok, expected) = match f {
         ScalarFn::Lower
         | ScalarFn::Upper
         | ScalarFn::Length
         | ScalarFn::Trim
         | ScalarFn::Ltrim
-        | ScalarFn::Rtrim => argc == 1,
-        ScalarFn::Substr => (2..=3).contains(&argc),
-        ScalarFn::Replace => argc == 3,
+        | ScalarFn::Rtrim => (argc == 1, "1 argument"),
+        ScalarFn::Substr => ((2..=3).contains(&argc), "2 or 3 arguments"),
+        ScalarFn::Replace => (argc == 3, "3 arguments"),
     };
     if arity_ok {
         Ok(())
     } else {
         Err(unsupported(format!(
-            "{name}() called with {argc} argument(s)"
+            "{name}() takes {expected}, got {argc}"
         )))
     }
 }
@@ -1074,6 +1075,30 @@ mod tests {
             parse("SELECT replace(status, status)"),
             Err(ParseError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn scalar_arity_error_names_function_and_expected_arity() {
+        // The message must name both the function and its expected arity,
+        // not just the count the caller passed — pinned end-to-end through
+        // a real query for a fixed arity (`lower` takes exactly 1 arg).
+        let err = parse("SELECT lower(status, status)").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "unsupported query feature: lower() takes 1 argument, got 2"
+        );
+
+        // `substr`'s range arity ("2 or 3 arguments") is exercised directly:
+        // sqlparser's dedicated `SUBSTRING` AST node means a too-few-args
+        // `substr(...)` call is rejected by `lower_substr` before this
+        // check ever runs (see `substr() without a start position` above),
+        // so this message is reachable only via `check_scalar_arity`
+        // itself — still worth pinning since it's the same fix.
+        let err = check_scalar_arity(&ScalarFn::Substr, "substr", 1).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "unsupported query feature: substr() takes 2 or 3 arguments, got 1"
+        );
     }
 
     #[test]
