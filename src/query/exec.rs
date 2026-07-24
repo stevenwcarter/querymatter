@@ -731,32 +731,25 @@ fn three_valued_or(a: Option<bool>, b: Option<bool>) -> Option<bool> {
 }
 
 /// Compares `left` against `right` under 3VL, both already evaluated via
-/// [`eval_expr`]. `right`'s type picks the coercion rule — mirroring how a
-/// `Literal`'s type drove this comparison before both sides became arbitrary
-/// expressions.
+/// [`eval_expr`], using the same symmetric numeric-else-lexicographic rule
+/// as [`compare_values`] — so a query and its operand-swapped equivalent
+/// (`a op b` vs `b op' a`) always agree, regardless of which side holds a
+/// numeric-looking string (e.g. frontmatter `n: "9"`). Now that both sides
+/// of a comparison can be arbitrary expressions, dispatching the coercion
+/// off of only one side's `Value` variant — as if it were still always the
+/// literal — would make the result depend on operand order.
 ///
 /// `Null` on either side yields `None` (unknown) — the only source of
-/// unknown here. Otherwise the result is always `Some(_)`: a string `right`
-/// compares `to_cmp_string()`; a numeric (`Int`/`Float`) `right` requires
-/// `left` to also be numeric — a non-numeric `left` fails the predicate as
-/// `Some(false)` rather than being unknown, per the spec's "the row fails
-/// the predicate"; a `Bool` or `List` `right` falls back to the general
-/// [`compare_values`] ordering.
+/// unknown here. Otherwise the result is always `Some(_)`: when both sides
+/// coerce to a number they compare numerically; otherwise they compare
+/// lexicographically on `to_cmp_string()`, so a non-numeric operand against
+/// a numeric one fails the predicate as `Some(false)` rather than being
+/// unknown, per the spec's "the row fails the predicate".
 fn eval_compare(left: &Value, op: &CmpOp, right: &Value) -> Option<bool> {
     if left.is_null() || right.is_null() {
         return None;
     }
-    let ordering = match right {
-        Value::Str(s) => Some(left.to_cmp_string().cmp(s)),
-        Value::Int(_) | Value::Float(_) => match (left.as_number(), right.as_number()) {
-            (Some(l), Some(r)) => l.partial_cmp(&r),
-            _ => None,
-        },
-        Value::Bool(_) | Value::List(_) => compare_values(left, right),
-        // Handled by the early return above.
-        Value::Null => unreachable!("right-hand Null is excluded above"),
-    };
-    Some(ordering.is_some_and(|ord| apply_cmp(op, ord)))
+    Some(compare_values(left, right).is_some_and(|ord| apply_cmp(op, ord)))
 }
 
 /// Interprets an `Ordering` per comparison operator.
@@ -1293,6 +1286,79 @@ mod tests {
     }
 
     #[test]
+    fn where_comparison_is_commutative_for_numeric_string_field() {
+        // Critical fix: `eval_compare` used to pick its coercion rule off the
+        // RIGHT operand's `Value` variant alone, so a numeric-looking string
+        // field (`n: "9"` — a real pattern in this codebase, e.g. `prd:
+        // '010'`) compared differently depending on which side it was
+        // written on. All four phrasings below describe the same fact
+        // (9 < 10) and must now agree.
+        let rows = [rec("s", "s/a.md", &[("n", Value::Str("9".into()))])];
+
+        let lt = parse("SELECT n WHERE n < 10").unwrap();
+        assert_eq!(
+            execute(&lt, rows.iter()).unwrap().rows,
+            vec![vec![Value::Str("9".into())]],
+            "n < 10"
+        );
+
+        let gt_flipped = parse("SELECT n WHERE 10 > n").unwrap();
+        assert_eq!(
+            execute(&gt_flipped, rows.iter()).unwrap().rows,
+            vec![vec![Value::Str("9".into())]],
+            "10 > n must agree with n < 10"
+        );
+
+        let gt = parse("SELECT n WHERE n > 10").unwrap();
+        assert!(
+            execute(&gt, rows.iter()).unwrap().rows.is_empty(),
+            "n > 10 is false"
+        );
+
+        let lt_flipped = parse("SELECT n WHERE 10 < n").unwrap();
+        assert!(
+            execute(&lt_flipped, rows.iter()).unwrap().rows.is_empty(),
+            "10 < n must agree with n > 10"
+        );
+    }
+
+    #[test]
+    fn where_equality_is_commutative_for_numeric_string_and_non_numeric_field() {
+        // Same bug, `=` form: a numeric-looking string ("5.0") must compare
+        // equal to Int(5) from either side, while a genuinely non-numeric
+        // string ("draft") must still fail the predicate from either side —
+        // not flip to a match just because the literal moved to the left.
+        let numeric = [rec("s", "s/a.md", &[("status", Value::Str("5.0".into()))])];
+        let eq = parse("SELECT status WHERE status = 5").unwrap();
+        assert_eq!(
+            execute(&eq, numeric.iter()).unwrap().rows,
+            vec![vec![Value::Str("5.0".into())]]
+        );
+        let eq_flipped = parse("SELECT status WHERE 5 = status").unwrap();
+        assert_eq!(
+            execute(&eq_flipped, numeric.iter()).unwrap().rows,
+            vec![vec![Value::Str("5.0".into())]],
+            "5 = status must agree with status = 5"
+        );
+
+        let non_numeric = [rec(
+            "s",
+            "s/b.md",
+            &[("status", Value::Str("draft".into()))],
+        )];
+        let eq2 = parse("SELECT status WHERE status = 5").unwrap();
+        assert!(execute(&eq2, non_numeric.iter()).unwrap().rows.is_empty());
+        let eq2_flipped = parse("SELECT status WHERE 5 = status").unwrap();
+        assert!(
+            execute(&eq2_flipped, non_numeric.iter())
+                .unwrap()
+                .rows
+                .is_empty(),
+            "5 = status must still fail (not unknown) against a non-numeric field"
+        );
+    }
+
+    #[test]
     fn where_column_to_column_and_scalar() {
         // Column-to-column: `start < end` matches only the row where it holds.
         let bounds = [
@@ -1345,12 +1411,42 @@ mod tests {
         // rows) must be unknown — not a match, and not an error — the same
         // 3VL rule a NULL field already follows on the literal-comparison
         // side (column validation for a genuinely unknown field is T9).
+        //
+        // A plain `WHERE` can't tell unknown (`None`) apart from `Some(false)`
+        // — both yield zero rows — so this also checks the negated form:
+        // `missing = status` is unknown, `NOT unknown` stays unknown under
+        // 3VL, and an unknown `WHERE` still excludes every row. If
+        // `eval_compare` wrongly returned `Some(false)` for a null operand,
+        // `NOT false` = `true` would wrongly INCLUDE both rows here — so this
+        // distinguishes the two where the un-negated form alone cannot.
         let rows = [
             rec("s", "s/a.md", &[("status", Value::Str("draft".into()))]),
             rec("s", "s/b.md", &[("status", Value::Str("synced".into()))]),
         ];
         let q = parse("SELECT status WHERE missing = status").unwrap();
         assert!(execute(&q, rows.iter()).unwrap().rows.is_empty());
+
+        let negated = parse("SELECT status WHERE NOT (missing = status)").unwrap();
+        assert!(
+            execute(&negated, rows.iter()).unwrap().rows.is_empty(),
+            "NOT (unknown) is still unknown, not true — must not resurrect the rows"
+        );
+
+        // Same check with the Null on the right-hand operand instead.
+        let right_null = parse("SELECT status WHERE status = missing").unwrap();
+        assert!(
+            execute(&right_null, rows.iter()).unwrap().rows.is_empty(),
+            "a right-side Null operand must also be unknown, not a hard match/no-match"
+        );
+
+        let right_null_negated = parse("SELECT status WHERE NOT (status = missing)").unwrap();
+        assert!(
+            execute(&right_null_negated, rows.iter())
+                .unwrap()
+                .rows
+                .is_empty(),
+            "NOT (unknown) on a right-side Null must also stay unknown"
+        );
     }
 
     #[test]
