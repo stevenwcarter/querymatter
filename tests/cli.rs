@@ -126,6 +126,22 @@ fn batch_mode_from_stdin() {
         .stdout(predicates::str::contains("n"));
 }
 
+/// Batch mode (piped stdin, no `-e`) is the same code path as `-e`/one-shot
+/// and must never print the REPL-only `-- N rows` count line — regression
+/// guard for the row-count feature, which is wired only into `repl::run`.
+#[test]
+fn batch_mode_stdin_emits_no_row_count_line() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg(td.path())
+        .write_stdin("SELECT count(*) AS n;\n")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("n"))
+        .stderr(predicates::str::contains("-- ").not());
+}
+
 #[test]
 fn query_error_exits_nonzero() {
     let td = tree();

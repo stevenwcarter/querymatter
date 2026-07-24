@@ -281,8 +281,11 @@ pub fn run(mut session: Session) -> anyhow::Result<()> {
 
         match resolved {
             Line::Blank | Line::More => {}
-            Line::Statement(statement) => match session.render_statement(&statement) {
-                Ok(rendered) => println!("{rendered}"),
+            Line::Statement(statement) => match session.render_statement_counted(&statement) {
+                Ok((rendered, count)) => {
+                    println!("{rendered}");
+                    eprintln!("{}", row_count_line(count));
+                }
                 Err(err) => eprintln!("querymatter: {err:#}"),
             },
             Line::Dot(cmd, _) => {
@@ -302,6 +305,14 @@ pub fn run(mut session: Session) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// The `-- N rows` line printed to stderr after a REPL statement's result,
+/// distinguishing a genuinely empty result from a mistake (REPL-only; batch
+/// and `-e` mode never print this). Pulled out as a pure function so the
+/// singular/plural wording is unit-tested without a TTY.
+fn row_count_line(n: usize) -> String {
+    format!("-- {n} row{}", if n == 1 { "" } else { "s" })
 }
 
 /// What to add to the line editor's history for one resolved [`Line`], or
@@ -754,6 +765,13 @@ mod tests {
         assert_eq!(parse_dot(".set"), DotCommand::MissingArg("set"));
         assert_eq!(parse_dot(".set table_style"), DotCommand::MissingArg("set"));
         assert_eq!(parse_dot(".unset"), DotCommand::MissingArg("unset"));
+    }
+
+    #[test]
+    fn row_count_line_pluralizes_correctly() {
+        assert_eq!(row_count_line(0), "-- 0 rows");
+        assert_eq!(row_count_line(1), "-- 1 row");
+        assert_eq!(row_count_line(2), "-- 2 rows");
     }
 
     #[test]

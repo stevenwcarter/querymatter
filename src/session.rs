@@ -190,11 +190,24 @@ impl Session {
     /// format for a `;`/`\g` terminator, or one record per block for `\G`.
     ///
     /// The returned string carries no trailing newline (see [`render`]); the
-    /// caller adds exactly one when printing.
+    /// caller adds exactly one when printing. Thin wrapper around
+    /// [`render_statement_counted`](Self::render_statement_counted) for the
+    /// one-shot/batch callers that don't need the row count.
     pub fn render_statement(&self, statement: &Statement) -> anyhow::Result<String> {
+        Ok(self.render_statement_counted(statement)?.0)
+    }
+
+    /// Runs `statement` once and returns both its rendered string and the
+    /// row count from that same [`ResultTable`] — the REPL prints the count
+    /// as a `-- N rows` line after the result, without a second query run.
+    pub fn render_statement_counted(
+        &self,
+        statement: &Statement,
+    ) -> anyhow::Result<(String, usize)> {
         let table = self.run(&statement.sql)?;
         let output = statement.terminator.output(self.format());
-        Ok(render::render(&table, output, self.style()))
+        let rendered = render::render(&table, output, self.style());
+        Ok((rendered, table.rows.len()))
     }
 
     /// Switches the output format for the rest of this session only.
@@ -466,6 +479,45 @@ mod tests {
             "the backslash stays literal and 'b' is still a real quoted \
              literal, not an escaped quote"
         );
+    }
+
+    /// `render_statement_counted` must run the query exactly once and return
+    /// both the rendered string and the row count read off that same
+    /// `ResultTable` — not re-run the query separately to count rows.
+    #[test]
+    fn render_statement_counted_returns_row_count() {
+        let td = TempDir::new().unwrap();
+        for (name, body) in [
+            ("a.md", "---\nstatus: draft\n---\n"),
+            ("b.md", "---\nstatus: synced\n---\n"),
+            ("c.md", "---\nstatus: synced\n---\n"),
+        ] {
+            fs::write(td.path().join(name), body).unwrap();
+        }
+        let (store, _report) =
+            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default());
+        let session = Session::new(
+            Box::new(store),
+            Settings::default(),
+            Settings::default(),
+            None,
+        );
+
+        let (rendered, count) = session
+            .render_statement_counted(&semi("SELECT status"))
+            .unwrap();
+        assert_eq!(count, 3);
+        assert!(!rendered.is_empty());
+
+        let (_, count) = session
+            .render_statement_counted(&semi("SELECT status WHERE status = 'draft'"))
+            .unwrap();
+        assert_eq!(count, 1);
+
+        let (_, count) = session
+            .render_statement_counted(&semi("SELECT status WHERE status = 'missing'"))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     /// A vault-backed session's `refresh` must both update the in-memory
