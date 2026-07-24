@@ -664,6 +664,82 @@ mod tests {
         );
     }
 
+    /// MUST-FIX #2 regression guard: `RecordStore::refresh`'s on-disk-cache-
+    /// unavailable fallback (`cached_dirs_from_slices`) reconstructs its
+    /// starting point from THIS store's own in-memory slices, then persists
+    /// it — so a directory `refresh` never touches keeps its fields only if
+    /// those slices were unpruned to begin with. `build_session` (main.rs)
+    /// guarantees that by forcing `wanted = None` whenever a refresh flag is
+    /// present, regardless of how narrow the triggering query was; this test
+    /// pins the invariant directly at the seam the finding identified,
+    /// reusing `refresh_reconstructs_cached_dirs_when_no_cache_exists`'s
+    /// technique (`InMemoryStore::load`, so no on-disk cache exists and
+    /// `refresh` is forced through the fallback) to trigger it
+    /// deterministically.
+    #[test]
+    fn refresh_fallback_preserves_out_of_subtree_fields_when_store_is_unpruned() {
+        let td = TempDir::new().unwrap();
+        write(td.path(), "plans/a.md", "---\nstatus: draft\n---\n");
+        write(td.path(), "product/c.md", "---\nprd: '011'\n---\n");
+
+        // wanted = None: what build_session now always passes to the store
+        // build whenever a refresh flag is set.
+        let (mut store, _report) =
+            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default(), None);
+        assert!(cache::load_cache(td.path()).is_none());
+
+        // Refresh only "plans" — "product" is never rescanned, so its record
+        // can only come through intact if the fallback's starting point
+        // (this store's own slices) still carried every field.
+        let plans = td.path().join("plans");
+        store.refresh(td.path(), Some(&plans));
+
+        let prd = store
+            .records()
+            .find(|r| r.field_names().any(|name| name == "prd"))
+            .map(|r| r.field("prd"));
+        assert_eq!(
+            prd,
+            Some(Value::Str("011".into())),
+            "an out-of-subtree field must survive refresh's on-disk-cache- \
+             unavailable fallback when the store it falls back to is unpruned"
+        );
+    }
+
+    /// Companion to the guard above: proves the invariant it pins is real,
+    /// not vacuous. Feeding the store a narrow `wanted` — the pre-fix
+    /// `build_session` behavior whenever `--refresh` accompanied a narrow
+    /// query — DOES lose an out-of-subtree field once `refresh` falls back
+    /// to `cached_dirs_from_slices`, which is exactly what `build_session`
+    /// forcing `wanted = None` on a refresh now prevents.
+    #[test]
+    fn refresh_fallback_loses_pruned_out_of_subtree_fields_when_store_is_pruned() {
+        let td = TempDir::new().unwrap();
+        write(td.path(), "plans/a.md", "---\nstatus: draft\n---\n");
+        write(td.path(), "product/c.md", "---\nprd: '011'\n---\n");
+
+        let wanted: BTreeSet<String> = ["status".to_string()].into_iter().collect();
+        let (mut store, _report) = InMemoryStore::load(
+            vec![td.path().to_path_buf()],
+            WalkOpts::default(),
+            Some(&wanted),
+        );
+
+        let plans = td.path().join("plans");
+        store.refresh(td.path(), Some(&plans));
+
+        let has_prd = store
+            .records()
+            .any(|r| r.field_names().any(|name| name == "prd"));
+        assert!(
+            !has_prd,
+            "narrowing wanted to a query's own fields without also forcing \
+             wanted = None on --refresh silently drops an out-of-subtree \
+             field the refresh never touched — the exact corruption \
+             build_session's guard exists to prevent"
+        );
+    }
+
     /// FIX 2 (spec §9): a `manifest.bin` present on disk but rejected by
     /// `load_cache` (incompatible/corrupt) must warn to the report — which
     /// `main` prints to stderr — before rebuilding via a full live scan, so a
@@ -806,6 +882,12 @@ mod tests {
     /// load report's warnings must come out in exactly the order a serial
     /// scan would produce — `discover`'s path-sorted order — regardless of
     /// which worker finishes first.
+    ///
+    /// Note: this test passes even with `map_paths`'s final sort removed,
+    /// since `discover()` already hands back a path-sorted list and this
+    /// fixture's worker split happens to preserve that order. The real guard
+    /// for the sort itself is
+    /// `parallel::tests::results_are_sorted_by_path_regardless_of_input_order`.
     #[test]
     fn parallel_scan_matches_serial_records_and_order() {
         let td = TempDir::new().unwrap();

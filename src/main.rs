@@ -570,6 +570,15 @@ fn compute_wanted(input: &str) -> Option<BTreeSet<String>> {
 /// threaded straight into the store's materialization
 /// ([`InMemoryStore::load`]/[`InMemoryStore::from_cache`]); `None` (the REPL,
 /// always) keeps every field, matching pre-push-down behavior.
+///
+/// Forced to `None` regardless of what was passed whenever `--refresh`/
+/// `--refresh-all` is set: `RecordStore::refresh` always rebuilds slices with
+/// `wanted = None` afterward (see its doc comment), so a pruned initial
+/// `wanted` gives zero benefit on a refreshing run — and in the narrow case
+/// where `refresh` falls back to reconstructing its on-disk cache from the
+/// store's own (pruned) slices, a non-`None` `wanted` here would silently
+/// persist out-of-subtree records with fields missing. Disabling push-down
+/// on a refresh is free and closes that gap.
 fn build_session(
     cli: &Cli,
     config: &Config,
@@ -578,6 +587,9 @@ fn build_session(
     wanted: Option<&BTreeSet<String>>,
 ) -> anyhow::Result<Session> {
     cli.validate()?;
+
+    let wants_refresh = cli.refresh_all || !cli.refresh.is_empty();
+    let wanted = if wants_refresh { None } else { wanted };
 
     let settings = Settings::resolve(cli, config, matches);
     // Validated on the RESOLVED exclude list (flag, config, or default —

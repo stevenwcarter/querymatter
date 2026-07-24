@@ -693,6 +693,65 @@ fn refresh_all_forces_full_rescan_despite_unchanged_mtime_and_size() {
     );
 }
 
+/// MUST-FIX #2 (design W17 + `--refresh` interaction): a narrow one-shot
+/// query's projection push-down `wanted` set must not leak into a
+/// `--refresh <subtree>` alongside it. `build_session` forces `wanted = None`
+/// whenever a refresh flag is present specifically so an out-of-subtree
+/// field a narrow query never asked for still survives in the cache a LATER,
+/// unrelated query reads — this end-to-end run pins that observable
+/// contract; `store::tests::refresh_fallback_preserves_out_of_subtree_fields_when_store_is_unpruned`
+/// (and its loses-the-field companion) pin the exact fallback mechanism the
+/// guard closes.
+#[test]
+fn narrow_query_with_refresh_does_not_lose_out_of_subtree_field_from_cache() {
+    let td = TempDir::new().unwrap();
+    fs::create_dir_all(td.path().join("plans")).unwrap();
+    fs::create_dir_all(td.path().join("product")).unwrap();
+    fs::write(td.path().join("plans/a.md"), "---\nstatus: draft\n---\n").unwrap();
+    fs::write(td.path().join("product/c.md"), "---\nprd: '011'\n---\n").unwrap();
+    let home = TempDir::new().unwrap();
+
+    qm(home.path())
+        .arg("init")
+        .arg(td.path())
+        .assert()
+        .success();
+
+    // A narrow query (`SELECT status` only references "status") combined
+    // with `--refresh plans` — the exact shape whose `wanted` must not reach
+    // `from_cache` un-widened.
+    qm(home.path())
+        .current_dir(td.path())
+        .args([
+            "-e",
+            "SELECT status",
+            "--format",
+            "csv",
+            "--refresh",
+            "plans",
+        ])
+        .assert()
+        .success();
+
+    // A separate, later query for the DIFFERENT, out-of-subtree field must
+    // still find it in the cache the run above left behind.
+    let out = qm(home.path())
+        .current_dir(td.path())
+        .args(["-e", "SELECT prd", "--format", "csv"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    assert_eq!(
+        s.lines().last().unwrap().trim(),
+        "011",
+        "an out-of-subtree field must not be lost from the cache after a \
+         narrow query ran alongside --refresh on a different subtree; got: {s:?}"
+    );
+}
+
 #[test]
 fn refresh_nonexistent_path_exits_nonzero() {
     let td = tree();
