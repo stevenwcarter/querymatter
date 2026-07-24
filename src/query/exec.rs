@@ -65,9 +65,10 @@ pub enum ExecError {
 /// [`Query::referenced_fields`]) is checked against the schema — the sorted
 /// union of field names across `records` — before the filter/project
 /// pipeline runs, so a typo'd column fails fast with a suggestion rather than
-/// silently reading as `Null` throughout. An empty `records` skips this
-/// check: a fresh or empty vault has no schema to check against, and must
-/// not fail every query on that account alone.
+/// silently reading as `Null` throughout. An empty schema skips this check:
+/// a fresh or empty vault (or one whose only records have explicit-but-empty
+/// frontmatter, e.g. `---\n{}\n---`) has no fields to check against, and
+/// must not fail every query on that account alone.
 ///
 /// Dispatches on whether `q` is grouped/aggregate; see
 /// [`is_grouped_or_aggregate`].
@@ -77,8 +78,11 @@ pub fn execute<'a>(
     lenient: bool,
 ) -> Result<ResultTable, ExecError> {
     let records: Vec<&Record> = records.collect();
-    if !lenient && !records.is_empty() {
-        validate_columns(q, &sorted_field_union(&records))?;
+    if !lenient {
+        let schema = sorted_field_union(&records);
+        if !schema.is_empty() {
+            validate_columns(q, &schema)?;
+        }
     }
     if is_grouped_or_aggregate(q) {
         return execute_grouped(q, records.into_iter());
@@ -824,10 +828,11 @@ fn numeric_result(v: f64, is_float: bool) -> Value {
 /// A `WHERE` keeps a row only when this is `Some(true)` (see
 /// [`filter_records`]); both `Some(false)` and `None` exclude it. Threading
 /// the unknown through negation is what makes `status NOT IN (...)`,
-/// `status NOT LIKE ...`, and `NOT (status = ...)` all EXCLUDE a NULL-`status`
-/// row — matching the plain-`Compare` path and the spec's "any comparison
-/// where a side is Null yields 'not true'" rule (§4). Only `IS NULL` /
-/// `IS NOT NULL` are ever determinate for a NULL field.
+/// `status NOT LIKE ...`, `NOT 'x' MEMBER OF(tags)`, and `NOT (status = ...)`
+/// all EXCLUDE a NULL-`status` row — matching the plain-`Compare` path and
+/// the spec's "any comparison where a side is Null yields 'not true'" rule
+/// (§4). Only `IS NULL` / `IS NOT NULL` are ever determinate for a NULL
+/// field.
 fn eval_predicate(record: &Record, pred: &Predicate) -> Option<bool> {
     match pred {
         Predicate::Compare(left, op, right) => {
@@ -1769,6 +1774,18 @@ mod tests {
     }
 
     #[test]
+    fn record_with_empty_frontmatter_skips_validation() {
+        // A lone file with an explicit-but-empty frontmatter mapping
+        // (`---\n{}\n---`) yields one record with zero fields: `records` is
+        // non-empty, but the schema (the field union) is — validation must
+        // key off the schema, not the record count.
+        let empty = [rec("s", "s/a.md", &[])];
+        let q = parse("SELECT somefield").unwrap();
+        let t = execute(&q, empty.iter(), false).unwrap();
+        assert_eq!(t.rows, vec![vec![Value::Null]]);
+    }
+
+    #[test]
     fn typo_inside_scalar_and_having_is_caught() {
         // Validation must walk into a scalar-function argument, not just a
         // bare `SELECT` column.
@@ -1984,6 +2001,21 @@ mod agg_tests {
             vec![
                 vec![Value::Str("synced".into()), Value::Int(2)],
                 vec![Value::Str("draft".into()), Value::Int(1)],
+            ]
+        );
+    }
+    #[test]
+    fn order_by_bare_aggregate_ascending() {
+        // Same groups as `order_by_bare_aggregate`, but `ASC` — pins the
+        // sort direction itself so a flipped-comparator bug can't hide
+        // behind a DESC-only test.
+        let q = parse("SELECT status, count(*) GROUP BY status ORDER BY count(*) ASC").unwrap();
+        let t = execute(&q, recs().iter(), false).unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec![Value::Str("draft".into()), Value::Int(1)],
+                vec![Value::Str("synced".into()), Value::Int(2)],
             ]
         );
     }

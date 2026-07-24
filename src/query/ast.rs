@@ -95,9 +95,9 @@ pub enum Expr {
 /// A scalar string function, as it may appear in a `SELECT` expression.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScalarFn {
-    /// `lower(s)` — ASCII-aware lowercase.
+    /// `lower(s)` — Unicode-aware lowercase.
     Lower,
-    /// `upper(s)` — ASCII-aware uppercase.
+    /// `upper(s)` — Unicode-aware uppercase.
     Upper,
     /// `length(s)` — character count.
     Length,

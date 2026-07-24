@@ -838,16 +838,29 @@ fn lower_having_compare(
     group_by: &[ColRef],
 ) -> Result<Having, ParseError> {
     if let Some(leaf) = try_having_leaf(left, group_by)? {
-        return Ok(Having::Compare(leaf, cmp, lower_literal(right)?));
+        return Ok(Having::Compare(leaf, cmp, lower_having_literal(right)?));
     }
     if let Some(leaf) = try_having_leaf(right, group_by)? {
         return Ok(Having::Compare(
             leaf,
             flip_cmp_op(cmp),
-            lower_literal(left)?,
+            lower_having_literal(left)?,
         ));
     }
     Err(unsupported("this HAVING comparison"))
+}
+
+/// Lowers the literal side of a `HAVING` comparison, once the other side has
+/// already been confirmed to be a [`HavingLeaf`]. Replaces
+/// [`lower_literal`]'s generic "this literal value" message with a
+/// `HAVING`-specific one when this side isn't a literal at all — most often
+/// aggregate-vs-aggregate (`HAVING count(*) < count(*)`), which this subset
+/// doesn't support: a `HAVING` leaf may only be compared against a plain
+/// literal, never against another leaf.
+fn lower_having_literal(expr: &sql::Expr) -> Result<Literal, ParseError> {
+    lower_literal(expr).map_err(|_| {
+        unsupported("HAVING compares an aggregate or grouping-key column to a literal")
+    })
 }
 
 /// Attempts to lower `expr` as a [`HavingLeaf`]: `Ok(None)` when `expr` isn't
@@ -916,6 +929,12 @@ fn lower_order_by(
 /// alongside a non-empty `group_by`, mirroring how [`lower_having`] rejects
 /// an aggregate on an ungrouped query (including the implicit single-group
 /// case, where `group_by` is empty too).
+///
+/// [`lower_aggregate`] runs FIRST, before the `group_by` check: it already
+/// rejects a non-aggregate function name (e.g. `ORDER BY upper(status)`)
+/// with a clean "function `upper`" message, so that case must never be
+/// misreported as "requires GROUP BY" — a message that only makes sense once
+/// the function is confirmed to actually be an aggregate.
 fn lower_order_expr(
     order: &sql::OrderByExpr,
     aliases: &[&str],
@@ -924,10 +943,11 @@ fn lower_order_expr(
     let desc = order.options.asc == Some(false);
     let target = match &order.expr {
         sql::Expr::Function(func) => {
+            let agg = lower_aggregate(func)?;
             if group_by.is_empty() {
                 return Err(unsupported("ORDER BY an aggregate requires GROUP BY"));
             }
-            OrderTarget::Agg(lower_aggregate(func)?)
+            OrderTarget::Agg(agg)
         }
         sql::Expr::Identifier(ident) if aliases.contains(&ident.value.as_str()) => {
             OrderTarget::Alias(ident.value.clone())
@@ -1179,6 +1199,16 @@ mod tests {
         // an implicit single group from the bare aggregate SELECT item),
         // matching how `HAVING` rejects that same case.
         assert!(crate::query::parse("SELECT count(*) ORDER BY count(*)").is_err());
+    }
+    #[test]
+    fn order_by_scalar_fn_does_not_claim_requires_group_by() {
+        // `upper` isn't an aggregate at all, so an empty `group_by` must
+        // never be blamed — the error should name the unsupported function
+        // instead of the (irrelevant) GROUP BY requirement.
+        let err = crate::query::parse("SELECT status ORDER BY upper(status)").unwrap_err();
+        let message = err.to_string();
+        assert!(!message.contains("requires GROUP BY"), "got: {message}");
+        assert!(message.contains("upper"), "got: {message}");
     }
     #[test]
     fn group_by_resolves_select_alias() {
@@ -1505,10 +1535,12 @@ mod tests {
     }
     #[test]
     fn having_aggregate_vs_aggregate_is_unsupported() {
-        assert!(matches!(
-            parse("SELECT status GROUP BY status HAVING count(*) > sum(prd)"),
-            Err(ParseError::Unsupported(_))
-        ));
+        let err = parse("SELECT status GROUP BY status HAVING count(*) > sum(prd)").unwrap_err();
+        assert!(matches!(err, ParseError::Unsupported(_)));
+        assert!(
+            err.to_string().contains("aggregate or grouping-key column"),
+            "got: {err}"
+        );
     }
     #[test]
     fn distinct_sets_the_flag() {
