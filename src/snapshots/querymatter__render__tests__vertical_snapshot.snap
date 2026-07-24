@@ -1,0 +1,10 @@
+---
+source: src/render.rs
+expression: "render(&table(), Output::Vertical, TableStyle::Ascii)"
+---
+*************************** 1. row ***************************
+status: synced
+ Count: 2
+*************************** 2. row ***************************
+status: draft
+ Count: 1

@@ -176,7 +176,7 @@ fn run_query(cli: &Cli) -> anyhow::Result<()> {
     for warning in &report.warnings {
         eprintln!("querymatter: {warning}");
     }
-    let session = Session::new(Box::new(store), cli.format, session_vault);
+    let session = Session::new(Box::new(store), cli.format, cli.table_style, session_vault);
 
     match cli.query.as_deref() {
         // `-e -`: read the query text from stdin, then run it.
@@ -203,16 +203,16 @@ fn canonicalize_dirs(dirs: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
         .collect()
 }
 
-/// Runs every top-level `;`-separated statement in `input`, printing each
-/// rendered result to stdout (with exactly one trailing newline via
-/// `println!`).
+/// Runs every top-level statement in `input` — `;`/`\g`-terminated, or
+/// `\G`-terminated for vertical output — printing each rendered result to
+/// stdout (with exactly one trailing newline via `println!`).
 ///
 /// The first statement that fails aborts the run: its error propagates to
 /// `main`, which reports it on stderr and exits non-zero. Statements that ran
 /// before it have already printed their results.
 fn run_statements(session: &Session, input: &str) -> anyhow::Result<()> {
     for statement in split_statements(input) {
-        let rendered = session.render_query(&statement)?;
+        let rendered = session.render_statement(&statement)?;
         println!("{rendered}");
     }
     Ok(())

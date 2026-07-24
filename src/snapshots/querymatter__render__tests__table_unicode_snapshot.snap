@@ -1,0 +1,11 @@
+---
+source: src/render.rs
+expression: "render(&table(), Output::Format(Format::Table), TableStyle::Unicode)"
+---
+╭────────┬───────╮
+│ status │ Count │
+╞════════╪═══════╡
+│ synced │ 2     │
+├────────┼───────┤
+│ draft  │ 1     │
+╰────────┴───────╯

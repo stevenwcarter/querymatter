@@ -16,13 +16,14 @@ use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
 use crate::model::Value;
-use crate::render::Format;
-use crate::session::Session;
+use crate::render::{Format, TableStyle};
+use crate::session::{Session, Statement, Terminator};
 use crate::store::LoadReport;
 
 /// Prompt shown while waiting for a new statement or dot-command.
 const PROMPT: &str = "querymatter> ";
-/// Prompt shown while a statement is still accumulating (no `;` yet).
+/// Prompt shown while a statement is still accumulating (no `;`, `\g`, or
+/// `\G` yet).
 const CONTINUATION_PROMPT: &str = "   ...> ";
 /// The `file.*` pseudo-columns every record exposes, independent of
 /// frontmatter (kept in sync with [`crate::model::FileAttr`]'s labels).
@@ -37,8 +38,9 @@ pub enum Line {
     Blank,
     /// A statement is still accumulating; more input is needed.
     More,
-    /// A complete statement, `;`-terminated (the `;` is stripped).
-    Statement(String),
+    /// A complete statement plus the terminator that ended it (the terminator
+    /// itself is stripped).
+    Statement(Statement),
     /// A `.`-prefixed dot-command.
     Dot(DotCommand),
 }
@@ -52,6 +54,8 @@ pub enum DotCommand {
     Schema,
     /// `.format [fmt]` — set (`Some`) or report (`None`) the output format.
     Format(Option<Format>),
+    /// `.style [style]` — set (`Some`) or report (`None`) the table style.
+    Style(Option<TableStyle>),
     /// `.reload` — rescan every tracked directory (in-memory only; never
     /// touches a `.querymatter` cache).
     Reload,
@@ -67,12 +71,16 @@ pub enum DotCommand {
     /// `.format <name>` where `<name>` is not a known [`Format`], carrying the
     /// offending name so the error can name the format rather than the command.
     BadFormat(String),
+    /// `.style <name>` where `<name>` is not a known [`TableStyle`], carrying
+    /// the offending name so the error can name the style rather than the
+    /// command.
+    BadStyle(String),
     /// Any other `.`-prefixed line, carried verbatim for the error message.
     Unknown(String),
 }
 
 /// Accumulates raw input lines into complete SQL statements, splitting on a
-/// trailing `;`.
+/// trailing `;`, `\g`, or `\G`.
 ///
 /// A line starting with `.` or an empty/whitespace line is only recognized
 /// as a dot-command/blank line when the buffer is currently empty —
@@ -105,9 +113,12 @@ impl LineBuffer {
             self.buf.push_str(raw);
         }
 
-        match self.buf.trim_end().strip_suffix(';') {
-            Some(stmt) => {
-                let statement = stmt.trim().to_string();
+        match take_terminated(self.buf.trim_end()) {
+            Some((sql, terminator)) => {
+                let statement = Statement {
+                    sql: sql.trim().to_string(),
+                    terminator,
+                };
                 self.buf.clear();
                 Line::Statement(statement)
             }
@@ -119,6 +130,25 @@ impl LineBuffer {
     /// continuation prompt in [`run`].
     fn is_pending(&self) -> bool {
         !self.buf.is_empty()
+    }
+}
+
+/// Splits a trailing `;`, `\g`, or `\G` terminator off `text`, returning the
+/// statement body and which terminator ended it.
+///
+/// Like the bare `;` check this replaces, it looks only at the suffix and is
+/// not quote-aware: a terminator that ends the line ends the statement even
+/// inside a string literal. [`crate::session::split_statements`] is the
+/// quote-aware seam for batch input; the asymmetry predates these terminators
+/// and is left as-is.
+fn take_terminated(text: &str) -> Option<(&str, Terminator)> {
+    if let Some(sql) = text.strip_suffix("\\G") {
+        Some((sql, Terminator::VerticalG))
+    } else if let Some(sql) = text.strip_suffix("\\g") {
+        Some((sql, Terminator::Semicolon))
+    } else {
+        text.strip_suffix(';')
+            .map(|sql| (sql, Terminator::Semicolon))
     }
 }
 
@@ -144,6 +174,13 @@ pub fn parse_dot(line: &str) -> DotCommand {
             Some(arg) => match arg.parse() {
                 Ok(fmt) => DotCommand::Format(Some(fmt)),
                 Err(_) => DotCommand::BadFormat(arg.to_string()),
+            },
+        },
+        "style" => match words.next() {
+            None => DotCommand::Style(None),
+            Some(arg) => match arg.parse() {
+                Ok(style) => DotCommand::Style(Some(style)),
+                Err(_) => DotCommand::BadStyle(arg.to_string()),
             },
         },
         _ => DotCommand::Unknown(line.to_string()),
@@ -187,7 +224,7 @@ pub fn run(mut session: Session) -> anyhow::Result<()> {
 
         match buffer.push(&line) {
             Line::Blank | Line::More => {}
-            Line::Statement(sql) => match session.render_query(&sql) {
+            Line::Statement(statement) => match session.render_statement(&statement) {
                 Ok(rendered) => println!("{rendered}"),
                 Err(err) => eprintln!("querymatter: {err:#}"),
             },
@@ -214,22 +251,27 @@ pub fn run(mut session: Session) -> anyhow::Result<()> {
 /// should exit (`.quit`/`.exit`).
 ///
 /// stdout/stderr policy: reference/inspection output (`.help`, `.schema`, and
-/// `.format`'s report of the current format) goes to stdout; the
-/// `.reload`/`.refresh`/`.refresh-all` reports and all error messages
-/// (unknown command, bad format) go to stderr, keeping stdout clean for
-/// piping.
+/// `.format`'s/`.style`'s reports of the current format/style) goes to
+/// stdout; the `.reload`/`.refresh`/`.refresh-all` reports and all error
+/// messages (unknown command, bad format, bad style) go to stderr, keeping
+/// stdout clean for piping.
 fn dispatch_dot(cmd: DotCommand, session: &mut Session) -> bool {
     match cmd {
         DotCommand::Help => print_help(),
         DotCommand::Schema => print_schema(session),
         DotCommand::Format(Some(fmt)) => session.set_format(fmt),
         DotCommand::Format(None) => println!("format: {}", format_name(session.format)),
+        DotCommand::Style(Some(style)) => session.set_style(style),
+        DotCommand::Style(None) => println!("style: {}", style_name(session.style)),
         DotCommand::Reload => report_reload(session),
         DotCommand::Refresh(path) => report_refresh(session, path.as_deref().map(Path::new)),
         DotCommand::RefreshAll => report_refresh(session, None),
         DotCommand::Quit => return true,
         DotCommand::BadFormat(name) => {
             eprintln!("querymatter: unknown format '{name}' (try: table, json, csv, tsv, md)");
+        }
+        DotCommand::BadStyle(name) => {
+            eprintln!("querymatter: unknown style '{name}' (try: ascii, unicode, compact, plain)");
         }
         DotCommand::Unknown(raw) => {
             eprintln!("querymatter: unknown command {raw:?} (try .help)");
@@ -244,6 +286,9 @@ fn print_help() {
     println!("  .help              show this message");
     println!("  .schema            list frontmatter fields, file.* columns, and the record count");
     println!("  .format [fmt]      show, or set, the output format (table, json, csv, tsv, md)");
+    println!(
+        "  .style [style]     show, or set, the table border style (ascii, unicode, compact, plain)"
+    );
     println!("  .reload            rescan every tracked directory (in-memory only)");
     println!(
         "  .refresh [path]    re-scan path (or all); updates the .querymatter cache, else in memory"
@@ -253,7 +298,8 @@ fn print_help() {
     );
     println!("  .quit / .exit      leave the REPL");
     println!();
-    println!("End a statement with ';' to run it; statements may span multiple lines.");
+    println!("End a statement with ';' to run it, or with '\\G' to print each row as a block of");
+    println!("name: value lines; '\\g' is a synonym for ';'. Statements may span multiple lines.");
 }
 
 /// Prints the discovered frontmatter fields, the `file.*` pseudo-columns,
@@ -317,6 +363,17 @@ fn format_name(format: Format) -> &'static str {
     }
 }
 
+/// The name `.style` reports/accepts for `style`, kept in sync with
+/// [`TableStyle`]'s `FromStr` impl.
+fn style_name(style: TableStyle) -> &'static str {
+    match style {
+        TableStyle::Ascii => "ascii",
+        TableStyle::Unicode => "unicode",
+        TableStyle::Compact => "compact",
+        TableStyle::Plain => "plain",
+    }
+}
+
 /// The history file path under the OS's per-app state (or data) directory,
 /// or `None` when no valid home directory can be found — history is simply
 /// not persisted in that case.
@@ -365,11 +422,40 @@ mod tests {
         assert!(matches!(b.push("SELECT status"), Line::More));
         assert!(matches!(b.push("FROM 'x' ;"), Line::Statement(_)));
     }
+
+    #[test]
+    fn buffers_until_vertical_g() {
+        let mut b = LineBuffer::new();
+        assert_eq!(b.push("SELECT status"), Line::More);
+        match b.push("FROM files\\G") {
+            Line::Statement(stmt) => {
+                assert_eq!(stmt.sql, "SELECT status\nFROM files");
+                assert_eq!(stmt.terminator, Terminator::VerticalG);
+            }
+            other => panic!("expected a Statement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lowercase_g_terminates_like_a_semicolon() {
+        let mut b = LineBuffer::new();
+        match b.push("SELECT 1\\g") {
+            Line::Statement(stmt) => {
+                assert_eq!(stmt.sql, "SELECT 1");
+                assert_eq!(stmt.terminator, Terminator::Semicolon);
+            }
+            other => panic!("expected a Statement, got {other:?}"),
+        }
+    }
+
     #[test]
     fn single_line_statement() {
         let mut b = LineBuffer::new();
         match b.push("SELECT 1;") {
-            Line::Statement(s) => assert_eq!(s, "SELECT 1"),
+            Line::Statement(s) => {
+                assert_eq!(s.sql, "SELECT 1");
+                assert_eq!(s.terminator, Terminator::Semicolon);
+            }
             _ => panic!(),
         }
     }
@@ -389,7 +475,10 @@ mod tests {
             ".schema mid-statement must accumulate, not dispatch as Line::Dot"
         );
         match b.push(";") {
-            Line::Statement(s) => assert_eq!(s, "SELECT status\n.schema"),
+            Line::Statement(s) => {
+                assert_eq!(s.sql, "SELECT status\n.schema");
+                assert_eq!(s.terminator, Terminator::Semicolon);
+            }
             other => panic!("expected the accumulated Statement, got {other:?}"),
         }
     }
@@ -404,7 +493,10 @@ mod tests {
             "a blank line mid-statement must be Line::More, not Line::Blank"
         );
         match b.push("WHERE prd = '010';") {
-            Line::Statement(s) => assert_eq!(s, "SELECT status\n   \nWHERE prd = '010'"),
+            Line::Statement(s) => {
+                assert_eq!(s.sql, "SELECT status\n   \nWHERE prd = '010'");
+                assert_eq!(s.terminator, Terminator::Semicolon);
+            }
             other => panic!("expected the accumulated Statement, got {other:?}"),
         }
     }
@@ -444,5 +536,24 @@ mod tests {
             DotCommand::Refresh(Some("plans".to_string()))
         );
         assert!(matches!(parse_dot(".refresh-all"), DotCommand::RefreshAll));
+    }
+
+    #[test]
+    fn style_command_parses() {
+        assert_eq!(
+            parse_dot(".style unicode"),
+            DotCommand::Style(Some(TableStyle::Unicode))
+        );
+        assert!(matches!(parse_dot(".style"), DotCommand::Style(None)));
+    }
+
+    /// A known `.style` with an unknown name is BadStyle (reported as an
+    /// unknown *style*), not an unknown command — mirroring `.format`.
+    #[test]
+    fn bad_style_arg_is_bad_style_not_unknown_command() {
+        match parse_dot(".style fancy") {
+            DotCommand::BadStyle(name) => assert_eq!(name, "fancy"),
+            other => panic!("expected BadStyle, got {other:?}"),
+        }
     }
 }

@@ -31,7 +31,7 @@ piped stdin.
 | `querymatter [dirs]` (stdin is a TTY) | Interactive REPL |
 | `querymatter -e "SELECT …" [dirs]` | Run one query, print, exit |
 | `querymatter --query - [dirs]` | Read the query text from stdin, run once, exit |
-| `… \| querymatter [dirs]` (stdin piped, no `-e`) | Batch mode: run each `;`-separated statement from stdin in turn, no prompt |
+| `… \| querymatter [dirs]` (stdin piped, no `-e`) | Batch mode: run each statement from stdin in turn (ended by `;` or `\G`), no prompt |
 | `querymatter init [dir]` | Build a `.querymatter/` cache over `dir` (default cwd) — see [Caching large vaults](#caching-large-vaults-querymatter) |
 
 `-e`/`--query` always wins if given; otherwise piped (non-TTY) stdin means
@@ -95,8 +95,9 @@ available alongside frontmatter fields:
 
 | Flag | Meaning |
 | --- | --- |
-| `-e, --query <QUERY>` | One-shot mode; `-` reads the query text from stdin. May contain several `;`-separated statements. |
+| `-e, --query <QUERY>` | One-shot mode; `-` reads the query text from stdin. May contain several statements, each ended by `;` (or `\G`, which prints every row as a block of `name: value` lines instead of a table). |
 | `--format <FMT>` | `table` (default), `json`, `csv`, `tsv`, or `md`. In the REPL this is just the *initial* format — `.format` changes it live. |
+| `--table-style <STYLE>` | Border style for `--format table`: `ascii` (default), `unicode`, `compact`, or `plain`. Also settable per-shell with `QUERYMATTER_TABLE_STYLE`; the flag wins. Ignored by `json`/`csv`/`tsv`/`md`. In the REPL this is just the *initial* style — `.style` changes it live. |
 | `--ext <LIST>` | Comma-separated extensions to include. Default `md,markdown`. |
 | `--respect-gitignore` | Honor `.gitignore`/`.ignore` while walking. **Off by default** — see below. |
 | `--hidden` | Descend into hidden files/directories (e.g. `.git`, `.obsidian`). Off by default. |
@@ -229,13 +230,18 @@ rather than SQL:
 | `.help` | List the dot-commands. |
 | `.schema` | List discovered frontmatter fields, the `file.*` columns, and the record count. |
 | `.format [fmt]` | Show, or set, the output format for subsequent queries. |
+| `.style [style]` | Show, or set, the table border style (`ascii`, `unicode`, `compact`, `plain`) for subsequent queries. |
 | `.reload` | Re-scan every tracked directory (in-memory only; never touches a `.querymatter` cache). |
 | `.refresh [path]` | Force a re-scan of `path` (or the whole vault); updates the `.querymatter` cache when one is loaded, otherwise behaves like `.reload`. |
 | `.refresh-all` | Force a re-scan of the whole vault; alias for `.refresh` with no path. |
 | `.quit` / `.exit` | Leave the REPL (Ctrl-D also exits; Ctrl-C cancels the current line). |
 
 SQL statements may span multiple lines; a trailing `;` ends the statement and
-runs it.
+runs it. Ending with `\G` instead runs it and prints each row as a block of
+right-aligned `name: value` lines — the readable way to inspect a wide record,
+as in `SELECT * LIMIT 1\G`. `\g` is accepted as a synonym for `;`. `\G`
+overrides whatever `.format` is set to, and works in `-e` and piped batch mode
+as well as the REPL.
 
 ## Accuracy notes / gotchas
 

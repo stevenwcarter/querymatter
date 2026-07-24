@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use predicates::prelude::*;
 use std::fs;
 use tempfile::TempDir;
 
@@ -676,4 +677,180 @@ fn missing_ignore_file_flag_exits_nonzero() {
         .assert()
         .failure()
         .stderr(predicates::str::contains("definitely-nonexistent.ignore"));
+}
+
+/// `--table-style` is opt-in: with nothing set, output stays ASCII. The
+/// env-var removal matters — a developer with QUERYMATTER_TABLE_STYLE
+/// exported would otherwise see this pass or fail by accident.
+#[test]
+fn table_style_defaults_to_ascii() {
+    let td = tree();
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .env_remove("QUERYMATTER_TABLE_STYLE")
+        .args(["-e", "SELECT status WHERE prd = '010'"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("+--"))
+        .stdout(predicates::str::contains("╭").not());
+}
+
+#[test]
+fn table_style_flag_draws_unicode_borders() {
+    let td = tree();
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .env_remove("QUERYMATTER_TABLE_STYLE")
+        .args([
+            "-e",
+            "SELECT status WHERE prd = '010'",
+            "--table-style",
+            "unicode",
+        ])
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("╭"));
+}
+
+#[test]
+fn table_style_env_var_is_honored() {
+    let td = tree();
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .env("QUERYMATTER_TABLE_STYLE", "unicode")
+        .args(["-e", "SELECT status WHERE prd = '010'"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("╭"));
+}
+
+#[test]
+fn table_style_flag_overrides_env_var() {
+    let td = tree();
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .env("QUERYMATTER_TABLE_STYLE", "unicode")
+        .args([
+            "-e",
+            "SELECT status WHERE prd = '010'",
+            "--table-style",
+            "ascii",
+        ])
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("+--"))
+        .stdout(predicates::str::contains("╭").not());
+}
+
+/// A typo'd style must fail loudly from either source, never degrade to the
+/// default.
+#[test]
+fn bad_table_style_flag_exits_non_zero() {
+    let td = tree();
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .env_remove("QUERYMATTER_TABLE_STYLE")
+        .args(["-e", "SELECT status", "--table-style", "fancy"])
+        .arg(td.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("fancy"));
+}
+
+#[test]
+fn bad_table_style_env_var_exits_non_zero() {
+    let td = tree();
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .env("QUERYMATTER_TABLE_STYLE", "fancy")
+        .args(["-e", "SELECT status"])
+        .arg(td.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("fancy"));
+}
+
+#[test]
+fn oneshot_vertical_g_prints_row_blocks() {
+    let td = tree();
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        // \G forces Output::Vertical, which render() dispatches independent
+        // of TableStyle — so this assertion can't actually flip on an
+        // ambient QUERYMATTER_TABLE_STYLE today, but removing it keeps the
+        // test from silently growing a dependency on that if vertical
+        // rendering ever starts consulting the style.
+        .env_remove("QUERYMATTER_TABLE_STYLE")
+        .args(["-e", "SELECT status, prd WHERE prd = '011'\\G"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("1. row"))
+        .stdout(predicates::str::contains("status: synced"))
+        .stdout(predicates::str::contains("+--").not());
+}
+
+/// One piped script, two terminators: each statement renders its own way.
+/// The env-var removal matters here exactly as in `table_style_defaults_to_ascii`:
+/// without it, a developer with QUERYMATTER_TABLE_STYLE=unicode exported sees
+/// the `;` statement grow unicode borders and the `+--` assertion fails.
+#[test]
+fn batch_mode_mixes_terminators() {
+    let td = tree();
+    let out = Command::cargo_bin("querymatter")
+        .unwrap()
+        .env_remove("QUERYMATTER_TABLE_STYLE")
+        .arg(td.path())
+        .write_stdin("SELECT count(*) AS n;\nSELECT status WHERE prd = '011'\\G\n")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("+--"),
+        "the `;` statement stays a table:\n{text}"
+    );
+    assert!(
+        text.contains("1. row"),
+        "the `\\G` statement goes vertical:\n{text}"
+    );
+}
+
+/// `\G` means "record-wise" whatever the standing format is.
+#[test]
+fn vertical_g_overrides_the_session_format() {
+    let td = tree();
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .args([
+            "-e",
+            "SELECT status WHERE prd = '011'\\G",
+            "--format",
+            "json",
+        ])
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("1. row"))
+        .stdout(predicates::str::contains("[").not());
+}
+
+#[test]
+fn lowercase_g_terminates_like_a_semicolon() {
+    let td = tree();
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .env_remove("QUERYMATTER_TABLE_STYLE")
+        .args(["-e", "SELECT status WHERE prd = '011'\\g"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("+--"))
+        .stdout(predicates::str::contains("1. row").not());
 }

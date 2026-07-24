@@ -8,7 +8,7 @@ use anyhow::Context;
 
 use crate::cache;
 use crate::query::{self, ResultTable};
-use crate::render::{self, Format};
+use crate::render::{self, Format, Output, TableStyle};
 use crate::store::{LoadReport, RecordStore};
 
 /// Owns the queryable store plus the current output format, and runs queries
@@ -18,6 +18,9 @@ pub struct Session {
     /// The format rendered results are produced in; mutable at runtime (the
     /// REPL's `.format` command).
     pub format: Format,
+    /// The border style used when rendering [`Format::Table`]; mutable at
+    /// runtime (the REPL's `.style` command).
+    pub style: TableStyle,
     /// The `.querymatter` vault this session's store is backed by, when it
     /// is cache-backed. `None` for a live (no-cache) session, in which case
     /// [`refresh`](Self::refresh) falls back to an in-memory-only reload.
@@ -25,15 +28,22 @@ pub struct Session {
 }
 
 impl Session {
-    /// Builds a session over `store`, rendering results in `format`.
+    /// Builds a session over `store`, rendering results in `format` with
+    /// `style`'s table borders.
     ///
     /// `vault` is the `.querymatter` directory backing `store`, when it was
     /// built via [`crate::store::InMemoryStore::from_cache`]; pass `None`
     /// for a live (no-cache) store.
-    pub fn new(store: Box<dyn RecordStore>, format: Format, vault: Option<PathBuf>) -> Self {
+    pub fn new(
+        store: Box<dyn RecordStore>,
+        format: Format,
+        style: TableStyle,
+        vault: Option<PathBuf>,
+    ) -> Self {
         Session {
             store,
             format,
+            style,
             vault,
         }
     }
@@ -48,18 +58,27 @@ impl Session {
             .with_context(|| format!("failed to execute query: {sql}"))
     }
 
-    /// Runs `sql` and renders the result in the session's current format.
+    /// Runs `statement` and renders the result: in the session's current
+    /// format for a `;`/`\g` terminator, or one record per block for `\G`.
     ///
     /// The returned string carries no trailing newline (see [`render`]); the
     /// caller adds exactly one when printing.
-    pub fn render_query(&self, sql: &str) -> anyhow::Result<String> {
-        let table = self.run(sql)?;
-        Ok(render::render(&table, self.format))
+    pub fn render_statement(&self, statement: &Statement) -> anyhow::Result<String> {
+        let table = self.run(&statement.sql)?;
+        let output = statement.terminator.output(self.format);
+        Ok(render::render(&table, output, self.style))
     }
 
-    /// Switches the output format used by [`render_query`](Self::render_query).
+    /// Switches the output format used by
+    /// [`render_statement`](Self::render_statement).
     pub fn set_format(&mut self, f: Format) {
         self.format = f;
+    }
+
+    /// Switches the table border style used by
+    /// [`render_statement`](Self::render_statement).
+    pub fn set_style(&mut self, style: TableStyle) {
+        self.style = style;
     }
 
     /// Rescans every tracked root, returning the combined load report.
@@ -106,17 +125,51 @@ impl Session {
     }
 }
 
-/// Splits `input` into individual statements on top-level `;`, trimming each
-/// and dropping the empties.
+/// How a statement was terminated, which selects how its result renders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Terminator {
+    /// `;` or `\g` — render in the session's current format.
+    Semicolon,
+    /// `\G` — render one record per block (see [`Output::Vertical`]).
+    VerticalG,
+}
+
+impl Terminator {
+    /// The rendering this terminator selects, given the session's standing
+    /// `format`. `\G` overrides the format entirely: it means "show me this
+    /// record-wise" whatever `.format` is currently set to.
+    fn output(self, format: Format) -> Output {
+        match self {
+            Terminator::Semicolon => Output::Format(format),
+            Terminator::VerticalG => Output::Vertical,
+        }
+    }
+}
+
+/// One statement plus the terminator that ended it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Statement {
+    /// The statement text, with the terminator stripped and trimmed.
+    pub sql: String,
+    /// The terminator that ended it.
+    pub terminator: Terminator,
+}
+
+/// Splits `input` into individual statements on top-level `;`, `\g`, and
+/// `\G`, trimming each and dropping the empties.
 ///
-/// "Top-level" means semicolons inside single- or double-quoted string
+/// "Top-level" means terminators inside single- or double-quoted string
 /// literals do not split — so `WHERE title = 'a;b'` stays one statement.
-pub fn split_statements(input: &str) -> Vec<String> {
+/// `\g` terminates exactly like `;` while `\G` additionally selects vertical
+/// rendering; both are case-sensitive, matching `mysql`. Any other backslash
+/// sequence is ordinary statement text.
+pub fn split_statements(input: &str) -> Vec<Statement> {
     let mut statements = Vec::new();
     let mut current = String::new();
     let mut quote: Option<char> = None;
+    let mut chars = input.chars().peekable();
 
-    for ch in input.chars() {
+    while let Some(ch) = chars.next() {
         match quote {
             Some(q) => {
                 current.push(ch);
@@ -130,22 +183,39 @@ pub fn split_statements(input: &str) -> Vec<String> {
                     current.push(ch);
                 }
                 ';' => {
-                    push_statement(&mut statements, &current);
+                    push_statement(&mut statements, &current, Terminator::Semicolon);
                     current.clear();
                 }
+                '\\' => match chars.peek() {
+                    Some('g') => {
+                        chars.next();
+                        push_statement(&mut statements, &current, Terminator::Semicolon);
+                        current.clear();
+                    }
+                    Some('G') => {
+                        chars.next();
+                        push_statement(&mut statements, &current, Terminator::VerticalG);
+                        current.clear();
+                    }
+                    _ => current.push(ch),
+                },
                 _ => current.push(ch),
             },
         }
     }
-    push_statement(&mut statements, &current);
+    // Trailing text with no terminator runs like a `;`-terminated statement.
+    push_statement(&mut statements, &current, Terminator::Semicolon);
     statements
 }
 
-/// Trims `stmt` and pushes it onto `out` when it is not empty.
-fn push_statement(out: &mut Vec<String>, stmt: &str) {
+/// Trims `stmt` and pushes it onto `out` with `terminator` when not empty.
+fn push_statement(out: &mut Vec<Statement>, stmt: &str, terminator: Terminator) {
     let trimmed = stmt.trim();
     if !trimmed.is_empty() {
-        out.push(trimmed.to_string());
+        out.push(Statement {
+            sql: trimmed.to_string(),
+            terminator,
+        });
     }
 }
 
@@ -160,21 +230,109 @@ mod tests {
     use std::fs::File;
     use tempfile::TempDir;
 
+    fn semi(sql: &str) -> Statement {
+        Statement {
+            sql: sql.to_string(),
+            terminator: Terminator::Semicolon,
+        }
+    }
+
     #[test]
     fn split_statements_basic() {
         assert_eq!(
             split_statements(" SELECT 1 ; SELECT 2 ;"),
-            vec!["SELECT 1", "SELECT 2"]
+            vec![semi("SELECT 1"), semi("SELECT 2")]
         );
-        assert_eq!(split_statements("SELECT 1"), vec!["SELECT 1"]);
-        assert_eq!(split_statements("  ;; "), Vec::<String>::new());
+        assert_eq!(split_statements("SELECT 1"), vec![semi("SELECT 1")]);
+        assert_eq!(split_statements("  ;; "), Vec::<Statement>::new());
     }
 
     #[test]
-    fn semicolon_inside_quotes_does_not_split() {
+    fn split_statements_recognizes_vertical_g() {
         assert_eq!(
-            split_statements("SELECT status WHERE title = 'a;b'"),
-            vec!["SELECT status WHERE title = 'a;b'"]
+            split_statements("SELECT 1\\G"),
+            vec![Statement {
+                sql: "SELECT 1".to_string(),
+                terminator: Terminator::VerticalG,
+            }]
+        );
+    }
+
+    /// `\g` terminates exactly like `;`, and the pair is case-sensitive —
+    /// both match `mysql`.
+    #[test]
+    fn split_statements_lowercase_g_is_a_plain_terminator() {
+        assert_eq!(split_statements("SELECT 1\\g"), vec![semi("SELECT 1")]);
+    }
+
+    #[test]
+    fn split_statements_mixes_terminators() {
+        assert_eq!(
+            split_statements("SELECT 1; SELECT 2\\G SELECT 3\\g"),
+            vec![
+                semi("SELECT 1"),
+                Statement {
+                    sql: "SELECT 2".to_string(),
+                    terminator: Terminator::VerticalG,
+                },
+                semi("SELECT 3"),
+            ]
+        );
+    }
+
+    /// Terminators inside a string literal are ordinary text, exactly as `;`
+    /// already was.
+    #[test]
+    fn split_statements_ignores_terminators_in_quotes() {
+        assert_eq!(
+            split_statements("SELECT status WHERE title = 'a\\Gb;c'"),
+            vec![semi("SELECT status WHERE title = 'a\\Gb;c'")]
+        );
+    }
+
+    /// A backslash inside a quoted literal is handled by the quote-mode match
+    /// arm, which never inspects backslashes at all — it is just more quoted
+    /// text. This does NOT exercise the top-level `'\\' => match chars.peek()`
+    /// fallback; see the `split_statements_backslash_*` tests below for that.
+    #[test]
+    fn split_statements_ignores_backslashes_inside_quotes() {
+        assert_eq!(
+            split_statements("SELECT status WHERE p = 'a\\b'"),
+            vec![semi("SELECT status WHERE p = 'a\\b'")]
+        );
+    }
+
+    /// At the top level (outside any quote), a backslash not followed by `g`
+    /// or `G` is retained verbatim and the following character is preserved
+    /// untouched — the peek must not consume it.
+    #[test]
+    fn split_statements_backslash_before_letter_preserves_next_char() {
+        assert_eq!(
+            split_statements("a\\zb;"),
+            vec![semi("a\\zb")],
+            "a top-level backslash before an ordinary letter must keep both \
+             the backslash and the letter"
+        );
+    }
+
+    /// A trailing backslash at end of input (nothing left to peek) must not
+    /// panic, and the backslash is retained in the final statement.
+    #[test]
+    fn split_statements_trailing_backslash_does_not_panic() {
+        assert_eq!(split_statements("SELECT 1\\"), vec![semi("SELECT 1\\")]);
+    }
+
+    /// A backslash immediately before a quote character is retained as
+    /// literal text, and the quote genuinely opens a string — this crate
+    /// implements no backslash-escaping of quotes, so the quote character
+    /// still flips the quote-mode state machine on its own.
+    #[test]
+    fn split_statements_backslash_before_quote_opens_a_string() {
+        assert_eq!(
+            split_statements("a\\'b';"),
+            vec![semi("a\\'b'")],
+            "the backslash stays literal and 'b' is still a real quoted \
+             literal, not an escaped quote"
         );
     }
 
@@ -193,6 +351,7 @@ mod tests {
         let mut session = Session::new(
             Box::new(store),
             Format::Table,
+            TableStyle::Ascii,
             Some(td.path().to_path_buf()),
         );
 
@@ -233,7 +392,7 @@ mod tests {
 
         let (store, _report) =
             InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default());
-        let mut session = Session::new(Box::new(store), Format::Table, None);
+        let mut session = Session::new(Box::new(store), Format::Table, TableStyle::Ascii, None);
 
         fs::write(&a_path, "---\nstatus: final\n---\n").unwrap();
 
@@ -265,7 +424,12 @@ mod tests {
 
         let (store, _report) =
             InMemoryStore::from_cache(&vault, WalkOpts::default(), Freshness::PerFile);
-        let mut session = Session::new(Box::new(store), Format::Table, Some(vault.clone()));
+        let mut session = Session::new(
+            Box::new(store),
+            Format::Table,
+            TableStyle::Ascii,
+            Some(vault.clone()),
+        );
 
         // Equal byte length ("draft" -> "fresh") plus a restored mtime: the
         // default per-file freshness check would REUSE the stale cached value,
@@ -304,7 +468,12 @@ mod tests {
 
         let (store, _report) =
             InMemoryStore::from_cache(&vault, WalkOpts::default(), Freshness::PerFile);
-        let mut session = Session::new(Box::new(store), Format::Table, Some(vault.clone()));
+        let mut session = Session::new(
+            Box::new(store),
+            Format::Table,
+            TableStyle::Ascii,
+            Some(vault.clone()),
+        );
 
         let report = session.refresh(Some(Path::new("definitely-not-here")));
         assert!(
