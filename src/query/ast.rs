@@ -246,13 +246,20 @@ pub struct OrderKey {
     pub desc: bool,
 }
 
-/// The sort key of an `ORDER BY` clause: either a projection alias or a column.
+/// The sort key of an `ORDER BY` clause: a projection alias, a column, or a
+/// bare aggregate call.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OrderTarget {
     /// An identifier that matched a `SELECT` alias.
     Alias(String),
     /// A direct column reference.
     Col(ColRef),
+    /// A bare aggregate function call with no `AS` alias, e.g. `ORDER BY
+    /// count(*) DESC`. Only valid alongside a non-empty `GROUP BY` — the
+    /// parser rejects it on an ungrouped query (including the implicit
+    /// single-group case, where `group_by` is empty too) rather than
+    /// leaving that combination representable.
+    Agg(Aggregate),
 }
 
 impl SelectItem {

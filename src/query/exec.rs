@@ -39,6 +39,14 @@ pub enum ExecError {
     /// An `ORDER BY` alias didn't match any `SELECT` alias.
     #[error("unknown ORDER BY alias `{0}`")]
     UnknownAlias(String),
+    /// An `ORDER BY` aggregate target reached the ungrouped execution path.
+    /// `parse::lower_order_expr` rejects this at parse time (an aggregate
+    /// `ORDER BY` requires a non-empty `GROUP BY`, which always routes to
+    /// [`execute_grouped`]), so this is unreachable for any [`Query`] built
+    /// by [`crate::query::parse`]; it exists only so [`resolve_order_targets`]
+    /// stays total for a hand-built `Query` that bypasses that guarantee.
+    #[error("ORDER BY an aggregate requires GROUP BY")]
+    AggregateOrderWithoutGroupBy,
 }
 
 /// Executes `q` against `records`, returning the projected, filtered,
@@ -167,30 +175,37 @@ fn execute_grouped<'a>(
     let mut groups = group_rows(&filtered, &q.group_by);
     groups.sort_by(|a, b| compare_key_tuple(&a.key, &b.key));
 
+    let order = resolve_group_order_targets(&q.order_by, &headers, &q.group_by)?;
+
+    // Each order key's value is resolved here, while `group.rows` is still
+    // around — an aggregate order target (Task 8) is computed fresh from
+    // them and need not be a projected `SELECT` cell, unlike `Row`/`GroupKey`
+    // targets, which are just read back from `row`/`group.key`.
     let mut rows: Vec<(Vec<Value>, Vec<Value>)> = groups
         .into_iter()
         .map(|group| {
             let row = project_group(&group, &items);
-            (group, row)
+            let order_keys: Vec<Value> = order
+                .iter()
+                .map(|(target, _)| group_order_key_value(target, &group, &row))
+                .collect();
+            (group, row, order_keys)
         })
-        .filter(|(group, _)| match &q.having {
+        .filter(|(group, _, _)| match &q.having {
             // SQL 3VL, same rule as WHERE: a group is kept only when HAVING
             // is definitely true; unknown/false both drop it.
             Some(having) => eval_having(having, group, &q.group_by) == Some(true),
             None => true,
         })
-        .map(|(group, row)| (group.key, row))
+        .map(|(_, row, order_keys)| (row, order_keys))
         .collect();
 
-    let order = resolve_group_order_targets(&q.order_by, &headers, &q.group_by)?;
-    rows.sort_by(|(ka, rowa), (kb, rowb)| {
+    rows.sort_by(|(_, oa), (_, ob)| {
         order
             .iter()
-            .map(|(target, desc)| {
-                let va = group_order_key_value(target, ka, rowa);
-                let vb = group_order_key_value(target, kb, rowb);
-                order_cmp(&va, &vb, *desc)
-            })
+            .zip(oa)
+            .zip(ob)
+            .map(|(((_, desc), va), vb)| order_cmp(va, vb, *desc))
             .find(|ord| *ord != Ordering::Equal)
             .unwrap_or(Ordering::Equal)
     });
@@ -198,7 +213,7 @@ fn execute_grouped<'a>(
     let offset = q.offset.unwrap_or(0);
     let rows: Vec<Vec<Value>> = rows
         .into_iter()
-        .map(|(_, row)| row)
+        .map(|(row, _)| row)
         .skip(offset)
         .take(q.limit.unwrap_or(usize::MAX))
         .collect();
@@ -447,12 +462,18 @@ enum ResolvedGroupOrderTarget {
     /// An index into the group key tuple (a bare `ORDER BY` column, which is
     /// only meaningful when it's one of the `GROUP BY` keys).
     GroupKey(usize),
+    /// A bare aggregate call (Task 8), computed fresh from the group's rows
+    /// — it need not appear in `SELECT`, mirroring how `HAVING` may
+    /// reference an unselected aggregate (see [`HavingLeaf::Agg`]).
+    Agg(Aggregate),
 }
 
 /// Resolves each `ORDER BY` key's target for the grouped path: an explicit
 /// alias resolves against `headers`, exactly like the non-grouped path; a
 /// bare column must be one of `group_by`'s keys — referencing anything else
-/// is as invalid as selecting it, so it's rejected the same way.
+/// is as invalid as selecting it, so it's rejected the same way; a bare
+/// aggregate always resolves, since it's computed fresh per group rather
+/// than looked up in the projection or the grouping keys.
 fn resolve_group_order_targets(
     order_by: &[OrderKey],
     headers: &[String],
@@ -472,6 +493,7 @@ fn resolve_group_order_targets(
                     .position(|g| g == col)
                     .map(ResolvedGroupOrderTarget::GroupKey)
                     .ok_or_else(|| ExecError::NonGroupedColumn(col_header(col)))?,
+                OrderTarget::Agg(agg) => ResolvedGroupOrderTarget::Agg(agg.clone()),
             };
             Ok((target, key.desc))
         })
@@ -488,12 +510,18 @@ fn col_header(col: &ColRef) -> String {
     .header()
 }
 
-/// Reads the sort key's value for one grouped row, given its key tuple and
-/// already-projected row.
-fn group_order_key_value(target: &ResolvedGroupOrderTarget, key: &[Value], row: &[Value]) -> Value {
+/// Reads the sort key's value for one group, given its already-projected
+/// row. An aggregate target is computed fresh from `group.rows` — it need
+/// not be one of `group`'s already-projected `SELECT` cells.
+fn group_order_key_value(
+    target: &ResolvedGroupOrderTarget,
+    group: &Group<'_>,
+    row: &[Value],
+) -> Value {
     match target {
         ResolvedGroupOrderTarget::Row(idx) => row[*idx].clone(),
-        ResolvedGroupOrderTarget::GroupKey(idx) => key[*idx].clone(),
+        ResolvedGroupOrderTarget::GroupKey(idx) => group.key[*idx].clone(),
+        ResolvedGroupOrderTarget::Agg(agg) => compute_aggregate(agg, &group.rows),
     }
 }
 
@@ -857,6 +885,10 @@ enum ResolvedOrderTarget {
 
 /// Resolves each `ORDER BY` key's target once, up front, returning the
 /// resolved target paired with its `DESC` flag.
+///
+/// `OrderTarget::Agg` has no resolution here — see
+/// [`ExecError::AggregateOrderWithoutGroupBy`] for why it's unreachable for
+/// any [`Query`] the parser produces.
 fn resolve_order_targets(
     order_by: &[OrderKey],
     headers: &[String],
@@ -873,6 +905,7 @@ fn resolve_order_targets(
                     ResolvedOrderTarget::AliasIndex(idx)
                 }
                 OrderTarget::Col(col) => ResolvedOrderTarget::Col(col.clone()),
+                OrderTarget::Agg(_) => return Err(ExecError::AggregateOrderWithoutGroupBy),
             };
             Ok((target, key.desc))
         })
@@ -1784,6 +1817,34 @@ mod agg_tests {
             execute(&q, recs().iter()),
             Err(ExecError::NonGroupedColumn(_))
         ));
+    }
+    #[test]
+    fn order_by_bare_aggregate() {
+        // status: draft x1, synced x2 (see `recs()`) — no `AS` alias on
+        // `count(*)`, yet `ORDER BY count(*) DESC` still sorts groups by it.
+        let q = parse("SELECT status, count(*) GROUP BY status ORDER BY count(*) DESC").unwrap();
+        let t = execute(&q, recs().iter()).unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec![Value::Str("synced".into()), Value::Int(2)],
+                vec![Value::Str("draft".into()), Value::Int(1)],
+            ]
+        );
+    }
+    #[test]
+    fn order_by_bare_aggregate_need_not_be_selected() {
+        // `count(*)` drives the sort even though it's absent from SELECT —
+        // it's computed fresh from each group's rows, same as `HAVING`.
+        let q = parse("SELECT status GROUP BY status ORDER BY count(*) DESC").unwrap();
+        let t = execute(&q, recs().iter()).unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec![Value::Str("synced".into())],
+                vec![Value::Str("draft".into())],
+            ]
+        );
     }
     #[test]
     fn aggregate_with_no_group_by_over_zero_rows_is_one_row_of_zero() {
