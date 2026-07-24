@@ -1573,6 +1573,33 @@ fn exit_code_two_on_error() {
         .code(2);
 }
 
+/// MUST-FIX: `--exit-code`'s grep-style 0/1/2 error mapping (`is_query_like`
+/// in `main.rs`) applies only to query mode and `query run` — every other
+/// subcommand error stays exit 1 even under `--exit-code`. `query get` is a
+/// `query` subcommand ACTION but not a query RUN, so it must stay 1, same
+/// for a rejected `query save`; `query run` on an unknown name IS
+/// query-like (it resolves a name to SQL and runs it exactly like `-e`
+/// would), so it's 2, for contrast.
+#[test]
+fn exit_code_only_maps_query_mode_errors_not_every_query_subcommand_error() {
+    let home = TempDir::new().unwrap();
+
+    qm(home.path())
+        .args(["--exit-code", "query", "get", "nope"])
+        .assert()
+        .code(1);
+
+    qm(home.path())
+        .args(["--exit-code", "query", "save", "has space", "SELECT status"])
+        .assert()
+        .code(1);
+
+    qm(home.path())
+        .args(["--exit-code", "query", "run", "nope"])
+        .assert()
+        .code(2);
+}
+
 #[test]
 fn without_exit_code_zero_rows_still_exits_zero() {
     let td = tree();
@@ -1890,6 +1917,56 @@ fn query_run_honors_exit_code_flag() {
         .code(1);
 }
 
+/// FOLD-IN: `query run <name> [DIR]` scans `[DIR]` instead of cwd/vault when
+/// given — exactly like a positional `[DIRS]` entry would in query mode
+/// (the live-scan counterpart of `positional_dir_restricts_vault_query_to_that_subtree`,
+/// which covers the vault-narrowing case for `-e`). Run from an unrelated
+/// cwd containing BOTH subtrees, `query run names <dir>` must match `-e`
+/// scoped to `<dir>` via `.current_dir`, byte for byte.
+#[test]
+fn query_run_dir_argument_scans_that_directory() {
+    let td = TempDir::new().unwrap();
+    for (p, s) in [
+        ("a/one.md", "---\nstatus: draft\n---\n"),
+        ("b/two.md", "---\nstatus: synced\n---\n"),
+    ] {
+        let f = td.path().join(p);
+        fs::create_dir_all(f.parent().unwrap()).unwrap();
+        fs::write(f, s).unwrap();
+    }
+    let home = TempDir::new().unwrap();
+    let sql = "SELECT file.name";
+
+    qm(home.path())
+        .args(["query", "save", "names", sql])
+        .assert()
+        .success();
+
+    let via_dash_e = qm(home.path())
+        .current_dir(td.path().join("a"))
+        .args(["-e", sql])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let via_query_run = qm(home.path())
+        .current_dir(td.path())
+        .args(["query", "run", "names"])
+        .arg(td.path().join("a"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert_eq!(via_dash_e, via_query_run);
+    let text = String::from_utf8(via_query_run).unwrap();
+    assert!(text.contains("one.md"), "got: {text:?}");
+    assert!(!text.contains("two.md"), "got: {text:?}");
+}
+
 #[test]
 fn query_run_unknown_name_errors() {
     let td = tree();
@@ -1900,6 +1977,62 @@ fn query_run_unknown_name_errors() {
         .assert()
         .failure()
         .stderr(predicates::str::contains("nope"));
+}
+
+/// MUST-FIX: `query save`/`list`/`get`/`delete` operate only on
+/// `queries.toml`, a file separate from `config.toml` — they must not be
+/// blocked by a broken `config.toml`, mirroring `config path`'s and
+/// `completions`' own pre-`config::load()` dispatch (see
+/// `config_path_survives_a_malformed_config_while_a_query_still_fails`).
+/// `query run` DOES build a session, so it still needs a valid config and is
+/// expected to fail, just like an ordinary query.
+#[test]
+fn query_actions_survive_a_malformed_config_but_run_still_fails() {
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "table_style = = broken\n");
+
+    qm(home.path())
+        .args(["query", "save", "stale", "SELECT status"])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("stale"));
+
+    qm(home.path())
+        .args(["query", "list"])
+        .assert()
+        .success()
+        .stdout("stale\tSELECT status\n");
+
+    qm(home.path())
+        .args(["query", "get", "stale"])
+        .assert()
+        .success()
+        .stdout("SELECT status\n");
+
+    // `query run` DOES build a session, so — unlike its config-free siblings
+    // above — it still needs a valid config, and fails here naming
+    // config.toml just like an ordinary query would.
+    qm(home.path())
+        .args(["query", "run", "stale"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("config.toml"));
+
+    qm(home.path())
+        .args(["query", "delete", "stale"])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("stale"));
+
+    // An ordinary query still errors too, naming config.toml — the broken
+    // file is real, just irrelevant to the four config-free actions above.
+    let td = tree();
+    qm(home.path())
+        .args(["-e", "SELECT status"])
+        .arg(td.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("config.toml"));
 }
 
 /// A broken `queries.toml` blocks every `query` action, so its message must
@@ -2032,6 +2165,44 @@ fn explain_path_outside_cwd_is_a_clean_error() {
         .assert()
         .failure()
         .stderr(predicates::str::contains("outside"));
+}
+
+/// MUST-FIX: `explain` must root at the ancestor `.querymatter` vault when
+/// one exists, exactly like a real query does — not always at cwd. From a
+/// vault subdirectory, `explain ../top.md` names a file that IS under the
+/// vault root (and so IS what a real query from this subdirectory would
+/// scan) even though it is outside cwd; before the fix this was rejected as
+/// "outside the current directory".
+#[test]
+fn explain_roots_at_the_vault_from_a_subdirectory_matching_a_real_query() {
+    let td = TempDir::new().unwrap();
+    fs::write(td.path().join("top.md"), "---\nstatus: x\n---\n").unwrap();
+    let sub = td.path().join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    let home = TempDir::new().unwrap();
+
+    qm(home.path())
+        .arg("init")
+        .arg(td.path())
+        .assert()
+        .success();
+
+    // A real query from `sub` discovers `top.md` via the vault.
+    qm(home.path())
+        .current_dir(&sub)
+        .args(["-e", "SELECT file.name WHERE file.name = 'top.md'"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("top.md"));
+
+    // `explain` from the same directory must agree, not reject the path as
+    // outside cwd.
+    qm(home.path())
+        .current_dir(&sub)
+        .args(["explain", "../top.md"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("included"));
 }
 
 /// Property: `explain`'s verdict must match `discover()`'s actual membership
