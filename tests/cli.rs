@@ -1467,3 +1467,28 @@ fn configured_lenient_allows_unknown_column_without_the_flag() {
         .assert()
         .success();
 }
+
+/// `--no-lenient` overrides a configured `lenient = true` back to strict for
+/// one invocation — the same symmetry `--no-hidden` gives `hidden`.
+#[test]
+fn no_lenient_overrides_configured_lenient() {
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["config", "set", "lenient", "true"])
+        .assert()
+        .success();
+    let td = tree();
+
+    qm(home.path())
+        .args(["-e", "SELECT staus", "--no-lenient"])
+        .arg(td.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("staus"));
+
+    qm(home.path())
+        .args(["-e", "SELECT staus"])
+        .arg(td.path())
+        .assert()
+        .success();
+}

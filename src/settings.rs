@@ -106,7 +106,13 @@ impl Settings {
                 defaults.table_style.value,
                 source_of(matches, "table_style"),
             ),
-            lenient: resolve_flag(matches, "lenient", config.lenient, defaults.lenient.value),
+            lenient: resolve_bool(
+                matches,
+                "lenient",
+                "no_lenient",
+                config.lenient,
+                defaults.lenient.value,
+            ),
             ..Settings::resolve_walk(&cli.walk, config, matches)
         }
     }
@@ -260,25 +266,6 @@ fn resolve_bool(
         Resolved::new(true, Source::Flag)
     } else if source_of(matches, off) == Some(Source::Flag) {
         Resolved::new(false, Source::Flag)
-    } else if let Some(value) = config {
-        Resolved::new(value, Source::Config)
-    } else {
-        Resolved::new(default, Source::Default)
-    }
-}
-
-/// Picks the winning layer for a plain on/off flag with no negation
-/// counterpart (unlike `hidden`/`respect_gitignore`) and no environment
-/// variable — `on`'s presence always wins, then the config file, then
-/// `default`.
-fn resolve_flag(
-    matches: &ArgMatches,
-    on: &str,
-    config: Option<bool>,
-    default: bool,
-) -> Resolved<bool> {
-    if source_of(matches, on) == Some(Source::Flag) {
-        Resolved::new(true, Source::Flag)
     } else if let Some(value) = config {
         Resolved::new(value, Source::Config)
     } else {
@@ -463,6 +450,17 @@ mod tests {
         assert_eq!(s.lenient.source, Source::Config);
     }
 
+    /// Without a negation flag there would be no way to turn a configured
+    /// `true` back to strict for one invocation.
+    #[test]
+    fn no_lenient_overrides_a_configured_true() {
+        let config = config_with(|c| c.lenient = Some(true));
+        assert!(resolve(&["querymatter"], &config).lenient.value);
+        let s = resolve(&["querymatter", "--no-lenient"], &config);
+        assert!(!s.lenient.value);
+        assert_eq!(s.lenient.source, Source::Flag);
+    }
+
     #[test]
     fn a_flag_and_its_negation_together_are_rejected() {
         let mut command = Cli::command().mut_arg("table_style", |a| a.env(None::<&str>));
@@ -479,6 +477,12 @@ mod tests {
                     "--respect-gitignore",
                     "--no-respect-gitignore"
                 ])
+                .is_err()
+        );
+        let mut command = Cli::command().mut_arg("table_style", |a| a.env(None::<&str>));
+        assert!(
+            command
+                .try_get_matches_from_mut(["querymatter", "--lenient", "--no-lenient"])
                 .is_err()
         );
     }
