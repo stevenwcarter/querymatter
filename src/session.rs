@@ -187,20 +187,13 @@ impl Session {
             .with_context(|| format!("failed to execute query: {sql}"))
     }
 
-    /// Runs `statement` and renders the result: in the session's current
-    /// format for a `;`/`\g` terminator, or one record per block for `\G`.
-    ///
-    /// The returned string carries no trailing newline (see [`render`]); the
-    /// caller adds exactly one when printing. Thin wrapper around
-    /// [`render_statement_counted`](Self::render_statement_counted) for the
-    /// one-shot/batch callers that don't need the row count.
-    pub fn render_statement(&self, statement: &Statement) -> anyhow::Result<String> {
-        Ok(self.render_statement_counted(statement)?.0)
-    }
-
-    /// Runs `statement` once and returns both its rendered string and the
-    /// row count from that same [`ResultTable`] — the REPL prints the count
-    /// as a `-- N rows` line after the result, without a second query run.
+    /// Runs `statement` once and returns both its rendered string — in the
+    /// session's current format for a `;`/`\g` terminator, or one record per
+    /// block for `\G`, with no trailing newline (see [`render`]); the caller
+    /// adds exactly one when printing — and the row count from that same
+    /// [`ResultTable`]. The REPL prints the count as a `-- N rows` line after
+    /// the result, and one-shot/batch callers sum it for `--exit-code`,
+    /// without either needing a second query run.
     pub fn render_statement_counted(
         &self,
         statement: &Statement,

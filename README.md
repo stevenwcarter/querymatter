@@ -164,6 +164,7 @@ forces strict validation for one invocation, overriding a configured `lenient
 | `-e, --query <QUERY>` | One-shot mode; `-` reads the query text from stdin. May contain several statements, each ended by `;` (or `\G`, which prints every row as a block of `name: value` lines instead of a table). |
 | `--format <FMT>` | `table` (default), `json`, `csv`, `tsv`, or `md`. In the REPL this is just the *initial* format — `.format` changes it live. |
 | `--table-style <STYLE>` | Border style for `--format table`: `ascii` (default), `unicode`, `compact`, or `plain`. Also settable per-shell with `QUERYMATTER_TABLE_STYLE`; the flag wins. Ignored by `json`/`csv`/`tsv`/`md`. In the REPL this is just the *initial* style — `.style` changes it live. |
+| `--output <PATH>` | Write query results to `PATH` instead of stdout (one-shot/batch mode only). See [Redirecting output](#redirecting-output---output). |
 | `--lenient` | Disable unknown-column validation — an unknown column reads as `NULL` instead of failing the query. Off by default — see [Unknown-column validation](#unknown-column-validation). |
 | `--no-lenient` | Force strict unknown-column validation, overriding a config `lenient = true`. |
 | `--ext <LIST>` | Comma-separated extensions to include. Default `md,markdown`. |
@@ -179,10 +180,156 @@ forces strict validation for one invocation, overriding a configured `lenient
 | `--fast` | Use the dir-mtime + TTL hybrid freshness check instead of the accurate per-file default. |
 | `--refresh <PATH>` | Force a re-scan of `PATH`'s subtree before querying, updating the cache. Repeatable. |
 | `--refresh-all` | Force a re-scan of the whole vault before querying, updating the cache. |
+| `--exit-code` | Grep-style 0/1/2 exit status instead of the default 0-unless-erroring behavior. Query mode and `query run` only. See [Exit codes for scripting](#exit-codes-for-scripting---exit-code). |
 
 See [Caching large vaults](#caching-large-vaults-querymatter) below for what
 these mean and for `querymatter init`'s own flags (`--ttl`, plus the walk
 flags above, which `init` shares).
+
+## Exit codes for scripting (`--exit-code`)
+
+By default a clean run — even one that matched zero rows — exits `0`; only a
+genuine error (bad SQL, an IO problem, a missing directory) exits `1`. Pass
+`--exit-code` for grep-style semantics instead:
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | The query matched at least one row. |
+| `1` | The query ran cleanly but matched no rows. |
+| `2` | A parse/exec/IO error. |
+
+For `-e`/piped batch input containing several `;`-separated statements, row
+counts are summed across every statement in the run — exit `1` only when
+**every** statement matched zero rows; if any one statement matched at least
+one row, the whole run exits `0`.
+
+`--exit-code` only applies to **query mode** (no subcommand, `-e`/piped
+stdin/the REPL's non-interactive paths) and **`query run`** (which resolves a
+saved name to SQL and runs it exactly like `-e` would). Every other
+subcommand — `init`, `config …`, `query save`/`list`/`get`/`delete`,
+`explain`, `completions` — keeps today's plain "error exits 1, success exits
+0" behavior regardless of `--exit-code`; those aren't query-result concepts
+the 0/1/2 mapping has an analog for. `--exit-code` has no effect on the
+interactive REPL itself, which has no single "total rows for the whole
+session" to report.
+
+```console
+$ querymatter -e "SELECT status WHERE status = 'archived'" --exit-code; echo $?
+1
+$ querymatter -e "SELECT status WHERE status = 'draft'" --exit-code; echo $?
+0
+$ querymatter -e "SELECT (" --exit-code; echo $?
+2
+```
+
+## Redirecting output (`--output`)
+
+`--output <PATH>` writes query results to a file instead of stdout, for
+one-shot (`-e`) and batch (piped-stdin) mode:
+
+```sh
+querymatter -e "SELECT status" --output results.txt
+```
+
+`PATH` is **truncated up front** — like a shell `>` redirect — before the
+first statement runs, and every statement in the run appends to that same
+handle; stdout stays completely empty. Because the file is cleared before any
+query work happens, a run that fails partway through (a later statement in a
+multi-statement `-e`, say) can leave `PATH` empty or holding only the
+statements that ran before the failure — check the process exit code, not
+just the file's existence, before trusting its contents.
+
+**`--output` applies to one-shot/batch mode only; it is ignored in the
+interactive REPL.** Use `.output` inside the REPL instead:
+
+| Command | Effect |
+| --- | --- |
+| `.output <path>` | Truncate/open `<path>`; every later statement's result is appended there instead of printed. |
+| `.output` / `.output stdout` | Reset: later results print to stdout again. |
+
+```
+querymatter> .output results.txt
+querymatter: writing results to results.txt
+querymatter> SELECT status;
+querymatter> .output stdout
+querymatter: results on stdout
+```
+
+A `.output <path>` that can't be opened for writing reports the error on
+stderr and leaves the session writing wherever it already was.
+
+## Saved queries (`querymatter query`)
+
+Save SQL under a short name once, then re-run it by name instead of retyping
+it — handy for a query you run often (e.g. "everything still `draft`").
+
+| Command | Meaning |
+| --- | --- |
+| `query save <NAME> <SQL>` | Save `SQL` under `NAME`, overwriting any query already saved under that name. Rejected up front, naming the parse error, if `SQL` fails to parse — a saved query can never be one that only breaks later at `query run`. |
+| `query list` | List every saved query's name and SQL, one `name<TAB>sql` line each. |
+| `query get <NAME>` | Print one saved query's SQL. |
+| `query run <NAME> [DIR]` | Resolve `NAME` to its saved SQL and run it — see below. |
+| `query delete <NAME>` | Remove a saved query. Deleting a name that was never saved is reported on stderr, not an error. |
+
+`NAME` may contain letters, digits, `_`, and `-` only.
+
+Saved queries live in their own file, **`queries.toml`**, in the same config
+directory as `config.toml` (`querymatter config path`'s directory) but never
+merged into it — a malformed `queries.toml` only blocks `query` actions, never
+an ordinary query, and vice versa. `query save`/`list`/`get`/`delete` read and
+write only `queries.toml`, so they keep working even when `config.toml` is
+broken — mirroring `config path`'s and `completions`' own resilience (see
+[Shell completions](#shell-completions)) — while `query run` builds a session
+like a normal query, so it does need a valid `config.toml`.
+
+`query run <NAME> [DIR]` resolves `NAME`'s saved SQL and executes it through
+the exact same machinery as `-e` (fed the resolved SQL as the query text), so
+it honors `--format`/`--table-style`/`--output`/`--exit-code` and every walk
+flag exactly like a one-shot query would. The optional `[DIR]` positional
+overrides the scan root, exactly like a single positional `[DIRS]` entry in
+query mode; omit it to keep the usual cwd/vault behavior.
+
+```console
+$ querymatter query save drafts "SELECT status WHERE status = 'draft'"
+querymatter: saved query 'drafts' in ~/.config/querymatter/queries.toml
+
+$ querymatter query run drafts --format csv
+status
+draft
+```
+
+Inside the REPL, `.query run <name>` runs a saved query in-session (splitting
+a multi-statement saved query and running each statement in turn, exactly
+like typing them one after another) and `.query list` lists every saved name
+and its SQL — see the dot-commands table below. `query save`/`get`/`delete`
+are CLI-only. Tab-completion offers saved-query names right after
+`.query run `.
+
+## Diagnosing exclusions (`querymatter explain <path>`)
+
+`querymatter explain <path>` reports whether `path` would be discovered by a
+real query — and when it wouldn't, **which filter layer is responsible**:
+
+```console
+$ querymatter explain notes/draft.md
+included
+
+$ querymatter explain notes/archive.txt
+excluded: extension 'txt' not in --ext (md, markdown)
+
+$ querymatter explain .obsidian/workspace.md
+excluded: hidden directory '.obsidian' (pass --hidden to include)
+```
+
+The verdict is ground truth: it's exactly whether a live scan under the same
+`--ext`/`--hidden`/`--exclude`/etc. flags would find `path`, so it can never
+disagree with a real query run. `explain` roots its scan at the ancestor
+`.querymatter` vault when one exists — the same vault a real query from this
+directory would use — or the current directory when there is none; `path`
+must resolve under that root, or `explain` reports a clean error rather than a
+silently wrong verdict. Like a real query, `explain` always does a **live
+scan** — it never consults a `.querymatter` cache's contents, only its
+location (to find the vault root).
 
 ## Ignoring files (`.querymatterignore`)
 
@@ -405,12 +552,15 @@ rather than SQL:
 | `.describe [field]` | With no argument, a one-line-per-field summary of every field's type and coverage. With `<field>`, that field's `Value` type(s), non-null coverage, and its most-frequent-first value list (or a bare distinct count, when there are too many distinct values to list). |
 | `.format [fmt]` | Show, or set, the output format for subsequent queries. |
 | `.style [style]` | Show, or set, the table border style (`ascii`, `unicode`, `compact`, `plain`) for subsequent queries. |
+| `.output [path\|stdout]` | Redirect subsequent results to `path` (truncating it first), or back to stdout with `.output`/`.output stdout`. See [Redirecting output](#redirecting-output---output). |
 | `.settings` | List every setting, its resolved value, and which layer supplied it. |
 | `.set <key> <value>` | Save a setting to the config file. Rendering settings (`format`, `table_style`) also apply immediately; scan settings take effect on the next run. |
 | `.unset <key>` | Remove a setting from the config file. |
 | `.reload` | Re-scan every tracked directory (in-memory only; never touches a `.querymatter` cache). |
 | `.refresh [path]` | Force a re-scan of `path` (or the whole vault); updates the `.querymatter` cache when one is loaded, otherwise behaves like `.reload`. |
 | `.refresh-all` | Force a re-scan of the whole vault; alias for `.refresh` with no path. |
+| `.query run <name>` | Run a saved query in-session, honoring the current `.format`/`.style`/`.output`. See [Saved queries](#saved-queries-querymatter-query). |
+| `.query list` | List every saved query's name and SQL. |
 | `.quit` / `.exit` | Leave the REPL (Ctrl-D also exits; Ctrl-C cancels the current line). |
 
 SQL statements may span multiple lines; a trailing `;` ends the statement and
@@ -432,11 +582,13 @@ it never corrupts piped output.
 
 Tab-completion is available for: frontmatter column names and the `file.*`
 pseudo-columns, in SQL position; dot-command names, right after a leading
-`.`; and config keys, right after `.set`/`.unset`. It does not complete SQL
-keywords (`SELECT`, `WHERE`, and so on) — only schema-derived and
-dot-command/config-key names. The column list is a one-time snapshot taken
-when the REPL starts, so a field discovered by a later `.reload`/`.refresh`
-won't tab-complete until you restart the REPL.
+`.`; config keys, right after `.set`/`.unset`; and saved-query names, right
+after `.query run`. It does not complete SQL keywords (`SELECT`, `WHERE`, and
+so on) — only schema-derived and dot-command/config-key/saved-query names.
+The column and saved-query-name lists are both one-time snapshots taken when
+the REPL starts, so a field discovered by a later `.reload`/`.refresh`, or a
+query saved from another shell (`querymatter query save`) mid-session, won't
+tab-complete until you restart the REPL.
 
 History records one entry per statement or dot-command, not per line: typing
 a SQL statement across several lines (ended by `;` or `\G`) or a dot-command

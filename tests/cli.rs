@@ -1539,3 +1539,698 @@ fn no_lenient_overrides_configured_lenient() {
         .assert()
         .success();
 }
+
+#[test]
+fn exit_code_zero_when_rows_match() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["-e", "SELECT status WHERE prd = '010'", "--exit-code"])
+        .arg(td.path())
+        .assert()
+        .code(0);
+}
+
+#[test]
+fn exit_code_one_when_no_rows() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["-e", "SELECT status WHERE prd = 'nope'", "--exit-code"])
+        .arg(td.path())
+        .assert()
+        .code(1);
+}
+
+#[test]
+fn exit_code_two_on_error() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["-e", "SELECT (", "--exit-code"])
+        .arg(td.path())
+        .assert()
+        .code(2);
+}
+
+/// MUST-FIX: `--exit-code`'s grep-style 0/1/2 error mapping (`is_query_like`
+/// in `main.rs`) applies only to query mode and `query run` — every other
+/// subcommand error stays exit 1 even under `--exit-code`. `query get` is a
+/// `query` subcommand ACTION but not a query RUN, so it must stay 1, same
+/// for a rejected `query save`; `query run` on an unknown name IS
+/// query-like (it resolves a name to SQL and runs it exactly like `-e`
+/// would), so it's 2, for contrast.
+#[test]
+fn exit_code_only_maps_query_mode_errors_not_every_query_subcommand_error() {
+    let home = TempDir::new().unwrap();
+
+    qm(home.path())
+        .args(["--exit-code", "query", "get", "nope"])
+        .assert()
+        .code(1);
+
+    qm(home.path())
+        .args(["--exit-code", "query", "save", "has space", "SELECT status"])
+        .assert()
+        .code(1);
+
+    qm(home.path())
+        .args(["--exit-code", "query", "run", "nope"])
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn without_exit_code_zero_rows_still_exits_zero() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["-e", "SELECT status WHERE prd = 'nope'"])
+        .arg(td.path())
+        .assert()
+        .code(0);
+}
+
+#[test]
+fn output_flag_writes_file_and_stdout_is_empty() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    let out = td.path().join("res.txt");
+    qm(home.path())
+        .args([
+            "-e",
+            "SELECT status WHERE prd = '010'",
+            "--format",
+            "csv",
+            "--output",
+            out.to_str().unwrap(),
+        ])
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::is_empty());
+    let body = fs::read_to_string(&out).unwrap();
+    assert!(body.contains("status"));
+}
+
+/// Every statement in one `--output` run appends to the same file — the
+/// second statement's result must not truncate the first's away.
+#[test]
+fn output_flag_appends_multiple_statements_in_one_run() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    let out = td.path().join("res.txt");
+    qm(home.path())
+        .args([
+            "-e",
+            "SELECT status WHERE prd = '010'; SELECT status WHERE prd = '011';",
+            "--format",
+            "csv",
+            "--output",
+            out.to_str().unwrap(),
+        ])
+        .arg(td.path())
+        .assert()
+        .success();
+    let body = fs::read_to_string(&out).unwrap();
+    assert_eq!(
+        body.matches("status").count(),
+        2,
+        "each statement's CSV header should appear once: {body:?}"
+    );
+}
+
+/// A stale file already at the `--output` path is truncated at the start of
+/// the run, not appended to.
+#[test]
+fn output_flag_truncates_a_preexisting_file() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    let out = td.path().join("res.txt");
+    fs::write(&out, "stale content that must not survive\n").unwrap();
+    qm(home.path())
+        .args([
+            "-e",
+            "SELECT status WHERE prd = '010'",
+            "--output",
+            out.to_str().unwrap(),
+        ])
+        .arg(td.path())
+        .assert()
+        .success();
+    let body = fs::read_to_string(&out).unwrap();
+    assert!(!body.contains("stale content"));
+}
+
+/// A `--output` path that can't be opened for writing is a clean, propagated
+/// error, not a panic, and the process exits non-zero.
+#[test]
+fn output_flag_errors_cleanly_on_an_unwritable_path() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    let bad = td.path().join("no-such-dir").join("res.txt");
+    qm(home.path())
+        .args(["-e", "SELECT status", "--output", bad.to_str().unwrap()])
+        .arg(td.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("querymatter:"));
+}
+
+// --- `querymatter query` (saved named queries) ---
+
+#[test]
+fn query_save_then_get_and_list() {
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["query", "save", "stale", "SELECT status WHERE prd = '010'"])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("stale"));
+
+    qm(home.path())
+        .args(["query", "get", "stale"])
+        .assert()
+        .success()
+        .stdout("SELECT status WHERE prd = '010'\n");
+
+    qm(home.path())
+        .args(["query", "list"])
+        .assert()
+        .success()
+        .stdout("stale\tSELECT status WHERE prd = '010'\n");
+}
+
+/// `query list` with nothing saved prints nothing on stdout — it must not
+/// error just because `queries.toml` has never been written.
+#[test]
+fn query_list_is_empty_when_nothing_is_saved() {
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["query", "list"])
+        .assert()
+        .success()
+        .stdout(predicates::str::is_empty());
+}
+
+/// A query that fails to parse is rejected up front, naming the parse
+/// error — it must never be possible to save a query that only breaks later
+/// at `query run`.
+#[test]
+fn query_save_rejects_a_query_that_fails_to_parse() {
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["query", "save", "broken", "SELECT ("])
+        .assert()
+        .failure();
+
+    // A rejected save must not persist anything.
+    qm(home.path())
+        .args(["query", "list"])
+        .assert()
+        .success()
+        .stdout(predicates::str::is_empty());
+}
+
+#[test]
+fn query_save_rejects_a_bad_name() {
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["query", "save", "has space", "SELECT status"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("has space"));
+}
+
+/// A name collision on `save` overwrites — last-write-wins, like `config set`.
+#[test]
+fn query_save_overwrites_an_existing_name() {
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["query", "save", "stale", "SELECT status"])
+        .assert()
+        .success();
+    qm(home.path())
+        .args(["query", "save", "stale", "SELECT status WHERE prd = '010'"])
+        .assert()
+        .success();
+    qm(home.path())
+        .args(["query", "get", "stale"])
+        .assert()
+        .success()
+        .stdout("SELECT status WHERE prd = '010'\n");
+}
+
+#[test]
+fn query_get_unknown_name_errors() {
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["query", "get", "nope"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("nope"));
+}
+
+#[test]
+fn query_delete_removes_a_saved_query() {
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["query", "save", "stale", "SELECT status"])
+        .assert()
+        .success();
+    qm(home.path())
+        .args(["query", "delete", "stale"])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("stale"));
+    qm(home.path())
+        .args(["query", "get", "stale"])
+        .assert()
+        .failure();
+}
+
+/// Deleting a name that was never saved (with no `queries.toml` at all) is
+/// reported on stderr, not an error — mirrors `config unset` on an absent key.
+#[test]
+fn query_delete_on_absent_name_is_not_an_error() {
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["query", "delete", "nope"])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("no saved query named 'nope'"));
+}
+
+/// `query run <name>` must produce byte-identical output to `-e` given the
+/// same resolved SQL — it is fed through the SAME store-building/rendering
+/// path, not a parallel implementation.
+#[test]
+fn query_run_matches_dash_e_byte_for_byte() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    let sql = "SELECT status, count(*) AS Count GROUP BY status ORDER BY Count DESC";
+
+    qm(home.path())
+        .args(["query", "save", "counts", sql])
+        .assert()
+        .success();
+
+    let via_dash_e = qm(home.path())
+        .current_dir(td.path())
+        .args(["-e", sql])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let via_query_run = qm(home.path())
+        .current_dir(td.path())
+        .args(["query", "run", "counts"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert_eq!(via_dash_e, via_query_run);
+}
+
+/// `query run` honors `--format`/`--output`, exactly like `-e` — proof it
+/// shares `run_query`'s machinery rather than a parallel path that could
+/// silently ignore them.
+#[test]
+fn query_run_honors_format_and_output_flags() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .current_dir(td.path())
+        .args(["query", "save", "drafts", "SELECT status WHERE prd = '010'"])
+        .assert()
+        .success();
+
+    let out = td.path().join("res.csv");
+    qm(home.path())
+        .current_dir(td.path())
+        .args([
+            "--format",
+            "csv",
+            "--output",
+            out.to_str().unwrap(),
+            "query",
+            "run",
+            "drafts",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::is_empty());
+    let body = fs::read_to_string(&out).unwrap();
+    assert!(body.contains("status"), "got: {body:?}");
+}
+
+/// `query run` participates in `--exit-code`'s grep-style mapping exactly
+/// like `-e` does: 0 when rows matched, 1 when none did.
+#[test]
+fn query_run_honors_exit_code_flag() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .current_dir(td.path())
+        .args(["query", "save", "drafts", "SELECT status WHERE prd = '010'"])
+        .assert()
+        .success();
+    qm(home.path())
+        .current_dir(td.path())
+        .args(["--exit-code", "query", "run", "drafts"])
+        .assert()
+        .code(0);
+
+    qm(home.path())
+        .current_dir(td.path())
+        .args(["query", "save", "none", "SELECT status WHERE prd = 'nope'"])
+        .assert()
+        .success();
+    qm(home.path())
+        .current_dir(td.path())
+        .args(["--exit-code", "query", "run", "none"])
+        .assert()
+        .code(1);
+}
+
+/// FOLD-IN: `query run <name> [DIR]` scans `[DIR]` instead of cwd/vault when
+/// given — exactly like a positional `[DIRS]` entry would in query mode
+/// (the live-scan counterpart of `positional_dir_restricts_vault_query_to_that_subtree`,
+/// which covers the vault-narrowing case for `-e`). Run from an unrelated
+/// cwd containing BOTH subtrees, `query run names <dir>` must match `-e`
+/// scoped to `<dir>` via `.current_dir`, byte for byte.
+#[test]
+fn query_run_dir_argument_scans_that_directory() {
+    let td = TempDir::new().unwrap();
+    for (p, s) in [
+        ("a/one.md", "---\nstatus: draft\n---\n"),
+        ("b/two.md", "---\nstatus: synced\n---\n"),
+    ] {
+        let f = td.path().join(p);
+        fs::create_dir_all(f.parent().unwrap()).unwrap();
+        fs::write(f, s).unwrap();
+    }
+    let home = TempDir::new().unwrap();
+    let sql = "SELECT file.name";
+
+    qm(home.path())
+        .args(["query", "save", "names", sql])
+        .assert()
+        .success();
+
+    let via_dash_e = qm(home.path())
+        .current_dir(td.path().join("a"))
+        .args(["-e", sql])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let via_query_run = qm(home.path())
+        .current_dir(td.path())
+        .args(["query", "run", "names"])
+        .arg(td.path().join("a"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert_eq!(via_dash_e, via_query_run);
+    let text = String::from_utf8(via_query_run).unwrap();
+    assert!(text.contains("one.md"), "got: {text:?}");
+    assert!(!text.contains("two.md"), "got: {text:?}");
+}
+
+#[test]
+fn query_run_unknown_name_errors() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .current_dir(td.path())
+        .args(["query", "run", "nope"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("nope"));
+}
+
+/// MUST-FIX: `query save`/`list`/`get`/`delete` operate only on
+/// `queries.toml`, a file separate from `config.toml` — they must not be
+/// blocked by a broken `config.toml`, mirroring `config path`'s and
+/// `completions`' own pre-`config::load()` dispatch (see
+/// `config_path_survives_a_malformed_config_while_a_query_still_fails`).
+/// `query run` DOES build a session, so it still needs a valid config and is
+/// expected to fail, just like an ordinary query.
+#[test]
+fn query_actions_survive_a_malformed_config_but_run_still_fails() {
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "table_style = = broken\n");
+
+    qm(home.path())
+        .args(["query", "save", "stale", "SELECT status"])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("stale"));
+
+    qm(home.path())
+        .args(["query", "list"])
+        .assert()
+        .success()
+        .stdout("stale\tSELECT status\n");
+
+    qm(home.path())
+        .args(["query", "get", "stale"])
+        .assert()
+        .success()
+        .stdout("SELECT status\n");
+
+    // `query run` DOES build a session, so — unlike its config-free siblings
+    // above — it still needs a valid config, and fails here naming
+    // config.toml just like an ordinary query would.
+    qm(home.path())
+        .args(["query", "run", "stale"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("config.toml"));
+
+    qm(home.path())
+        .args(["query", "delete", "stale"])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("stale"));
+
+    // An ordinary query still errors too, naming config.toml — the broken
+    // file is real, just irrelevant to the four config-free actions above.
+    let td = tree();
+    qm(home.path())
+        .args(["-e", "SELECT status"])
+        .arg(td.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("config.toml"));
+}
+
+/// A broken `queries.toml` blocks every `query` action, so its message must
+/// name the file — mirrors `malformed_config_exits_non_zero_naming_the_path`.
+#[test]
+fn malformed_queries_file_exits_non_zero_naming_the_path() {
+    let home = TempDir::new().unwrap();
+    let dir = home.path().join("querymatter");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("queries.toml"), "= = broken\n").unwrap();
+
+    qm(home.path())
+        .args(["query", "list"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("queries.toml"));
+}
+
+/// Builds a tree with one file each layer of `explain` can attribute an
+/// exclusion to: a plain included markdown file, a wrong-extension file, and
+/// a file inside a hidden directory.
+fn explain_tree() -> TempDir {
+    let td = TempDir::new().unwrap();
+    let w = |rel: &str, body: &str| {
+        let p = td.path().join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, body).unwrap();
+    };
+    w("keep.md", "---\nstatus: x\n---\n");
+    w("todo.txt", "x");
+    w(".draft/h.md", "---\nstatus: y\n---\n");
+    td
+}
+
+#[test]
+fn explain_reports_included_for_a_discovered_file() {
+    let td = explain_tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .current_dir(td.path())
+        .args(["explain", "keep.md"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("included"));
+}
+
+#[test]
+fn explain_attributes_wrong_extension() {
+    let td = explain_tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .current_dir(td.path())
+        .args(["explain", "todo.txt"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "excluded: extension 'txt' not in --ext (md, markdown)",
+        ));
+}
+
+#[test]
+fn explain_attributes_a_hidden_directory() {
+    let td = explain_tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .current_dir(td.path())
+        .args(["explain", ".draft/h.md"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "excluded: hidden directory '.draft' (pass --hidden to include)",
+        ));
+}
+
+/// The shared `WalkFlags` (here `--hidden`) must reach `explain` through its
+/// `#[command(flatten)]`, exactly like `init`'s — a hidden file explain would
+/// otherwise always report excluded regardless of the flag.
+#[test]
+fn explain_hidden_flag_flips_a_hidden_directory_file_to_included() {
+    let td = explain_tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .current_dir(td.path())
+        .args(["explain", ".draft/h.md", "--hidden"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("included"));
+}
+
+#[test]
+fn explain_attributes_an_exclude_glob_flag() {
+    let td = explain_tree();
+    fs::create_dir_all(td.path().join("templates")).unwrap();
+    fs::write(td.path().join("templates/t.md"), "---\nstatus: x\n---\n").unwrap();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .current_dir(td.path())
+        .args(["explain", "templates/t.md", "--exclude", "**/templates/**"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "excluded: matches --exclude glob '**/templates/**'",
+        ));
+}
+
+#[test]
+fn explain_nonexistent_path_is_a_clean_error() {
+    let td = explain_tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .current_dir(td.path())
+        .args(["explain", "no-such-file.md"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("no-such-file.md"));
+}
+
+/// A path outside the implicit scan root (the current directory) is a clean
+/// error rather than a silently wrong verdict.
+#[test]
+fn explain_path_outside_cwd_is_a_clean_error() {
+    let td = explain_tree();
+    let outside = TempDir::new().unwrap();
+    fs::write(outside.path().join("elsewhere.md"), "---\nstatus: x\n---\n").unwrap();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .current_dir(td.path())
+        .args(["explain"])
+        .arg(outside.path().join("elsewhere.md"))
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("outside"));
+}
+
+/// MUST-FIX: `explain` must root at the ancestor `.querymatter` vault when
+/// one exists, exactly like a real query does — not always at cwd. From a
+/// vault subdirectory, `explain ../top.md` names a file that IS under the
+/// vault root (and so IS what a real query from this subdirectory would
+/// scan) even though it is outside cwd; before the fix this was rejected as
+/// "outside the current directory".
+#[test]
+fn explain_roots_at_the_vault_from_a_subdirectory_matching_a_real_query() {
+    let td = TempDir::new().unwrap();
+    fs::write(td.path().join("top.md"), "---\nstatus: x\n---\n").unwrap();
+    let sub = td.path().join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    let home = TempDir::new().unwrap();
+
+    qm(home.path())
+        .arg("init")
+        .arg(td.path())
+        .assert()
+        .success();
+
+    // A real query from `sub` discovers `top.md` via the vault.
+    qm(home.path())
+        .current_dir(&sub)
+        .args(["-e", "SELECT file.name WHERE file.name = 'top.md'"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("top.md"));
+
+    // `explain` from the same directory must agree, not reject the path as
+    // outside cwd.
+    qm(home.path())
+        .current_dir(&sub)
+        .args(["explain", "../top.md"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("included"));
+}
+
+/// Property: `explain`'s verdict must match `discover()`'s actual membership
+/// for every file in a small tree exercising every filter layer at once.
+#[test]
+fn explain_verdict_matches_discover_membership_end_to_end() {
+    let td = explain_tree();
+    fs::create_dir_all(td.path().join("templates")).unwrap();
+    fs::write(td.path().join("templates/t.md"), "---\nstatus: x\n---\n").unwrap();
+    let home = TempDir::new().unwrap();
+
+    let cases = [
+        ("keep.md", true),
+        ("todo.txt", false),
+        (".draft/h.md", false),
+        ("templates/t.md", false),
+    ];
+    for (rel, included) in cases {
+        let assert = qm(home.path())
+            .current_dir(td.path())
+            .args(["explain", rel, "--exclude", "**/templates/**"])
+            .assert()
+            .success();
+        let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+        if included {
+            assert!(out.contains("included"), "{rel}: got {out:?}");
+        } else {
+            assert!(out.contains("excluded:"), "{rel}: got {out:?}");
+        }
+    }
+}

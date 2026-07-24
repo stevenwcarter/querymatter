@@ -115,6 +115,13 @@ pub struct Cli {
     #[arg(long, value_enum, env = "QUERYMATTER_TABLE_STYLE")]
     pub table_style: Option<TableStyle>,
 
+    /// Write query results to PATH instead of stdout (one-shot/batch mode
+    /// only); PATH is truncated before the first statement's result and
+    /// every later statement in the run appends to it. Stdout stays empty.
+    /// The interactive REPL has its own `.output` dot-command instead.
+    #[arg(long, value_name = "PATH")]
+    pub output: Option<PathBuf>,
+
     /// Disable unknown-column validation, treating an unknown
     /// SELECT/WHERE/GROUP BY/ORDER BY/HAVING column as NULL instead of
     /// failing the query with a suggestion.
@@ -151,6 +158,13 @@ pub struct Cli {
     #[arg(long)]
     pub refresh_all: bool,
 
+    /// Exit 0 when the query matched at least one row, 1 when it matched
+    /// none, and 2 on a parse/exec/IO error — grep-style, for scripting.
+    /// Query mode and `query run` only; `init`/`config`/`query save`/`query
+    /// list`/`query get`/`query delete`/`completions` are unaffected.
+    #[arg(long)]
+    pub exit_code: bool,
+
     /// Subcommand to run instead of a query; `None` means query mode.
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -164,6 +178,10 @@ pub enum Command {
     Init(InitArgs),
     /// Show or change the persistent configuration.
     Config(ConfigArgs),
+    /// Save, list, inspect, run, or delete a saved named query.
+    Query(QueryArgs),
+    /// Report whether a file would be discovered, and if not, why.
+    Explain(ExplainArgs),
     /// Print a shell completion script to stdout.
     Completions(CompletionsArgs),
 }
@@ -205,6 +223,56 @@ pub enum ConfigAction {
     Path,
 }
 
+/// Arguments for `querymatter query <ACTION>`.
+#[derive(Debug, Args)]
+pub struct QueryArgs {
+    /// What to do with saved queries.
+    #[command(subcommand)]
+    pub action: QueryAction,
+}
+
+/// The `querymatter query` actions.
+///
+/// Saved queries are static SQL text with no parameters (YAGNI): `save`
+/// stores it under a name, `run` resolves the name back to SQL and executes
+/// it exactly like `-e` would — honoring the same `--format`/`--table-style`/
+/// `--output`/`--exit-code`/walk flags, plus an optional `[DIR]` positional
+/// that overrides the scan root exactly like query mode's `[DIRS]` would —
+/// via [`Command::Query`]'s dispatch in `main`. `save`/`list`/`get`/`delete`
+/// never build a record store; they only read and write the `queries.toml`
+/// file (see [`crate::queries`]).
+#[derive(Debug, Subcommand)]
+pub enum QueryAction {
+    /// Save SQL under NAME, overwriting any existing query already saved
+    /// under that name.
+    Save {
+        /// The name to save under: letters, digits, `_`, and `-` only.
+        name: String,
+        /// The SQL to save; rejected up front if it fails to parse.
+        sql: String,
+    },
+    /// List every saved query's name and SQL.
+    List,
+    /// Print one saved query's SQL.
+    Get {
+        /// The saved query's name.
+        name: String,
+    },
+    /// Run a saved query, honoring the same output flags as `-e`.
+    Run {
+        /// The saved query's name.
+        name: String,
+        /// Directory to scan, overriding the cwd/vault default — exactly
+        /// like query mode's positional `[DIRS]` with a single entry.
+        dir: Option<PathBuf>,
+    },
+    /// Remove a saved query.
+    Delete {
+        /// The saved query's name.
+        name: String,
+    },
+}
+
 /// Arguments for `querymatter init [DIR]`.
 #[derive(Debug, Args)]
 pub struct InitArgs {
@@ -220,6 +288,24 @@ pub struct InitArgs {
     pub walk: WalkFlags,
 }
 
+/// Arguments for `querymatter explain <PATH>`.
+///
+/// `PATH` is the only positional — unlike query mode and `init`, `explain`
+/// has no `[DIRS]` to root the walk at, since clap cannot parse a top-level
+/// positional ahead of a subcommand name (`querymatter <dir> explain <path>`
+/// fails to parse `<dir>` as `Cli::dirs`). `run_explain` resolves the scan
+/// root itself instead — see its doc comment.
+#[derive(Debug, Args)]
+pub struct ExplainArgs {
+    /// The file to explain.
+    pub path: PathBuf,
+
+    /// Walk flags shared with query mode, so `--ext`/`--hidden`/`--exclude`/
+    /// etc. affect the explanation the same way they'd affect a real query.
+    #[command(flatten)]
+    pub walk: WalkFlags,
+}
+
 /// Arguments for `querymatter completions <SHELL>`.
 #[derive(Debug, Args)]
 pub struct CompletionsArgs {
@@ -229,37 +315,6 @@ pub struct CompletionsArgs {
 }
 
 impl Cli {
-    /// Resolves the scan roots: the positional `dirs`, or the current
-    /// directory when none were given.
-    ///
-    /// Each root is canonicalized once here at the CLI boundary — resolving
-    /// symlinks and absolutizing — because [`discover`](crate::discover)'s
-    /// exclude matching assumes an absolute root and
-    /// [`RecordStore::reload_dir`](crate::store::RecordStore::reload_dir)
-    /// keys slices by path equality; canonicalizing once keeps both
-    /// consistent. A missing or inaccessible directory is a hard error that
-    /// names the offending path.
-    pub fn resolved_roots(&self) -> anyhow::Result<Vec<PathBuf>> {
-        let raw = if self.dirs.is_empty() {
-            vec![env::current_dir().context("failed to determine the current directory")?]
-        } else {
-            self.dirs.clone()
-        };
-        let mut roots = Vec::with_capacity(raw.len());
-        for dir in raw {
-            let canonical = fs::canonicalize(&dir)
-                .with_context(|| format!("cannot access directory {}", dir.display()))?;
-            // Dedup exact-equal canonical roots so `querymatter . ./plans`
-            // (both resolving to the same directory) doesn't scan it twice and
-            // double every count. Overlapping-but-unequal roots — a parent and
-            // its descendant — are left as-is (see the README caveat).
-            if !roots.contains(&canonical) {
-                roots.push(canonical);
-            }
-        }
-        Ok(roots)
-    }
-
     /// Maps the freshness flags to a [`Freshness`] mode: `--force-cache` wins,
     /// then `--fast`, otherwise the accurate per-file default. Mutually
     /// exclusive combinations are rejected by [`Self::validate`] before this is
@@ -303,9 +358,43 @@ impl Cli {
     }
 }
 
+/// Canonicalizes each of `dirs` (resolving symlinks and absolutizing) —
+/// falling back to the current directory when `dirs` is empty — and dedups
+/// exact-equal canonical roots so scanning the same directory twice (e.g.
+/// `querymatter . ./plans` where both resolve to the same place) doesn't
+/// double every count. Overlapping-but-unequal roots — a parent and its
+/// descendant — are left as-is (see the README caveat).
+///
+/// Canonicalizing here, at the CLI boundary, matters because
+/// [`discover`](crate::discover)'s exclude matching assumes an absolute root
+/// and [`RecordStore::reload_dir`](crate::store::RecordStore::reload_dir)
+/// keys slices by path equality; doing it once keeps both consistent. A
+/// missing or inaccessible directory is a hard error that names the
+/// offending path.
+///
+/// [`crate::main::build_session`]'s live-scan branch calls this with
+/// [`Cli::dirs`] (query mode's own `[DIRS]`) or `query run <name> [DIR]`'s
+/// single-directory override — the same canonicalize/dedup rules either way.
+pub(crate) fn canonicalize_roots(dirs: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
+    let raw = if dirs.is_empty() {
+        vec![env::current_dir().context("failed to determine the current directory")?]
+    } else {
+        dirs.to_vec()
+    };
+    let mut roots = Vec::with_capacity(raw.len());
+    for dir in raw {
+        let canonical = fs::canonicalize(&dir)
+            .with_context(|| format!("cannot access directory {}", dir.display()))?;
+        if !roots.contains(&canonical) {
+            roots.push(canonical);
+        }
+    }
+    Ok(roots)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, ConfigAction};
+    use super::{Cli, Command, ConfigAction, QueryAction, canonicalize_roots};
     use crate::cache::Freshness;
     use crate::config::ConfigKey;
     use crate::render::{Format, TableStyle};
@@ -333,13 +422,13 @@ mod tests {
     }
 
     #[test]
-    fn resolved_roots_dedups_exact_duplicate_dirs() {
+    fn canonicalize_roots_dedups_exact_duplicate_dirs() {
         let dir = tempdir().unwrap();
         let path = dir.path().to_str().unwrap();
         // The same directory passed twice must collapse to a single canonical
         // root, so counts aren't doubled.
         let cli = parse(&["querymatter", path, path]);
-        let roots = cli.resolved_roots().unwrap();
+        let roots = canonicalize_roots(&cli.dirs).unwrap();
         assert_eq!(roots, vec![fs::canonicalize(dir.path()).unwrap()]);
     }
 
@@ -598,6 +687,91 @@ mod tests {
     fn config_key_is_rejected_when_misspelled() {
         assert!(try_parse(&["querymatter", "config", "get", "table-style"]).is_err());
         assert!(try_parse(&["querymatter", "config", "get", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn query_save_parses_name_and_sql() {
+        match parse(&["querymatter", "query", "save", "stale", "SELECT status"]).command {
+            Some(Command::Query(args)) => match args.action {
+                QueryAction::Save { name, sql } => {
+                    assert_eq!(name, "stale");
+                    assert_eq!(sql, "SELECT status");
+                }
+                other => panic!("expected Save, got {other:?}"),
+            },
+            other => panic!("expected a Query subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn query_list_get_run_delete_parse() {
+        assert!(matches!(
+            parse(&["querymatter", "query", "list"]).command,
+            Some(Command::Query(_))
+        ));
+        match parse(&["querymatter", "query", "get", "stale"]).command {
+            Some(Command::Query(args)) => match args.action {
+                QueryAction::Get { name } => assert_eq!(name, "stale"),
+                other => panic!("expected Get, got {other:?}"),
+            },
+            other => panic!("expected a Query subcommand, got {other:?}"),
+        }
+        match parse(&["querymatter", "query", "run", "stale"]).command {
+            Some(Command::Query(args)) => match args.action {
+                QueryAction::Run { name, dir } => {
+                    assert_eq!(name, "stale");
+                    assert_eq!(dir, None);
+                }
+                other => panic!("expected Run, got {other:?}"),
+            },
+            other => panic!("expected a Query subcommand, got {other:?}"),
+        }
+        match parse(&["querymatter", "query", "delete", "stale"]).command {
+            Some(Command::Query(args)) => match args.action {
+                QueryAction::Delete { name } => assert_eq!(name, "stale"),
+                other => panic!("expected Delete, got {other:?}"),
+            },
+            other => panic!("expected a Query subcommand, got {other:?}"),
+        }
+    }
+
+    /// FOLD-IN: `query run <name> [DIR]` parses the optional trailing
+    /// directory positional.
+    #[test]
+    fn query_run_parses_an_optional_dir() {
+        match parse(&["querymatter", "query", "run", "stale", "somedir"]).command {
+            Some(Command::Query(args)) => match args.action {
+                QueryAction::Run { name, dir } => {
+                    assert_eq!(name, "stale");
+                    assert_eq!(dir.as_deref(), Some(Path::new("somedir")));
+                }
+                other => panic!("expected Run, got {other:?}"),
+            },
+            other => panic!("expected a Query subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explain_subcommand_parses_path_and_walk_flags() {
+        let cli = parse(&[
+            "querymatter",
+            "explain",
+            "notes/a.md",
+            "--hidden",
+            "--ext",
+            "md,mdx",
+        ]);
+        match cli.command {
+            Some(Command::Explain(args)) => {
+                assert_eq!(args.path, Path::new("notes/a.md"));
+                assert!(args.walk.hidden);
+                assert_eq!(
+                    args.walk.ext,
+                    Some(vec!["md".to_string(), "mdx".to_string()])
+                );
+            }
+            other => panic!("expected an Explain subcommand, got {other:?}"),
+        }
     }
 
     #[test]
