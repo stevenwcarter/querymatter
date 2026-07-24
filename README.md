@@ -383,6 +383,18 @@ path` and find the file worth fixing.
 
 ## REPL dot-commands
 
+On entering the REPL, a startup banner reports the record count and points
+you at `.help`/`.schema`:
+
+```
+$ querymatter
+querymatter — 128 records. Type .help for commands, .schema for fields.
+querymatter>
+```
+
+The banner is REPL-only — never printed by `-e` or piped batch mode, so
+piping a query's output never picks up stray banner text.
+
 Inside the REPL, a line starting with `.` (no trailing `;`) is a command
 rather than SQL:
 
@@ -390,6 +402,7 @@ rather than SQL:
 | --- | --- |
 | `.help` | List the dot-commands. |
 | `.schema` | List discovered frontmatter fields, the `file.*` columns, and the record count. |
+| `.describe [field]` | With no argument, a one-line-per-field summary of every field's type and coverage. With `<field>`, that field's `Value` type(s), non-null coverage, and its most-frequent-first value list (or a bare distinct count, when there are too many distinct values to list). |
 | `.format [fmt]` | Show, or set, the output format for subsequent queries. |
 | `.style [style]` | Show, or set, the table border style (`ascii`, `unicode`, `compact`, `plain`) for subsequent queries. |
 | `.settings` | List every setting, its resolved value, and which layer supplied it. |
@@ -410,6 +423,25 @@ as well as the REPL.
 `.format` and `.style` change the current session only; `.set format` and
 `.set table_style` persist to the config file — so you can try a setting, then
 keep it.
+
+After each REPL statement's result, a `-- N rows` line (singular for exactly
+one row) is printed to stderr — a quick sanity check that distinguishes a
+genuinely empty result from a typo'd `WHERE`. It's REPL-only, printed to
+stderr rather than stdout, and never appears in `-e` or piped batch mode, so
+it never corrupts piped output.
+
+Tab-completion is available for: frontmatter column names and the `file.*`
+pseudo-columns, in SQL position; dot-command names, right after a leading
+`.`; and config keys, right after `.set`/`.unset`. It does not complete SQL
+keywords (`SELECT`, `WHERE`, and so on) — only schema-derived and
+dot-command/config-key names. The column list is a one-time snapshot taken
+when the REPL starts, so a field discovered by a later `.reload`/`.refresh`
+won't tab-complete until you restart the REPL.
+
+History records one entry per statement or dot-command, not per line: typing
+a SQL statement across several lines (ended by `;` or `\G`) or a dot-command
+still leaves exactly one entry, so pressing Up-arrow recalls the whole thing
+rather than a fragment of it.
 
 ## Accuracy notes / gotchas
 

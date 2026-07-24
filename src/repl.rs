@@ -7,6 +7,7 @@
 //! the IO driver built on top of them.
 
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -296,10 +297,7 @@ pub fn run(mut session: Session) -> anyhow::Result<()> {
         load_history(&mut editor, path);
     }
 
-    println!(
-        "querymatter — {} records. Type .help for commands, .schema for fields.",
-        record_count(&session)
-    );
+    println!("{}", banner(record_count(&session)));
 
     let mut buffer = LineBuffer::new();
     loop {
@@ -362,6 +360,14 @@ fn row_count_line(n: usize) -> String {
     format!("-- {n} row{}", if n == 1 { "" } else { "s" })
 }
 
+/// The startup banner [`run`] prints to stdout on entering the REPL: the
+/// record count plus a `.help`/`.schema` hint. Pulled out as a pure function
+/// so its content is unit-tested without a TTY; REPL-only — batch and `-e`
+/// mode never print it.
+fn banner(record_count: i64) -> String {
+    format!("querymatter — {record_count} records. Type .help for commands, .schema for fields.")
+}
+
 /// What to add to the line editor's history for one resolved [`Line`], or
 /// `None` when nothing should be recorded.
 ///
@@ -373,7 +379,10 @@ fn row_count_line(n: usize) -> String {
 /// records its original line text verbatim, carried on [`Line::Dot`], rather
 /// than a reconstruction from the parsed [`DotCommand`] (which lowercases the
 /// command name and collapses whitespace). Blank lines and mid-statement
-/// continuations record nothing.
+/// continuations record nothing. A statement typed with a `\g` terminator is
+/// re-emitted with a `;` instead (both are [`Terminator::Semicolon`]) —
+/// harmless, since the two run identically, but worth knowing if a `\g`
+/// history entry ever looks different from what was typed.
 fn history_entry(line: &Line) -> Option<String> {
     match line {
         Line::Blank | Line::More => None,
@@ -488,28 +497,68 @@ fn report_deferred(immediate: bool) {
 
 /// Prints the dot-command reference to stdout.
 fn print_help() {
-    println!("Dot-commands:");
-    println!("  .help              show this message");
-    println!("  .schema            list frontmatter fields, file.* columns, and the record count");
-    println!("  .describe [field]  per-field types and coverage, or detail (values) for one field");
-    println!("  .format [fmt]      show, or set, the output format (table, json, csv, tsv, md)");
-    println!(
+    print!("{}", help_text());
+}
+
+/// The dot-command reference text `print_help` prints, pulled out as a pure
+/// function so a test can assert every name in [`DOT_COMMAND_NAMES`]
+/// actually appears here — a future command that's tab-completable but
+/// missing from this listing would otherwise go unnoticed.
+fn help_text() -> String {
+    let mut text = String::new();
+    let _ = writeln!(text, "Dot-commands:");
+    let _ = writeln!(text, "  .help              show this message");
+    let _ = writeln!(
+        text,
+        "  .schema            list frontmatter fields, file.* columns, and the record count"
+    );
+    let _ = writeln!(
+        text,
+        "  .describe [field]  per-field types and coverage, or detail (values) for one field"
+    );
+    let _ = writeln!(
+        text,
+        "  .format [fmt]      show, or set, the output format (table, json, csv, tsv, md)"
+    );
+    let _ = writeln!(
+        text,
         "  .style [style]     show, or set, the table border style (ascii, unicode, compact, plain)"
     );
-    println!("  .settings          list every setting, its value, and where it came from");
-    println!("  .set <key> <val>   save a setting to the config file");
-    println!("  .unset <key>       remove a setting from the config file");
-    println!("  .reload            rescan every tracked directory (in-memory only)");
-    println!(
+    let _ = writeln!(
+        text,
+        "  .settings          list every setting, its value, and where it came from"
+    );
+    let _ = writeln!(
+        text,
+        "  .set <key> <val>   save a setting to the config file"
+    );
+    let _ = writeln!(
+        text,
+        "  .unset <key>       remove a setting from the config file"
+    );
+    let _ = writeln!(
+        text,
+        "  .reload            rescan every tracked directory (in-memory only)"
+    );
+    let _ = writeln!(
+        text,
         "  .refresh [path]    re-scan path (or all); updates the .querymatter cache, else in memory"
     );
-    println!(
+    let _ = writeln!(
+        text,
         "  .refresh-all       re-scan the whole vault; updates the cache, or in memory with no vault"
     );
-    println!("  .quit / .exit      leave the REPL");
-    println!();
-    println!("End a statement with ';' to run it, or with '\\G' to print each row as a block of");
-    println!("name: value lines; '\\g' is a synonym for ';'. Statements may span multiple lines.");
+    let _ = writeln!(text, "  .quit / .exit      leave the REPL");
+    let _ = writeln!(text);
+    let _ = writeln!(
+        text,
+        "End a statement with ';' to run it, or with '\\G' to print each row as a block of"
+    );
+    let _ = writeln!(
+        text,
+        "name: value lines; '\\g' is a synonym for ';'. Statements may span multiple lines."
+    );
+    text
 }
 
 /// Prints the discovered frontmatter fields, the `file.*` pseudo-columns,
@@ -762,6 +811,19 @@ fn filter_prefix<'a>(candidates: impl Iterator<Item = &'a str>, prefix: &str) ->
         .collect()
 }
 
+/// Case-insensitive variant of [`filter_prefix`], for dot-command and
+/// config-key completion: [`parse_dot`] itself accepts `.SCHEMA` and
+/// `.Schema` alike, so `.SC<tab>` completing nothing (while `.SCHEMA` runs
+/// fine) would be a needless surprise. Column completion in SQL position
+/// stays case-sensitive — field names genuinely are.
+fn filter_prefix_ci<'a>(candidates: impl Iterator<Item = &'a str>, prefix: &str) -> Vec<String> {
+    let prefix = prefix.to_ascii_lowercase();
+    candidates
+        .filter(|name| name.to_ascii_lowercase().starts_with(&prefix))
+        .map(str::to_string)
+        .collect()
+}
+
 /// Tab-completion candidates for the REPL's input `line` with the cursor at
 /// byte offset `pos`, given a snapshot of the frontmatter `schema` and the
 /// dot-command names to offer. Pure and independent of rustyline, so it's
@@ -789,10 +851,10 @@ fn complete_candidates(
     let (start, word) = current_word(line, pos);
 
     if start == 0 && word.starts_with('.') {
-        return filter_prefix(dot_names.iter().copied(), word);
+        return filter_prefix_ci(dot_names.iter().copied(), word);
     }
     if is_set_or_unset_key_position(line, start) {
-        return filter_prefix(ConfigKey::ALL.iter().map(|key| key.as_str()), word);
+        return filter_prefix_ci(ConfigKey::ALL.iter().map(|key| key.as_str()), word);
     }
     filter_prefix(schema.iter().map(String::as_str).chain(FILE_COLUMNS), word)
 }
@@ -1062,6 +1124,17 @@ mod tests {
         assert_eq!(row_count_line(2), "-- 2 rows");
     }
 
+    /// The startup banner must name the record count and hint at both
+    /// `.help` and `.schema` — pinned here since it's stdout-only/REPL-only
+    /// and can't be reached by an integration test without a TTY.
+    #[test]
+    fn banner_contains_record_count_and_hints() {
+        let text = banner(42);
+        assert!(text.contains("42"), "{text:?}");
+        assert!(text.contains(".help"), "{text:?}");
+        assert!(text.contains(".schema"), "{text:?}");
+    }
+
     #[test]
     fn history_records_one_entry_per_statement_not_per_line() {
         // Feed a multi-line statement through LineBuffer and assert the
@@ -1112,8 +1185,22 @@ mod tests {
         // column completion for a bare word in SQL position
         let c = complete_candidates("SELECT sta", 10, &schema, DOT_COMMAND_NAMES);
         assert!(c.iter().any(|x| x == "status"));
-        // no SQL-keyword noise
-        assert!(!c.iter().any(|x| x.eq_ignore_ascii_case("select")));
+    }
+
+    /// SQL-position completion must draw only from `schema` plus
+    /// [`FILE_COLUMNS`], never a SQL-keyword list — proven with a prefix
+    /// (`"sel"`) that actually contains `select` as a candidate, unlike the
+    /// `"sta"` prefix in `completion_candidates_by_position` above (which
+    /// can't match `select` regardless of the implementation and so proves
+    /// nothing). The schema here deliberately excludes `select`.
+    #[test]
+    fn sql_position_completion_never_offers_a_sql_keyword() {
+        let schema = vec!["status".to_string(), "prd".to_string()];
+        let c = complete_candidates("SELECT sel", 10, &schema, DOT_COMMAND_NAMES);
+        assert!(
+            !c.iter().any(|x| x.eq_ignore_ascii_case("select")),
+            "completion must never draw from a SQL-keyword list: {c:?}"
+        );
     }
 
     /// Every name [`DOT_COMMAND_NAMES`] lists must actually parse to
@@ -1127,6 +1214,30 @@ mod tests {
                 "{name} is in DOT_COMMAND_NAMES but parse_dot doesn't recognize it"
             );
         }
+    }
+
+    /// Every name [`DOT_COMMAND_NAMES`] lists must also appear in `.help`'s
+    /// output, so a command that tab-completes can never go undocumented —
+    /// the sibling drift guard to `dot_command_names_all_parse` above.
+    #[test]
+    fn print_help_documents_every_dot_command_name() {
+        let text = help_text();
+        for name in DOT_COMMAND_NAMES {
+            assert!(
+                text.contains(name),
+                "{name} is in DOT_COMMAND_NAMES but missing from .help's output:\n{text}"
+            );
+        }
+    }
+
+    /// `parse_dot` accepts `.SCHEMA`/`.Schema` case-insensitively, so
+    /// completion of the dot-command word must too — `.SC<tab>` offers
+    /// `.schema` exactly like `.sc<tab>` does.
+    #[test]
+    fn dot_command_completion_is_case_insensitive() {
+        let schema = vec!["status".to_string()];
+        let c = complete_candidates(".SC", 3, &schema, DOT_COMMAND_NAMES);
+        assert!(c.iter().any(|x| x == ".schema"), "{c:?}");
     }
 
     #[test]

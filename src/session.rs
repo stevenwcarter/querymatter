@@ -717,6 +717,67 @@ mod tests {
         );
     }
 
+    /// A field with EXACTLY `VALUE_CAP` distinct non-null values sits right at
+    /// the cap boundary, which `describe_caps_value_list_but_keeps_true_distinct_count`
+    /// (at `VALUE_CAP + 1`) doesn't exercise: `values` must still be `Some`
+    /// (shown), not fall to the over-cap `None` branch — pinning `<=`, not
+    /// `<`, in `RawFieldStat::finish`.
+    #[test]
+    fn describe_at_exact_cap_still_shows_the_value_list() {
+        let td = TempDir::new().unwrap();
+        for i in 0..VALUE_CAP {
+            fs::write(
+                td.path().join(format!("f{i}.md")),
+                format!("---\ntag: v{i}\n---\n"),
+            )
+            .unwrap();
+        }
+        let (store, _report) =
+            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default());
+        let session = Session::new(
+            Box::new(store),
+            Settings::default(),
+            Settings::default(),
+            None,
+        );
+
+        let report = session.describe();
+        let tag = &report["tag"];
+        assert_eq!(tag.distinct, VALUE_CAP);
+        assert!(
+            tag.values.is_some(),
+            "a field exactly at the cap must still report its value list"
+        );
+        assert_eq!(tag.values.as_ref().unwrap().len(), VALUE_CAP);
+    }
+
+    /// Two values tied on count must be ordered lexicographically by value —
+    /// pinning `RawFieldStat::finish`'s `.then_with(|| a.0.cmp(&b.0))`
+    /// tie-break, not merely its primary sort by count.
+    #[test]
+    fn describe_breaks_count_ties_lexicographically() {
+        let td = TempDir::new().unwrap();
+        for (name, tag) in [("a.md", "zeta"), ("b.md", "alpha")] {
+            fs::write(td.path().join(name), format!("---\ntag: {tag}\n---\n")).unwrap();
+        }
+        let (store, _report) =
+            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default());
+        let session = Session::new(
+            Box::new(store),
+            Settings::default(),
+            Settings::default(),
+            None,
+        );
+
+        let report = session.describe();
+        let tag = &report["tag"];
+        assert_eq!(
+            tag.values,
+            Some(vec![("alpha".to_string(), 1), ("zeta".to_string(), 1)]),
+            "equal-count values must be ordered lexicographically"
+        );
+    }
+
     /// A vault-backed session's `refresh` must both update the in-memory
     /// view AND persist the change to the on-disk `.querymatter` cache —
     /// unlike `.reload`, which never touches disk.
