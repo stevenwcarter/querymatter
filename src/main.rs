@@ -79,7 +79,7 @@ fn main() -> ExitCode {
 /// Whether `command` is a query-result concept `--exit-code`'s grep-style
 /// 0/1/2 error mapping applies to: no subcommand (ordinary query mode) or
 /// `query run` (which resolves a saved name to SQL and runs it exactly like
-/// `-e` would, via [`run_query_cmd`]). Every other subcommand keeps today's
+/// `-e` would, via [`run_query_run`]). Every other subcommand keeps today's
 /// plain "error exits 1" behavior.
 fn is_query_like(command: &Option<Command>) -> bool {
     matches!(
@@ -97,13 +97,16 @@ fn is_query_like(command: &Option<Command>) -> bool {
 /// [`ExitCode::SUCCESS`]. Any error is left to propagate — `main` prints it
 /// once and picks 1 vs. 2 uniformly, so callers here just use `?`.
 fn dispatch(cli: &Cli, matches: &ArgMatches) -> anyhow::Result<ExitCode> {
-    // Completions and `config path` must both work even with a broken config
-    // file: completions is how a user installs the completion that helps
-    // them type `config set` correctly, and `config path` is the one command
-    // a user with a broken config reaches for to find the file worth fixing.
-    // Neither needs config *content* — completions only needs the parser
-    // shape, and `path` only reports where the file would be — so both are
-    // dispatched here, before `config::load()` can fail on them.
+    // Completions, `config path`, and every config-free `query` action must
+    // all work even with a broken config file: completions is how a user
+    // installs the completion that helps them type `config set` correctly,
+    // `config path` is the one command a user with a broken config reaches
+    // for to find the file worth fixing, and `query save`/`list`/`get`/
+    // `delete` operate on the SEPARATE `queries.toml` file and never read
+    // `config.toml` at all (see [`run_query_action`]). None of these need
+    // config *content*, so all are dispatched here, before `config::load()`
+    // can fail on them. `query run` DOES build a session — it is dispatched
+    // below, after config loads, like every other config-needing command.
     match &cli.command {
         Some(Command::Completions(args)) => {
             run_completions(args);
@@ -114,6 +117,11 @@ fn dispatch(cli: &Cli, matches: &ArgMatches) -> anyhow::Result<ExitCode> {
         })) => {
             run_config_path()?;
             return Ok(ExitCode::SUCCESS);
+        }
+        Some(Command::Query(QueryArgs { action }))
+            if !matches!(action, QueryAction::Run { .. }) =>
+        {
+            return run_query_action(action);
         }
         _ => {}
     }
@@ -137,7 +145,10 @@ fn dispatch(cli: &Cli, matches: &ArgMatches) -> anyhow::Result<ExitCode> {
             run_config(&args.action, cli, &config, matches)?;
             Ok(ExitCode::SUCCESS)
         }
-        Some(Command::Query(args)) => run_query_cmd(&args.action, cli, &config, matches),
+        Some(Command::Query(QueryArgs {
+            action: QueryAction::Run { name, dir },
+        })) => run_query_run(name, dir.as_deref(), cli, &config, matches),
+        Some(Command::Query(_)) => unreachable!("non-Run actions are dispatched above"),
         Some(Command::Explain(args)) => {
             // Same reasoning as `init` above: `ExplainArgs`'s flattened
             // `WalkFlags` is matched under the "explain" subcommand's own
@@ -255,11 +266,13 @@ fn prompt_add_gitignore(root: &Path) -> anyhow::Result<()> {
 /// The verdict/reason line is printed to stdout: it's the command's data,
 /// not a diagnostic.
 ///
-/// Root resolution: `explain` scans from the current directory, matching
-/// every other command's behavior with no `[DIRS]` given (see
-/// [`Cli::resolved_roots`]) — `explain` cannot itself accept a `[DIRS]`
-/// positional (see [`ExplainArgs`]'s doc comment), so "explain this path"
-/// means "would it be discovered by a query run right here". `args.path` is
+/// Root resolution: `explain` roots at the ancestor `.querymatter` vault when
+/// one is found via [`cache::find_vault`], or the current directory
+/// otherwise — the SAME resolution [`build_session`] applies to a real query
+/// with no `[DIRS]` given, so "explain this path" always agrees with what a
+/// real query run right here would actually scan. (`explain` cannot itself
+/// accept a `[DIRS]` positional — see [`ExplainArgs`]'s doc comment — so
+/// there is no user-supplied root to prefer over the vault.) `args.path` is
 /// canonicalized and checked against that root; a path that doesn't exist,
 /// or resolves outside it, is a clean error rather than a silently wrong
 /// verdict.
@@ -271,13 +284,17 @@ fn run_explain(args: &ExplainArgs, config: &Config, matches: &ArgMatches) -> any
     opts.ignore_files = args.walk.ignore_files()?;
 
     let cwd = env::current_dir().context("failed to determine the current directory")?;
-    let root = fs::canonicalize(&cwd)
-        .with_context(|| format!("cannot access directory {}", cwd.display()))?;
+    let root = match cache::find_vault(&cwd) {
+        Some(vault) => vault,
+        None => fs::canonicalize(&cwd)
+            .with_context(|| format!("cannot access directory {}", cwd.display()))?,
+    };
     let target = fs::canonicalize(&args.path)
         .with_context(|| format!("cannot access path {}", args.path.display()))?;
     anyhow::ensure!(
         target.starts_with(&root),
-        "{} is outside the current directory {} (explain's implicit scan root)",
+        "{} is outside {} (explain's scan root: the enclosing .querymatter vault, or the \
+         current directory when there is none)",
         args.path.display(),
         root.display()
     );
@@ -360,22 +377,15 @@ fn run_config_path() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Runs a `querymatter query` action.
+/// Runs a config-free `querymatter query` action: `save`/`list`/`get`/
+/// `delete` operate only on the `queries.toml` file (see [`queries`]) and
+/// never build a record store — matching `config`'s stdout/stderr split,
+/// data goes to stdout, confirmations and errors to stderr.
 ///
-/// `Save`/`List`/`Get`/`Delete` operate only on the `queries.toml` file (see
-/// [`queries`]) and never build a record store — matching `config`'s
-/// stdout/stderr split, data goes to stdout, confirmations and errors to
-/// stderr. `Run` resolves the saved SQL and executes it through the SAME
-/// [`build_session`]/[`run_batch`] machinery `-e` uses (fed the resolved SQL
-/// as the query text), so it honors `--format`/`--table-style`/`--output`/
-/// `--exit-code` and the walk flags exactly like a one-shot query would,
-/// rather than a parallel, easily-drifting implementation.
-fn run_query_cmd(
-    action: &QueryAction,
-    cli: &Cli,
-    config: &Config,
-    matches: &ArgMatches,
-) -> anyhow::Result<ExitCode> {
+/// Dispatched from [`dispatch`] BEFORE `config::load()` (see its doc
+/// comment); `Run` is handled separately by [`run_query_run`], after config
+/// loads, since it's the one action that builds a session.
+fn run_query_action(action: &QueryAction) -> anyhow::Result<ExitCode> {
     match action {
         QueryAction::Save { name, sql } => {
             // Rejected up front, naming the parse error, so a saved query can
@@ -421,14 +431,35 @@ fn run_query_cmd(
             }
             Ok(ExitCode::SUCCESS)
         }
-        QueryAction::Run { name } => {
-            let saved = queries::load()?;
-            let sql = queries::get(&saved, name)
-                .with_context(|| format!("no saved query named '{name}'"))?;
-            let session = build_session(cli, config, matches)?;
-            run_batch(&session, sql, cli.exit_code, cli.output.as_deref())
+        QueryAction::Run { .. } => {
+            unreachable!("Run is dispatched separately, after config::load — see run_query_run")
         }
     }
+}
+
+/// Runs `query run <name> [DIR]`: resolves `name` to its saved SQL — a clean
+/// error naming `name` when nothing is saved under it — and executes it
+/// through the SAME [`build_session`]/[`run_batch`] machinery `-e` uses (fed
+/// the resolved SQL as the query text), so it honors `--format`/
+/// `--table-style`/`--output`/`--exit-code` and the walk flags exactly like a
+/// one-shot query would, rather than a parallel, easily-drifting
+/// implementation. `dir`, when given, overrides the scan root exactly like a
+/// single positional `[DIRS]` entry would in query mode. Dispatched from
+/// [`dispatch`] after `config::load()`, since (unlike its `query` siblings)
+/// it builds a session.
+fn run_query_run(
+    name: &str,
+    dir: Option<&Path>,
+    cli: &Cli,
+    config: &Config,
+    matches: &ArgMatches,
+) -> anyhow::Result<ExitCode> {
+    let saved = queries::load()?;
+    let sql =
+        queries::get(&saved, name).with_context(|| format!("no saved query named '{name}'"))?;
+    let dirs: Vec<PathBuf> = dir.map(Path::to_path_buf).into_iter().collect();
+    let session = build_session(cli, config, matches, &dirs)?;
+    run_batch(&session, sql, cli.exit_code, cli.output.as_deref())
 }
 
 /// Runs a query: loads the store from an ancestor `.querymatter` cache when one
@@ -441,7 +472,7 @@ fn run_query_cmd(
 /// the interactive REPL — which has no single "total rows" to report — a
 /// clean run is always [`ExitCode::SUCCESS`], matching today's behavior.
 fn run_query(cli: &Cli, config: &Config, matches: &ArgMatches) -> anyhow::Result<ExitCode> {
-    let session = build_session(cli, config, matches)?;
+    let session = build_session(cli, config, matches, &cli.dirs)?;
 
     let output = cli.output.as_deref();
     match cli.query.as_deref() {
@@ -461,14 +492,25 @@ fn run_query(cli: &Cli, config: &Config, matches: &ArgMatches) -> anyhow::Result
 }
 
 /// Builds the queryable [`Session`] shared by [`run_query`] (`-e`/stdin/the
-/// REPL) and [`run_query_cmd`]'s `Run` action (a saved query): resolves
-/// settings, validates the resolved exclude globs, loads the record store
-/// from an ancestor `.querymatter` cache when one is found (unless
-/// `--no-cache`) or live-scans the resolved roots otherwise, and applies any
-/// `--refresh`/`--refresh-all`/positional-`[DIRS]` vault narrowing. Pulled out
-/// so `query run` reuses exactly this — not a second, easily-drifting
-/// implementation of the same cache/walk/vault logic.
-fn build_session(cli: &Cli, config: &Config, matches: &ArgMatches) -> anyhow::Result<Session> {
+/// REPL) and [`run_query_run`] (a saved query): resolves settings, validates
+/// the resolved exclude globs, loads the record store from an ancestor
+/// `.querymatter` cache when one is found (unless `--no-cache`) or live-scans
+/// the resolved roots otherwise, and applies any `--refresh`/`--refresh-all`/
+/// `dirs` vault narrowing. Pulled out so `query run` reuses exactly this —
+/// not a second, easily-drifting implementation of the same cache/walk/vault
+/// logic.
+///
+/// `dirs` is the positional root list to resolve/narrow by — [`run_query`]
+/// passes `cli.dirs` (query mode's own `[DIRS]`) and [`run_query_run`] passes
+/// `query run <name> [DIR]`'s single-element override (or an empty slice when
+/// `[DIR]` was omitted) — rather than this function reading `cli.dirs`
+/// itself, so the two callers' independent positionals can't be conflated.
+fn build_session(
+    cli: &Cli,
+    config: &Config,
+    matches: &ArgMatches,
+    dirs: &[PathBuf],
+) -> anyhow::Result<Session> {
     cli.validate()?;
 
     let settings = Settings::resolve(cli, config, matches);
@@ -511,8 +553,8 @@ fn build_session(cli: &Cli, config: &Config, matches: &ArgMatches) -> anyhow::Re
             // slice granularity. A dir entirely outside the vault matches no
             // slice (its records are absent) — v1 does not live-scan
             // outside-vault dirs, a known limitation.
-            if !cli.dirs.is_empty() {
-                store.retain_under(&canonicalize_dirs(&cli.dirs)?);
+            if !dirs.is_empty() {
+                store.retain_under(&canonicalize_dirs(dirs)?);
             }
             (store, report, Some(vault))
         }
@@ -521,7 +563,7 @@ fn build_session(cli: &Cli, config: &Config, matches: &ArgMatches) -> anyhow::Re
                 !cli.force_cache,
                 "--force-cache: no .querymatter cache found (run `querymatter init` first)"
             );
-            let (store, report) = InMemoryStore::load(cli.resolved_roots()?, opts);
+            let (store, report) = InMemoryStore::load(cli::canonicalize_roots(dirs)?, opts);
             (store, report, None)
         }
     };
@@ -562,8 +604,8 @@ fn run_batch(
 /// Canonicalizes each positional `[DIRS]` entry (resolving symlinks and
 /// absolutizing) so they can restrict a vault query via
 /// [`InMemoryStore::retain_under`]. A missing or inaccessible directory is a
-/// hard error naming the offending path, matching [`Cli::resolved_roots`]'s
-/// live-scan behavior.
+/// hard error naming the offending path, matching
+/// [`crate::cli::canonicalize_roots`]'s live-scan behavior.
 fn canonicalize_dirs(dirs: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
     dirs.iter()
         .map(|dir| {

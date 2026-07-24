@@ -236,9 +236,11 @@ pub struct QueryArgs {
 /// Saved queries are static SQL text with no parameters (YAGNI): `save`
 /// stores it under a name, `run` resolves the name back to SQL and executes
 /// it exactly like `-e` would — honoring the same `--format`/`--table-style`/
-/// `--output`/`--exit-code`/walk flags — via [`Command::Query`]'s dispatch in
-/// `main`. `save`/`list`/`get`/`delete` never build a record store; they only
-/// read and write the `queries.toml` file (see [`crate::queries`]).
+/// `--output`/`--exit-code`/walk flags, plus an optional `[DIR]` positional
+/// that overrides the scan root exactly like query mode's `[DIRS]` would —
+/// via [`Command::Query`]'s dispatch in `main`. `save`/`list`/`get`/`delete`
+/// never build a record store; they only read and write the `queries.toml`
+/// file (see [`crate::queries`]).
 #[derive(Debug, Subcommand)]
 pub enum QueryAction {
     /// Save SQL under NAME, overwriting any existing query already saved
@@ -260,6 +262,9 @@ pub enum QueryAction {
     Run {
         /// The saved query's name.
         name: String,
+        /// Directory to scan, overriding the cwd/vault default — exactly
+        /// like query mode's positional `[DIRS]` with a single entry.
+        dir: Option<PathBuf>,
     },
     /// Remove a saved query.
     Delete {
@@ -310,37 +315,6 @@ pub struct CompletionsArgs {
 }
 
 impl Cli {
-    /// Resolves the scan roots: the positional `dirs`, or the current
-    /// directory when none were given.
-    ///
-    /// Each root is canonicalized once here at the CLI boundary — resolving
-    /// symlinks and absolutizing — because [`discover`](crate::discover)'s
-    /// exclude matching assumes an absolute root and
-    /// [`RecordStore::reload_dir`](crate::store::RecordStore::reload_dir)
-    /// keys slices by path equality; canonicalizing once keeps both
-    /// consistent. A missing or inaccessible directory is a hard error that
-    /// names the offending path.
-    pub fn resolved_roots(&self) -> anyhow::Result<Vec<PathBuf>> {
-        let raw = if self.dirs.is_empty() {
-            vec![env::current_dir().context("failed to determine the current directory")?]
-        } else {
-            self.dirs.clone()
-        };
-        let mut roots = Vec::with_capacity(raw.len());
-        for dir in raw {
-            let canonical = fs::canonicalize(&dir)
-                .with_context(|| format!("cannot access directory {}", dir.display()))?;
-            // Dedup exact-equal canonical roots so `querymatter . ./plans`
-            // (both resolving to the same directory) doesn't scan it twice and
-            // double every count. Overlapping-but-unequal roots — a parent and
-            // its descendant — are left as-is (see the README caveat).
-            if !roots.contains(&canonical) {
-                roots.push(canonical);
-            }
-        }
-        Ok(roots)
-    }
-
     /// Maps the freshness flags to a [`Freshness`] mode: `--force-cache` wins,
     /// then `--fast`, otherwise the accurate per-file default. Mutually
     /// exclusive combinations are rejected by [`Self::validate`] before this is
@@ -384,9 +358,43 @@ impl Cli {
     }
 }
 
+/// Canonicalizes each of `dirs` (resolving symlinks and absolutizing) —
+/// falling back to the current directory when `dirs` is empty — and dedups
+/// exact-equal canonical roots so scanning the same directory twice (e.g.
+/// `querymatter . ./plans` where both resolve to the same place) doesn't
+/// double every count. Overlapping-but-unequal roots — a parent and its
+/// descendant — are left as-is (see the README caveat).
+///
+/// Canonicalizing here, at the CLI boundary, matters because
+/// [`discover`](crate::discover)'s exclude matching assumes an absolute root
+/// and [`RecordStore::reload_dir`](crate::store::RecordStore::reload_dir)
+/// keys slices by path equality; doing it once keeps both consistent. A
+/// missing or inaccessible directory is a hard error that names the
+/// offending path.
+///
+/// [`crate::main::build_session`]'s live-scan branch calls this with
+/// [`Cli::dirs`] (query mode's own `[DIRS]`) or `query run <name> [DIR]`'s
+/// single-directory override — the same canonicalize/dedup rules either way.
+pub(crate) fn canonicalize_roots(dirs: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
+    let raw = if dirs.is_empty() {
+        vec![env::current_dir().context("failed to determine the current directory")?]
+    } else {
+        dirs.to_vec()
+    };
+    let mut roots = Vec::with_capacity(raw.len());
+    for dir in raw {
+        let canonical = fs::canonicalize(&dir)
+            .with_context(|| format!("cannot access directory {}", dir.display()))?;
+        if !roots.contains(&canonical) {
+            roots.push(canonical);
+        }
+    }
+    Ok(roots)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, ConfigAction, QueryAction};
+    use super::{Cli, Command, ConfigAction, QueryAction, canonicalize_roots};
     use crate::cache::Freshness;
     use crate::config::ConfigKey;
     use crate::render::{Format, TableStyle};
@@ -414,13 +422,13 @@ mod tests {
     }
 
     #[test]
-    fn resolved_roots_dedups_exact_duplicate_dirs() {
+    fn canonicalize_roots_dedups_exact_duplicate_dirs() {
         let dir = tempdir().unwrap();
         let path = dir.path().to_str().unwrap();
         // The same directory passed twice must collapse to a single canonical
         // root, so counts aren't doubled.
         let cli = parse(&["querymatter", path, path]);
-        let roots = cli.resolved_roots().unwrap();
+        let roots = canonicalize_roots(&cli.dirs).unwrap();
         assert_eq!(roots, vec![fs::canonicalize(dir.path()).unwrap()]);
     }
 
@@ -710,7 +718,10 @@ mod tests {
         }
         match parse(&["querymatter", "query", "run", "stale"]).command {
             Some(Command::Query(args)) => match args.action {
-                QueryAction::Run { name } => assert_eq!(name, "stale"),
+                QueryAction::Run { name, dir } => {
+                    assert_eq!(name, "stale");
+                    assert_eq!(dir, None);
+                }
                 other => panic!("expected Run, got {other:?}"),
             },
             other => panic!("expected a Query subcommand, got {other:?}"),
@@ -719,6 +730,22 @@ mod tests {
             Some(Command::Query(args)) => match args.action {
                 QueryAction::Delete { name } => assert_eq!(name, "stale"),
                 other => panic!("expected Delete, got {other:?}"),
+            },
+            other => panic!("expected a Query subcommand, got {other:?}"),
+        }
+    }
+
+    /// FOLD-IN: `query run <name> [DIR]` parses the optional trailing
+    /// directory positional.
+    #[test]
+    fn query_run_parses_an_optional_dir() {
+        match parse(&["querymatter", "query", "run", "stale", "somedir"]).command {
+            Some(Command::Query(args)) => match args.action {
+                QueryAction::Run { name, dir } => {
+                    assert_eq!(name, "stale");
+                    assert_eq!(dir.as_deref(), Some(Path::new("somedir")));
+                }
+                other => panic!("expected Run, got {other:?}"),
             },
             other => panic!("expected a Query subcommand, got {other:?}"),
         }

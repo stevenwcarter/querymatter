@@ -291,7 +291,7 @@ pub fn find_vault(start: &Path) -> Option<PathBuf> {
 /// under `vault`.
 ///
 /// The user-typed path may be relative — it is canonicalized against the cwd,
-/// mirroring [`crate::cli::Cli::resolved_roots`], and must exist. This is
+/// mirroring [`crate::cli::canonicalize_roots`], and must exist. This is
 /// load-bearing: [`refresh_subtree`] filters the vault's *absolute* discovery
 /// results with `starts_with(subtree)`, so a raw relative path (`plans`,
 /// `./plans`) would prefix-match nothing and silently refresh zero files —
