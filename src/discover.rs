@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
+use anyhow::Context;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
 
@@ -116,6 +117,22 @@ fn is_excluded(path: &Path, root: &Path, excludes: &GlobSet) -> bool {
     }
     path.strip_prefix(root)
         .is_ok_and(|relative| excludes.is_match(relative))
+}
+
+/// Rejects any exclude glob `globset` cannot compile, naming the offending
+/// pattern.
+///
+/// [`build_exclude_set`] below has no error channel back to its caller and
+/// silently drops what doesn't compile, so every producer of an exclude list
+/// — `config::set` at config-write time, and query/init's resolved
+/// [`crate::settings::Settings::exclude`] at run time, which also catches a
+/// hand-edited config file that bypassed `config set` — validates through
+/// this one function up front instead.
+pub fn validate_excludes(patterns: &[String]) -> anyhow::Result<()> {
+    for pattern in patterns {
+        Glob::new(pattern).with_context(|| format!("invalid exclude glob {pattern:?}"))?;
+    }
+    Ok(())
 }
 
 /// Compiles `patterns` into a [`GlobSet`], silently dropping any pattern
@@ -317,6 +334,25 @@ mod tests {
             .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
             .collect();
         assert_eq!(names, vec!["keep.md"]);
+    }
+
+    #[test]
+    fn validate_excludes_accepts_good_globs() {
+        assert!(
+            validate_excludes(&["**/templates/**".to_string(), "*.draft.md".to_string()]).is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_excludes_rejects_a_bad_glob_naming_it() {
+        let err = format!(
+            "{:#}",
+            validate_excludes(&["[plans/**".to_string()]).unwrap_err()
+        );
+        assert!(
+            err.contains("[plans/**"),
+            "must name the bad pattern, got: {err}"
+        );
     }
 
     #[test]

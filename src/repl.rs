@@ -15,6 +15,7 @@ use directories::ProjectDirs;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
+use crate::config::ConfigKey;
 use crate::model::Value;
 use crate::render::{Format, TableStyle};
 use crate::session::{Session, Statement, Terminator};
@@ -75,6 +76,17 @@ pub enum DotCommand {
     /// the offending name so the error can name the style rather than the
     /// command.
     BadStyle(String),
+    /// `.settings` — list every setting, its value, and its source.
+    Settings,
+    /// `.set <key> <value>` — persist a setting to the config file.
+    Set(ConfigKey, String),
+    /// `.unset <key>` — remove a setting from the config file.
+    Unset(ConfigKey),
+    /// `.set`/`.unset` naming a key that isn't configurable, carrying the
+    /// offending name so the error can name the key rather than the command.
+    BadKey(String),
+    /// `.set`/`.unset` with a missing argument, carrying the command name.
+    MissingArg(&'static str),
     /// Any other `.`-prefixed line, carried verbatim for the error message.
     Unknown(String),
 }
@@ -183,8 +195,41 @@ pub fn parse_dot(line: &str) -> DotCommand {
                 Err(_) => DotCommand::BadStyle(arg.to_string()),
             },
         },
+        "settings" => DotCommand::Settings,
+        "set" => match (words.next(), rest_after_key(rest, 2)) {
+            (Some(key), Some(value)) => match parse_key(key) {
+                Some(key) => DotCommand::Set(key, value),
+                None => DotCommand::BadKey(key.to_string()),
+            },
+            _ => DotCommand::MissingArg("set"),
+        },
+        "unset" => match words.next() {
+            Some(key) => match parse_key(key) {
+                Some(key) => DotCommand::Unset(key),
+                None => DotCommand::BadKey(key.to_string()),
+            },
+            None => DotCommand::MissingArg("unset"),
+        },
         _ => DotCommand::Unknown(line.to_string()),
     }
+}
+
+/// Parses a config key name, accepting exactly the spellings `ConfigKey`
+/// declares — the same ones the TOML file and `querymatter config` use.
+fn parse_key(name: &str) -> Option<ConfigKey> {
+    ConfigKey::ALL.into_iter().find(|key| key.as_str() == name)
+}
+
+/// Everything after the first `skip` whitespace-separated words of `rest`,
+/// trimmed — the value of a `.set`, taken verbatim so globs and commas
+/// survive. `None` when there are fewer than `skip + 1` words.
+fn rest_after_key(rest: &str, skip: usize) -> Option<String> {
+    let mut remainder = rest.trim_start();
+    for _ in 0..skip {
+        let end = remainder.find(char::is_whitespace)?;
+        remainder = remainder[end..].trim_start();
+    }
+    (!remainder.is_empty()).then(|| remainder.trim_end().to_string())
 }
 
 /// Runs the interactive REPL over `session` until `.quit`/`.exit`/EOF.
@@ -250,19 +295,20 @@ pub fn run(mut session: Session) -> anyhow::Result<()> {
 /// Runs one dot-command against `session`, returning `true` when the REPL
 /// should exit (`.quit`/`.exit`).
 ///
-/// stdout/stderr policy: reference/inspection output (`.help`, `.schema`, and
-/// `.format`'s/`.style`'s reports of the current format/style) goes to
-/// stdout; the `.reload`/`.refresh`/`.refresh-all` reports and all error
-/// messages (unknown command, bad format, bad style) go to stderr, keeping
-/// stdout clean for piping.
+/// stdout/stderr policy: reference/inspection output (`.help`, `.schema`,
+/// `.settings`, and `.format`'s/`.style`'s reports of the current
+/// format/style) goes to stdout; the `.reload`/`.refresh`/`.refresh-all`
+/// reports, `.set`/`.unset` confirmations, and all error messages (unknown
+/// command, bad format, bad style, bad key, missing argument) go to stderr,
+/// keeping stdout clean for piping.
 fn dispatch_dot(cmd: DotCommand, session: &mut Session) -> bool {
     match cmd {
         DotCommand::Help => print_help(),
         DotCommand::Schema => print_schema(session),
         DotCommand::Format(Some(fmt)) => session.set_format(fmt),
-        DotCommand::Format(None) => println!("format: {}", format_name(session.format)),
+        DotCommand::Format(None) => println!("format: {}", format_name(session.format())),
         DotCommand::Style(Some(style)) => session.set_style(style),
-        DotCommand::Style(None) => println!("style: {}", style_name(session.style)),
+        DotCommand::Style(None) => println!("style: {}", style_name(session.style())),
         DotCommand::Reload => report_reload(session),
         DotCommand::Refresh(path) => report_refresh(session, path.as_deref().map(Path::new)),
         DotCommand::RefreshAll => report_refresh(session, None),
@@ -273,11 +319,74 @@ fn dispatch_dot(cmd: DotCommand, session: &mut Session) -> bool {
         DotCommand::BadStyle(name) => {
             eprintln!("querymatter: unknown style '{name}' (try: ascii, unicode, compact, plain)");
         }
+        DotCommand::Settings => println!("{}", session.settings().rows()),
+        DotCommand::Set(key, value) => report_set(session.persist_set(key, &value), key),
+        DotCommand::Unset(key) => report_unset(session.persist_unset(key), key),
+        DotCommand::BadKey(name) => {
+            eprintln!(
+                "querymatter: unknown setting '{name}' (try: {})",
+                ConfigKey::ALL
+                    .iter()
+                    .map(|key| key.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        DotCommand::MissingArg(cmd) => match cmd {
+            "set" => eprintln!("querymatter: usage: .set <key> <value>"),
+            _ => eprintln!("querymatter: usage: .unset <key>"),
+        },
         DotCommand::Unknown(raw) => {
             eprintln!("querymatter: unknown command {raw:?} (try .help)");
         }
     }
     false
+}
+
+/// Reports the outcome of a `.set` on stderr: the file written, and a note
+/// when the change only takes effect on the next run.
+fn report_set(outcome: anyhow::Result<(PathBuf, bool)>, key: ConfigKey) {
+    match outcome {
+        Ok((path, immediate)) => {
+            eprintln!("querymatter: saved {} in {}", key.as_str(), path.display());
+            report_deferred(immediate);
+        }
+        Err(err) => eprintln!("querymatter: {err:#}"),
+    }
+}
+
+/// Reports the outcome of a `.unset` on stderr: "removed" (plus the file
+/// written, and a note when the change only takes effect on the next run)
+/// when the key had actually been set, or an accurate "was not set" —
+/// matching `querymatter config unset`'s wording — when it was already
+/// absent, since that case never wrote anything.
+fn report_unset(outcome: anyhow::Result<(PathBuf, bool, bool)>, key: ConfigKey) {
+    match outcome {
+        Ok((path, true, immediate)) => {
+            eprintln!(
+                "querymatter: removed {} from {}",
+                key.as_str(),
+                path.display()
+            );
+            report_deferred(immediate);
+        }
+        Ok((path, false, _)) => {
+            eprintln!(
+                "querymatter: {} was not set in {}",
+                key.as_str(),
+                path.display()
+            );
+        }
+        Err(err) => eprintln!("querymatter: {err:#}"),
+    }
+}
+
+/// Prints the "takes effect on the next run" note when a change was deferred
+/// (a scan setting: the store is already loaded from before the change).
+fn report_deferred(immediate: bool) {
+    if !immediate {
+        eprintln!("querymatter: takes effect on the next run (the store is already loaded)");
+    }
 }
 
 /// Prints the dot-command reference to stdout.
@@ -289,6 +398,9 @@ fn print_help() {
     println!(
         "  .style [style]     show, or set, the table border style (ascii, unicode, compact, plain)"
     );
+    println!("  .settings          list every setting, its value, and where it came from");
+    println!("  .set <key> <val>   save a setting to the config file");
+    println!("  .unset <key>       remove a setting from the config file");
     println!("  .reload            rescan every tracked directory (in-memory only)");
     println!(
         "  .refresh [path]    re-scan path (or all); updates the .querymatter cache, else in memory"
@@ -555,5 +667,51 @@ mod tests {
             DotCommand::BadStyle(name) => assert_eq!(name, "fancy"),
             other => panic!("expected BadStyle, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn settings_command_parses() {
+        assert_eq!(parse_dot(".settings"), DotCommand::Settings);
+    }
+
+    #[test]
+    fn set_command_parses_key_and_value() {
+        assert_eq!(
+            parse_dot(".set table_style unicode"),
+            DotCommand::Set(ConfigKey::TableStyle, "unicode".to_string())
+        );
+    }
+
+    /// A list value may contain commas but no spaces; the rest of the line is
+    /// taken verbatim so `exclude` globs survive.
+    #[test]
+    fn set_takes_the_rest_of_the_line_as_the_value() {
+        assert_eq!(
+            parse_dot(".set exclude **/a/**,**/b/**"),
+            DotCommand::Set(ConfigKey::Exclude, "**/a/**,**/b/**".to_string())
+        );
+    }
+
+    #[test]
+    fn unset_command_parses() {
+        assert_eq!(
+            parse_dot(".unset hidden"),
+            DotCommand::Unset(ConfigKey::Hidden)
+        );
+    }
+
+    #[test]
+    fn bad_key_is_bad_key_not_unknown_command() {
+        match parse_dot(".set bogus x") {
+            DotCommand::BadKey(name) => assert_eq!(name, "bogus"),
+            other => panic!("expected BadKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_arguments_are_reported_as_missing() {
+        assert_eq!(parse_dot(".set"), DotCommand::MissingArg("set"));
+        assert_eq!(parse_dot(".set table_style"), DotCommand::MissingArg("set"));
+        assert_eq!(parse_dot(".unset"), DotCommand::MissingArg("unset"));
     }
 }

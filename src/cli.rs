@@ -1,6 +1,6 @@
 //! The `querymatter` command-line interface: argument parsing plus the
 //! translation from raw flags into a canonical set of scan roots and the
-//! [`WalkOpts`] that drive discovery.
+//! [`WalkOpts`](crate::discover::WalkOpts) that drive discovery.
 //!
 //! The surface is an optional subcommand ([`Command`]) layered over the
 //! existing query args: with no subcommand the flags on [`Cli`] drive a query
@@ -16,32 +16,44 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
-use globset::Glob;
 
 use crate::cache::Freshness;
-use crate::discover::WalkOpts;
+use crate::config::ConfigKey;
 use crate::render::{Format, TableStyle};
 
-/// The six flags that shape a directory walk, shared verbatim between query
+/// Every flag that shapes a directory walk, shared verbatim between query
 /// mode and `querymatter init` via `#[command(flatten)]`.
 ///
-/// Grouping them here keeps [`walk_opts`](WalkFlags::walk_opts),
-/// [`validate_excludes`](WalkFlags::validate_excludes), and
-/// [`ignore_files`](WalkFlags::ignore_files) — which only ever read these six
-/// fields — off [`Cli`], so `init` reuses the exact same discovery semantics.
+/// Grouping them here keeps [`ignore_files`](WalkFlags::ignore_files) — which
+/// only ever reads these fields — off [`Cli`], so `init` reuses the exact
+/// same discovery semantics. Turning the raw flags into a
+/// [`WalkOpts`](crate::discover::WalkOpts) is
+/// [`Settings::walk_opts`](crate::settings::Settings::walk_opts)'s job, since
+/// only the resolver knows which layer won for each field. Exclude-glob
+/// validation ([`crate::discover::validate_excludes`]) runs on the
+/// *resolved* setting, not the flag alone, so a bad glob from the config
+/// file is caught too — see `run_query`/`run_init` in `main.rs`.
 #[derive(Debug, Args)]
 pub struct WalkFlags {
-    /// File extensions (without the leading dot) to include.
-    #[arg(long, value_delimiter = ',', default_value = "md,markdown")]
-    pub ext: Vec<String>,
+    /// File extensions (without the leading dot) to include. [default: md,markdown]
+    #[arg(long, value_delimiter = ',')]
+    pub ext: Option<Vec<String>>,
 
     /// Honor `.gitignore`/`.ignore` rules while scanning.
     #[arg(long)]
     pub respect_gitignore: bool,
 
+    /// Ignore `.gitignore`/`.ignore` rules, overriding a config `true`.
+    #[arg(long, conflicts_with = "respect_gitignore")]
+    pub no_respect_gitignore: bool,
+
     /// Descend into hidden files and directories.
     #[arg(long)]
     pub hidden: bool,
+
+    /// Do not descend into hidden files and directories, overriding a config `true`.
+    #[arg(long, conflicts_with = "hidden")]
+    pub no_hidden: bool,
 
     /// Glob pattern excluding matching files; repeatable.
     #[arg(long)]
@@ -59,28 +71,6 @@ pub struct WalkFlags {
 }
 
 impl WalkFlags {
-    /// Builds the [`WalkOpts`] described by these flags (with an empty
-    /// `ignore_files`; the caller fills it from [`Self::ignore_files`]).
-    pub fn walk_opts(&self) -> WalkOpts {
-        WalkOpts {
-            exts: self.ext.clone(),
-            respect_gitignore: self.respect_gitignore,
-            hidden: self.hidden,
-            excludes: self.exclude.clone(),
-            ignore_files: Vec::new(),
-        }
-    }
-
-    /// Rejects any `--exclude` glob that `globset` cannot compile, naming the
-    /// bad pattern, so invalid input surfaces up front instead of being
-    /// silently ignored deeper in discovery.
-    pub fn validate_excludes(&self) -> anyhow::Result<()> {
-        for pat in &self.exclude {
-            Glob::new(pat).with_context(|| format!("invalid --exclude glob {pat:?}"))?;
-        }
-        Ok(())
-    }
-
     /// Ordered list of gitignore-style ignore files to apply, earliest first:
     /// the cwd `.querymatterignore` (unless `--no-ignore-file`) followed by each
     /// `--ignore-file` in order. This is the single seam the `.querymatter`
@@ -117,13 +107,13 @@ pub struct Cli {
     #[arg(short = 'e', long = "query")]
     pub query: Option<String>,
 
-    /// Output format for results.
-    #[arg(long, default_value = "table")]
-    pub format: Format,
+    /// Output format for results. [default: table]
+    #[arg(long, value_enum)]
+    pub format: Option<Format>,
 
-    /// Border style for `--format table` (ascii, unicode, compact, plain).
-    #[arg(long, env = "QUERYMATTER_TABLE_STYLE", default_value = "ascii")]
-    pub table_style: TableStyle,
+    /// Border style for `--format table`. [default: ascii]
+    #[arg(long, value_enum, env = "QUERYMATTER_TABLE_STYLE")]
+    pub table_style: Option<TableStyle>,
 
     /// Flags shared with `querymatter init` that shape the directory walk.
     #[command(flatten)]
@@ -161,6 +151,47 @@ pub struct Cli {
 pub enum Command {
     /// Build a `.querymatter` cache over a directory tree for faster queries.
     Init(InitArgs),
+    /// Show or change the persistent configuration.
+    Config(ConfigArgs),
+    /// Print a shell completion script to stdout.
+    Completions(CompletionsArgs),
+}
+
+/// Arguments for `querymatter config <ACTION>`.
+#[derive(Debug, Args)]
+pub struct ConfigArgs {
+    /// What to do with the configuration.
+    #[command(subcommand)]
+    pub action: ConfigAction,
+}
+
+/// The `querymatter config` actions.
+#[derive(Debug, Subcommand)]
+pub enum ConfigAction {
+    /// List every setting, its value, and where that value came from.
+    List,
+    /// Show one setting's value and the values it accepts.
+    Get {
+        /// The setting to show.
+        #[arg(value_enum)]
+        key: ConfigKey,
+    },
+    /// Set one setting in the config file.
+    Set {
+        /// The setting to change.
+        #[arg(value_enum)]
+        key: ConfigKey,
+        /// The new value; a comma-separated list for `ext` and `exclude`.
+        value: String,
+    },
+    /// Remove one setting from the config file.
+    Unset {
+        /// The setting to remove.
+        #[arg(value_enum)]
+        key: ConfigKey,
+    },
+    /// Print the config file's path, whether or not it exists.
+    Path,
 }
 
 /// Arguments for `querymatter init [DIR]`.
@@ -176,6 +207,14 @@ pub struct InitArgs {
     /// Walk flags shared with query mode.
     #[command(flatten)]
     pub walk: WalkFlags,
+}
+
+/// Arguments for `querymatter completions <SHELL>`.
+#[derive(Debug, Args)]
+pub struct CompletionsArgs {
+    /// Shell to generate a completion script for.
+    #[arg(value_enum)]
+    pub shell: clap_complete::Shell,
 }
 
 impl Cli {
@@ -255,9 +294,10 @@ impl Cli {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command};
+    use super::{Cli, Command, ConfigAction};
     use crate::cache::Freshness;
-    use crate::render::TableStyle;
+    use crate::config::ConfigKey;
+    use crate::render::{Format, TableStyle};
     use clap::{CommandFactory, FromArgMatches};
     use std::fs;
     use std::path::Path;
@@ -464,24 +504,103 @@ mod tests {
         ]);
         assert!(cli.walk.hidden);
         assert!(cli.walk.respect_gitignore);
-        assert_eq!(cli.walk.ext, vec!["md".to_string(), "txt".to_string()]);
+        assert_eq!(
+            cli.walk.ext,
+            Some(vec!["md".to_string(), "txt".to_string()])
+        );
         assert_eq!(cli.walk.exclude, vec!["**/x/**".to_string()]);
     }
 
+    /// With nothing set, `Cli::table_style` stays `None`: clap no longer
+    /// supplies the ascii default, so an absent flag is indistinguishable
+    /// from an absent config entry — [`crate::settings::Settings`] is the
+    /// single place the built-in default is applied.
     #[test]
-    fn table_style_defaults_to_ascii() {
+    fn table_style_absent_when_not_given() {
         let cli = parse(&["querymatter"]);
-        assert_eq!(cli.table_style, TableStyle::Ascii);
+        assert_eq!(cli.table_style, None);
     }
 
     #[test]
     fn table_style_flag_parses() {
         let cli = parse(&["querymatter", "--table-style", "unicode"]);
-        assert_eq!(cli.table_style, TableStyle::Unicode);
+        assert_eq!(cli.table_style, Some(TableStyle::Unicode));
     }
 
     #[test]
     fn bad_table_style_is_rejected() {
         assert!(try_parse(&["querymatter", "--table-style", "fancy"]).is_err());
+    }
+
+    /// Regression: adding `clap::ValueEnum` to `Format` switched `--format`
+    /// from a `FromStr`-based parser (which accepts `markdown` as an alias
+    /// for `md`) to the `ValueEnum` parser, which by default knows only
+    /// canonical spellings. This goes through clap's real parsing, not
+    /// `Format::from_str` directly — that's the layer the regression lived
+    /// in and the layer `FromStr`-only unit tests couldn't catch.
+    #[test]
+    fn format_flag_accepts_markdown_alias() {
+        let cli = parse(&["querymatter", "--format", "markdown"]);
+        assert_eq!(cli.format, Some(Format::Md));
+    }
+
+    #[test]
+    fn config_list_parses() {
+        match parse(&["querymatter", "config", "list"]).command {
+            Some(Command::Config(args)) => assert!(matches!(args.action, ConfigAction::List)),
+            other => panic!("expected a Config subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_set_parses_key_and_value() {
+        match parse(&["querymatter", "config", "set", "table_style", "unicode"]).command {
+            Some(Command::Config(args)) => match args.action {
+                ConfigAction::Set { key, value } => {
+                    assert_eq!(key, ConfigKey::TableStyle);
+                    assert_eq!(value, "unicode");
+                }
+                other => panic!("expected Set, got {other:?}"),
+            },
+            other => panic!("expected a Config subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_get_and_unset_and_path_parse() {
+        assert!(matches!(
+            parse(&["querymatter", "config", "get", "format"]).command,
+            Some(Command::Config(_))
+        ));
+        assert!(matches!(
+            parse(&["querymatter", "config", "unset", "hidden"]).command,
+            Some(Command::Config(_))
+        ));
+        assert!(matches!(
+            parse(&["querymatter", "config", "path"]).command,
+            Some(Command::Config(_))
+        ));
+    }
+
+    /// Keys are spelled snake_case, matching the TOML file exactly.
+    #[test]
+    fn config_key_is_rejected_when_misspelled() {
+        assert!(try_parse(&["querymatter", "config", "get", "table-style"]).is_err());
+        assert!(try_parse(&["querymatter", "config", "get", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn completions_parses_each_shell() {
+        for shell in ["bash", "zsh", "fish", "elvish", "powershell"] {
+            match parse(&["querymatter", "completions", shell]).command {
+                Some(Command::Completions(_)) => {}
+                other => panic!("expected Completions for {shell}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn completions_rejects_an_unknown_shell() {
+        assert!(try_parse(&["querymatter", "completions", "tcsh"]).is_err());
     }
 }

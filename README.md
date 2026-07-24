@@ -37,9 +37,10 @@ piped stdin.
 `-e`/`--query` always wins if given; otherwise piped (non-TTY) stdin means
 batch mode; otherwise you get the REPL.
 
-**stdout carries query results only.** Warnings (e.g. a file with malformed
-frontmatter), reload reports, and prompts all go to stderr, so
-`querymatter -e '…' --format json | jq` always sees pure JSON.
+**stdout carries data** — query results, `config list`/`get`/`path` output,
+and completion scripts. Every diagnostic, warning, confirmation, and prompt
+goes to stderr, so `querymatter -e '…' --format json | jq` always sees pure
+JSON.
 
 ## The query DSL
 
@@ -100,7 +101,9 @@ available alongside frontmatter fields:
 | `--table-style <STYLE>` | Border style for `--format table`: `ascii` (default), `unicode`, `compact`, or `plain`. Also settable per-shell with `QUERYMATTER_TABLE_STYLE`; the flag wins. Ignored by `json`/`csv`/`tsv`/`md`. In the REPL this is just the *initial* style — `.style` changes it live. |
 | `--ext <LIST>` | Comma-separated extensions to include. Default `md,markdown`. |
 | `--respect-gitignore` | Honor `.gitignore`/`.ignore` while walking. **Off by default** — see below. |
+| `--no-respect-gitignore` | Ignore `.gitignore`/`.ignore` rules, overriding a config `respect_gitignore = true`. |
 | `--hidden` | Descend into hidden files/directories (e.g. `.git`, `.obsidian`). Off by default. |
+| `--no-hidden` | Do not descend into hidden files/directories, overriding a config `hidden = true`. |
 | `--exclude <GLOB>` | Path glob to skip. Repeatable, e.g. `--exclude '**/templates/**'`. |
 | `--ignore-file <PATH>` | Apply a gitignore-style ignore file. Repeatable; applied in order after the auto-discovered cwd `.querymatterignore`. |
 | `--no-ignore-file` | Skip auto-discovering `.querymatterignore` in the current directory. Explicit `--ignore-file`s still apply. |
@@ -220,6 +223,92 @@ directory that isn't already part of the cached vault matches nothing; it is
 not live-scanned as a fallback. Point `init` at the tree you want covered, or
 pass `--no-cache` for an ad-hoc scan outside it.
 
+## Configuration
+
+Persistent settings live in a single user-global TOML file. `querymatter config
+path` prints its location — on Linux that is
+`~/.config/querymatter/config.toml`.
+
+```toml
+format            = "table"     # table, json, csv, tsv, md
+table_style       = "unicode"   # ascii, unicode, compact, plain
+ext               = ["md", "markdown"]
+respect_gitignore = true
+hidden            = false
+exclude           = ["**/templates/**"]
+```
+
+Every key is optional; an absent key falls through to the next layer. Values
+resolve per key, independently:
+
+```
+flag  >  environment  >  config file  >  built-in default
+```
+
+So a configured `hidden = true` still scans hidden files when you pass no flag,
+and `--no-hidden` turns it back off for one run. `--table-style` additionally
+reads `QUERYMATTER_TABLE_STYLE`, which outranks the file but loses to the flag.
+
+| Command | Meaning |
+| --- | --- |
+| `config list` | Every setting, its resolved value, and which layer supplied it. |
+| `config get <KEY>` | One setting's value, then the values it accepts. |
+| `config set <KEY> <VALUE>` | Write the setting to the config file. `ext` and `exclude` take a comma-separated list. |
+| `config unset <KEY>` | Remove the setting, returning it to the next layer. |
+| `config path` | Print the config file's path, whether or not it exists. |
+
+```console
+$ querymatter config set table_style unicode
+querymatter: set table_style = unicode in ~/.config/querymatter/config.toml
+
+$ querymatter config list
+format             table        (default)
+table_style        unicode      (config)
+ext                md,markdown  (default)
+respect_gitignore  false        (default)
+hidden             false        (default)
+exclude            (none)       (default)
+```
+
+A malformed config file, an unknown key, or an invalid value is a hard error
+naming the file — a typo must not silently do nothing. The file is read once
+per session, at resolution time: a `config set` run in another shell cannot
+change an already-running session's resolved settings. (Inside a single
+session, the REPL's `.set`/`.unset` re-read the file on every call rather than
+a cached snapshot, so a prior `.set` to a sibling key earlier in that same
+session survives a later one — but that governs what gets written to the
+file, not what a different, already-running session resolved.)
+
+`config set`/`config unset` rewrite the whole file from the parsed settings,
+so any comments, blank lines, or key order you added by hand are **not**
+preserved. If you hand-edit `config.toml` (e.g. to add the comments in the
+example above), keep documentation like that in a separate note rather than
+relying on it surviving the next `config set`/`config unset`.
+
+## Shell completions
+
+`querymatter completions <SHELL>` prints a completion script to stdout for
+`bash`, `zsh`, `fish`, `elvish`, or `powershell`. It completes subcommands,
+flags, directories, and the allowed values of `--format`, `--table-style`, and
+the `config` keys.
+
+```sh
+# bash
+querymatter completions bash > ~/.local/share/bash-completion/completions/querymatter
+
+# zsh — anywhere on your $fpath (must be writable without sudo; not every
+# distro's default ${fpath[1]} is, so check first or point at a dir of
+# your own that's on $fpath)
+querymatter completions zsh > "${fpath[1]}/_querymatter"
+
+# fish
+querymatter completions fish > ~/.config/fish/completions/querymatter.fish
+```
+
+Completions — and `config path` itself — work even when the config file is
+malformed, so you can always tab-complete your way to `querymatter config
+path` and find the file worth fixing.
+
 ## REPL dot-commands
 
 Inside the REPL, a line starting with `.` (no trailing `;`) is a command
@@ -231,6 +320,9 @@ rather than SQL:
 | `.schema` | List discovered frontmatter fields, the `file.*` columns, and the record count. |
 | `.format [fmt]` | Show, or set, the output format for subsequent queries. |
 | `.style [style]` | Show, or set, the table border style (`ascii`, `unicode`, `compact`, `plain`) for subsequent queries. |
+| `.settings` | List every setting, its resolved value, and which layer supplied it. |
+| `.set <key> <value>` | Save a setting to the config file. Rendering settings (`format`, `table_style`) also apply immediately; scan settings take effect on the next run. |
+| `.unset <key>` | Remove a setting from the config file. |
 | `.reload` | Re-scan every tracked directory (in-memory only; never touches a `.querymatter` cache). |
 | `.refresh [path]` | Force a re-scan of `path` (or the whole vault); updates the `.querymatter` cache when one is loaded, otherwise behaves like `.reload`. |
 | `.refresh-all` | Force a re-scan of the whole vault; alias for `.refresh` with no path. |
@@ -242,6 +334,10 @@ right-aligned `name: value` lines — the readable way to inspect a wide record,
 as in `SELECT * LIMIT 1\G`. `\g` is accepted as a synonym for `;`. `\G`
 overrides whatever `.format` is set to, and works in `-e` and piped batch mode
 as well as the REPL.
+
+`.format` and `.style` change the current session only; `.set format` and
+`.set table_style` persist to the config file — so you can try a setting, then
+keep it.
 
 ## Accuracy notes / gotchas
 

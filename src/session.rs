@@ -7,20 +7,22 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 
 use crate::cache;
+use crate::config::{self, Config, ConfigKey};
 use crate::query::{self, ResultTable};
 use crate::render::{self, Format, Output, TableStyle};
+use crate::settings::{Resolved, Settings, Source};
 use crate::store::{LoadReport, RecordStore};
 
 /// Owns the queryable store plus the current output format, and runs queries
 /// against them.
 pub struct Session {
     store: Box<dyn RecordStore>,
-    /// The format rendered results are produced in; mutable at runtime (the
-    /// REPL's `.format` command).
-    pub format: Format,
-    /// The border style used when rendering [`Format::Table`]; mutable at
-    /// runtime (the REPL's `.style` command).
-    pub style: TableStyle,
+    /// Every setting as resolved for this session; `.style`/`.format` mutate
+    /// the rendering ones in place.
+    settings: Settings,
+    /// The same resolution with the config layer removed, so `.unset` can
+    /// revert a setting to whatever would apply without the config file.
+    fallback: Settings,
     /// The `.querymatter` vault this session's store is backed by, when it
     /// is cache-backed. `None` for a live (no-cache) session, in which case
     /// [`refresh`](Self::refresh) falls back to an in-memory-only reload.
@@ -28,23 +30,149 @@ pub struct Session {
 }
 
 impl Session {
-    /// Builds a session over `store`, rendering results in `format` with
-    /// `style`'s table borders.
-    ///
-    /// `vault` is the `.querymatter` directory backing `store`, when it was
-    /// built via [`crate::store::InMemoryStore::from_cache`]; pass `None`
-    /// for a live (no-cache) store.
+    /// Builds a session over `store` with `settings`, keeping `fallback` —
+    /// the config-free resolution — for `.unset`.
     pub fn new(
         store: Box<dyn RecordStore>,
-        format: Format,
-        style: TableStyle,
+        settings: Settings,
+        fallback: Settings,
         vault: Option<PathBuf>,
     ) -> Self {
         Session {
             store,
-            format,
-            style,
+            settings,
+            fallback,
             vault,
+        }
+    }
+
+    /// The format rendered results are produced in.
+    pub fn format(&self) -> Format {
+        self.settings.format.value
+    }
+
+    /// The border style used when rendering [`Format::Table`].
+    pub fn style(&self) -> TableStyle {
+        self.settings.table_style.value
+    }
+
+    /// Every setting, for `.settings`.
+    pub fn settings(&self) -> &Settings {
+        &self.settings
+    }
+
+    /// Persists `key = value` to the user's config file and applies it to
+    /// this session when it affects rendering.
+    ///
+    /// Returns the config file's path, for the caller's confirmation message,
+    /// and whether the change takes effect immediately — scan settings do
+    /// not, because the store is already loaded. Thin wrapper around
+    /// [`persist_set_at`](Self::persist_set_at) that resolves the real path;
+    /// tests exercise the path-taking version directly against a temp file.
+    pub fn persist_set(&mut self, key: ConfigKey, value: &str) -> anyhow::Result<(PathBuf, bool)> {
+        let path =
+            config::config_path().context("cannot determine a config directory for this user")?;
+        let immediate = self.persist_set_at(&path, key, value)?;
+        Ok((path, immediate))
+    }
+
+    /// Persists `key = value` to the config file at `path`, applying it to
+    /// this session when it affects rendering.
+    ///
+    /// Re-reads `path` on every call rather than reusing an in-memory
+    /// snapshot, so a prior `persist_set_at`/`persist_unset_at` call to a
+    /// *different* key in the same session is preserved rather than
+    /// clobbered. Returns whether the change takes effect immediately.
+    pub fn persist_set_at(
+        &mut self,
+        path: &Path,
+        key: ConfigKey,
+        value: &str,
+    ) -> anyhow::Result<bool> {
+        let mut config = config::load_from(path)?;
+        config::set(&mut config, key, value)?;
+        config::save_to(path, &config)?;
+        Ok(self.apply(key, &config))
+    }
+
+    /// Removes `key` from the user's config file, if present, reverting this
+    /// session's value to whatever applies without it.
+    ///
+    /// Returns the config file's path, whether the key had actually been
+    /// present (so the caller can report "removed" only when something
+    /// really changed, rather than always), and whether the change takes
+    /// effect immediately. Thin wrapper around
+    /// [`persist_unset_at`](Self::persist_unset_at) that resolves the real
+    /// path; tests exercise the path-taking version directly against a temp
+    /// file.
+    pub fn persist_unset(&mut self, key: ConfigKey) -> anyhow::Result<(PathBuf, bool, bool)> {
+        let path =
+            config::config_path().context("cannot determine a config directory for this user")?;
+        let (removed, immediate) = self.persist_unset_at(&path, key)?;
+        Ok((path, removed, immediate))
+    }
+
+    /// Removes `key` from the config file at `path`, if present, reverting
+    /// this session's value to whatever applies without it.
+    ///
+    /// A key that is already absent is a no-op: `path` is read to check, but
+    /// never written back, so a `.unset` of a never-set key never
+    /// materializes a config file (or its parent directory) for what is
+    /// semantically a no-op. Returns whether the key had actually been
+    /// present, and — only when it was — whether reverting it takes effect
+    /// immediately.
+    pub fn persist_unset_at(
+        &mut self,
+        path: &Path,
+        key: ConfigKey,
+    ) -> anyhow::Result<(bool, bool)> {
+        let mut config = config::load_from(path)?;
+        if config::get(&config, key).is_none() {
+            return Ok((false, false));
+        }
+        config::unset(&mut config, key);
+        config::save_to(path, &config)?;
+        let immediate = match key {
+            ConfigKey::Format => {
+                self.settings.format = self.fallback.format.clone();
+                true
+            }
+            ConfigKey::TableStyle => {
+                self.settings.table_style = self.fallback.table_style.clone();
+                true
+            }
+            _ => false,
+        };
+        Ok((true, immediate))
+    }
+
+    /// Applies a just-persisted rendering setting to this session. Returns
+    /// whether anything changed now; scan settings take effect next run.
+    fn apply(&mut self, key: ConfigKey, config: &Config) -> bool {
+        match key {
+            ConfigKey::Format => {
+                if let Some(format) = config.format {
+                    self.settings.format = Resolved {
+                        value: format,
+                        source: Source::Config,
+                    };
+                    true
+                } else {
+                    false
+                }
+            }
+            ConfigKey::TableStyle => {
+                if let Some(style) = config.table_style {
+                    self.settings.table_style = Resolved {
+                        value: style,
+                        source: Source::Config,
+                    };
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
         }
     }
 
@@ -65,20 +193,24 @@ impl Session {
     /// caller adds exactly one when printing.
     pub fn render_statement(&self, statement: &Statement) -> anyhow::Result<String> {
         let table = self.run(&statement.sql)?;
-        let output = statement.terminator.output(self.format);
-        Ok(render::render(&table, output, self.style))
+        let output = statement.terminator.output(self.format());
+        Ok(render::render(&table, output, self.style()))
     }
 
-    /// Switches the output format used by
-    /// [`render_statement`](Self::render_statement).
-    pub fn set_format(&mut self, f: Format) {
-        self.format = f;
+    /// Switches the output format for the rest of this session only.
+    pub fn set_format(&mut self, format: Format) {
+        self.settings.format = Resolved {
+            value: format,
+            source: Source::Session,
+        };
     }
 
-    /// Switches the table border style used by
-    /// [`render_statement`](Self::render_statement).
+    /// Switches the table border style for the rest of this session only.
     pub fn set_style(&mut self, style: TableStyle) {
-        self.style = style;
+        self.settings.table_style = Resolved {
+            value: style,
+            source: Source::Session,
+        };
     }
 
     /// Rescans every tracked root, returning the combined load report.
@@ -350,8 +482,8 @@ mod tests {
             InMemoryStore::from_cache(td.path(), WalkOpts::default(), Freshness::PerFile);
         let mut session = Session::new(
             Box::new(store),
-            Format::Table,
-            TableStyle::Ascii,
+            Settings::default(),
+            Settings::default(),
             Some(td.path().to_path_buf()),
         );
 
@@ -392,7 +524,12 @@ mod tests {
 
         let (store, _report) =
             InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default());
-        let mut session = Session::new(Box::new(store), Format::Table, TableStyle::Ascii, None);
+        let mut session = Session::new(
+            Box::new(store),
+            Settings::default(),
+            Settings::default(),
+            None,
+        );
 
         fs::write(&a_path, "---\nstatus: final\n---\n").unwrap();
 
@@ -426,8 +563,8 @@ mod tests {
             InMemoryStore::from_cache(&vault, WalkOpts::default(), Freshness::PerFile);
         let mut session = Session::new(
             Box::new(store),
-            Format::Table,
-            TableStyle::Ascii,
+            Settings::default(),
+            Settings::default(),
             Some(vault.clone()),
         );
 
@@ -470,8 +607,8 @@ mod tests {
             InMemoryStore::from_cache(&vault, WalkOpts::default(), Freshness::PerFile);
         let mut session = Session::new(
             Box::new(store),
-            Format::Table,
-            TableStyle::Ascii,
+            Settings::default(),
+            Settings::default(),
             Some(vault.clone()),
         );
 
@@ -488,5 +625,180 @@ mod tests {
         // The store is untouched and still queryable.
         let table = session.run("SELECT status").unwrap();
         assert_eq!(table.rows[0][0], Value::Str("draft".into()));
+    }
+
+    /// A session over an empty in-memory store, for the
+    /// `persist_set_at`/`persist_unset_at` tests below, which exercise the
+    /// config-file plumbing rather than querying.
+    fn empty_session(settings: Settings, fallback: Settings) -> Session {
+        let (store, _report) = InMemoryStore::load(Vec::new(), WalkOpts::default());
+        Session::new(Box::new(store), settings, fallback, None)
+    }
+
+    /// `apply`'s return value must be DERIVED from whether `config` actually
+    /// carries a value for the rendering key, not hardcoded. Unreachable via
+    /// `persist_set_at` today (it always calls `apply` right after
+    /// `config::set`, so the key is always present) but not guaranteed by
+    /// the type system — a `Some`-less `Config` must report `false`, never
+    /// silently claim a change happened.
+    #[test]
+    fn apply_reports_false_when_the_config_lacks_the_rendering_key() {
+        let mut session = empty_session(Settings::default(), Settings::default());
+        assert!(!session.apply(ConfigKey::Format, &Config::default()));
+        assert!(!session.apply(ConfigKey::TableStyle, &Config::default()));
+    }
+
+    /// Property 1 (re-read, not snapshot): two successive `persist_set_at`
+    /// calls for different keys must both survive in the file — a call built
+    /// on an in-memory snapshot taken before the first write would silently
+    /// clobber it instead.
+    #[test]
+    fn persist_set_at_rereads_the_file_leaving_prior_keys_intact() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("config.toml");
+        let mut session = empty_session(Settings::default(), Settings::default());
+
+        session
+            .persist_set_at(&path, ConfigKey::TableStyle, "unicode")
+            .unwrap();
+        session
+            .persist_set_at(&path, ConfigKey::Format, "json")
+            .unwrap();
+
+        let config = config::load_from(&path).unwrap();
+        assert_eq!(config.table_style, Some(TableStyle::Unicode));
+        assert_eq!(config.format, Some(Format::Json));
+    }
+
+    /// Property 2 (revert to fallback, not default): a session whose
+    /// `table_style` came from a flag — with `fallback` reflecting that same
+    /// flag — must revert to the FLAG's value on `.unset`, not to the
+    /// built-in `TableStyle::Ascii` default.
+    #[test]
+    fn persist_unset_at_reverts_to_fallback_not_default() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("config.toml");
+
+        let flagged = Resolved {
+            value: TableStyle::Compact,
+            source: Source::Flag,
+        };
+        let settings = Settings {
+            table_style: flagged.clone(),
+            ..Settings::default()
+        };
+        let fallback = Settings {
+            table_style: flagged,
+            ..Settings::default()
+        };
+
+        let mut session = empty_session(settings, fallback);
+        session
+            .persist_set_at(&path, ConfigKey::TableStyle, "unicode")
+            .unwrap();
+        assert_eq!(session.style(), TableStyle::Unicode);
+
+        let (removed, immediate) = session
+            .persist_unset_at(&path, ConfigKey::TableStyle)
+            .unwrap();
+        assert!(removed);
+        assert!(immediate);
+        assert_eq!(
+            session.style(),
+            TableStyle::Compact,
+            "must revert to the flag's value, not the Ascii default"
+        );
+    }
+
+    /// Property 3 (immediate): `persist_set_at` on a rendering key
+    /// (`format`, `table_style`) reports immediate and changes the
+    /// corresponding session accessor right away.
+    #[test]
+    fn persist_set_at_rendering_keys_take_effect_immediately() {
+        let td = TempDir::new().unwrap();
+        let mut session = empty_session(Settings::default(), Settings::default());
+
+        let immediate = session
+            .persist_set_at(&td.path().join("format.toml"), ConfigKey::Format, "json")
+            .unwrap();
+        assert!(immediate, "format is a rendering key and must be immediate");
+        assert_eq!(session.format(), Format::Json);
+
+        let immediate = session
+            .persist_set_at(
+                &td.path().join("style.toml"),
+                ConfigKey::TableStyle,
+                "unicode",
+            )
+            .unwrap();
+        assert!(
+            immediate,
+            "table_style is a rendering key and must be immediate"
+        );
+        assert_eq!(session.style(), TableStyle::Unicode);
+    }
+
+    /// Property 3 (deferred): `persist_set_at` on a scan key (`ext`,
+    /// `hidden`, `respect_gitignore`, `exclude`) reports deferred and leaves
+    /// the rendering accessors untouched — the store is already loaded, so a
+    /// scan setting can't retroactively change what's in it.
+    #[test]
+    fn persist_set_at_scan_keys_are_deferred_and_do_not_touch_rendering() {
+        let td = TempDir::new().unwrap();
+        for (key, value) in [
+            (ConfigKey::Ext, "mdx"),
+            (ConfigKey::Hidden, "true"),
+            (ConfigKey::RespectGitignore, "true"),
+            (ConfigKey::Exclude, "**/x/**"),
+        ] {
+            let path = td.path().join(format!("{}.toml", key.as_str()));
+            let mut session = empty_session(Settings::default(), Settings::default());
+            let before_format = session.format();
+            let before_style = session.style();
+
+            let immediate = session.persist_set_at(&path, key, value).unwrap();
+
+            assert!(
+                !immediate,
+                "{} must be deferred, not immediate",
+                key.as_str()
+            );
+            assert_eq!(
+                session.format(),
+                before_format,
+                "{} must not touch format",
+                key.as_str()
+            );
+            assert_eq!(
+                session.style(),
+                before_style,
+                "{} must not touch style",
+                key.as_str()
+            );
+        }
+    }
+
+    /// `.unset` on a key that was never set must be a true no-op: no config
+    /// file (or parent directory) materializes for what is semantically a
+    /// no-op query, matching `querymatter config unset`'s CLI behavior.
+    #[test]
+    fn persist_unset_at_absent_key_does_not_create_the_file() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("nested").join("config.toml");
+        let mut session = empty_session(Settings::default(), Settings::default());
+
+        let (removed, immediate) = session
+            .persist_unset_at(&path, ConfigKey::TableStyle)
+            .unwrap();
+        assert!(!removed);
+        assert!(!immediate);
+        assert!(
+            !path.exists(),
+            "no config file must be created for a no-op unset"
+        );
+        assert!(
+            !path.parent().unwrap().exists(),
+            "no parent directory must be created for a no-op unset"
+        );
     }
 }
