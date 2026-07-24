@@ -18,6 +18,7 @@ pub mod query;
 pub mod render;
 mod repl;
 mod session;
+mod settings;
 pub mod store;
 
 use std::env;
@@ -26,17 +27,33 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use clap::Parser;
+use clap::{ArgMatches, CommandFactory, FromArgMatches};
 
 use crate::cli::{Cli, Command, InitArgs};
+use crate::config::Config;
 use crate::session::{Session, split_statements};
+use crate::settings::Settings;
 use crate::store::{InMemoryStore, RecordStore};
 
 fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches)?;
+    let config = config::load()?;
     match &cli.command {
-        Some(Command::Init(args)) => run_init(args),
-        None => run_query(&cli),
+        Some(Command::Init(args)) => {
+            // `init`'s walk flags are matched under the "init" subcommand's
+            // own nested `ArgMatches`, not the top-level one: `WalkFlags` is
+            // flattened separately onto `Cli` and `InitArgs`, so each gets
+            // its own arg registration, and `ArgMatches::value_source` only
+            // sees the level it's called on. Handing `Settings::resolve_walk`
+            // the top-level `matches` here would read every init walk flag's
+            // source as absent, silently dropping `--hidden` and friends.
+            let sub_matches = matches
+                .subcommand_matches("init")
+                .expect("Command::Init parsed implies the init subcommand matched");
+            run_init(args, &config, sub_matches)
+        }
+        None => run_query(&cli, &config, &matches),
     }
 }
 
@@ -45,7 +62,7 @@ fn main() -> anyhow::Result<()> {
 ///
 /// All summary output goes to stderr; `init` produces no stdout so it composes
 /// cleanly in scripts.
-fn run_init(args: &InitArgs) -> anyhow::Result<()> {
+fn run_init(args: &InitArgs, config: &Config, matches: &ArgMatches) -> anyhow::Result<()> {
     args.walk.validate_excludes()?;
 
     let cwd = env::current_dir().context("failed to determine the current directory")?;
@@ -53,7 +70,8 @@ fn run_init(args: &InitArgs) -> anyhow::Result<()> {
     let base = fs::canonicalize(&target)
         .with_context(|| format!("cannot access directory {}", target.display()))?;
 
-    let mut opts = args.walk.walk_opts();
+    let settings = Settings::resolve_walk(&args.walk, config, matches);
+    let mut opts = settings.walk_opts();
     opts.ignore_files = args.walk.ignore_files()?;
 
     let report = cache::build_vault(&base, &opts, args.ttl)?;
@@ -124,11 +142,12 @@ fn prompt_add_gitignore(root: &Path) -> anyhow::Result<()> {
 /// Runs a query: loads the store from an ancestor `.querymatter` cache when one
 /// is found (unless `--no-cache`), or live-scans the resolved roots otherwise,
 /// then dispatches to one-shot, batch, or interactive mode.
-fn run_query(cli: &Cli) -> anyhow::Result<()> {
+fn run_query(cli: &Cli, config: &Config, matches: &ArgMatches) -> anyhow::Result<()> {
     cli.validate()?;
     cli.walk.validate_excludes()?;
 
-    let mut opts = cli.walk.walk_opts();
+    let settings = Settings::resolve(cli, config, matches);
+    let mut opts = settings.walk_opts();
     opts.ignore_files = cli.walk.ignore_files()?;
 
     let cwd = env::current_dir().context("failed to determine the current directory")?;
@@ -177,7 +196,8 @@ fn run_query(cli: &Cli) -> anyhow::Result<()> {
     for warning in &report.warnings {
         eprintln!("querymatter: {warning}");
     }
-    let session = Session::new(Box::new(store), cli.format, cli.table_style, session_vault);
+    let fallback = Settings::resolve(cli, &Config::default(), matches);
+    let session = Session::new(Box::new(store), settings, fallback, session_vault);
 
     match cli.query.as_deref() {
         // `-e -`: read the query text from stdin, then run it.

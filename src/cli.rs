@@ -1,6 +1,6 @@
 //! The `querymatter` command-line interface: argument parsing plus the
 //! translation from raw flags into a canonical set of scan roots and the
-//! [`WalkOpts`] that drive discovery.
+//! [`WalkOpts`](crate::discover::WalkOpts) that drive discovery.
 //!
 //! The surface is an optional subcommand ([`Command`]) layered over the
 //! existing query args: with no subcommand the flags on [`Cli`] drive a query
@@ -19,29 +19,38 @@ use clap::{Args, Parser, Subcommand};
 use globset::Glob;
 
 use crate::cache::Freshness;
-use crate::discover::WalkOpts;
 use crate::render::{Format, TableStyle};
 
 /// The six flags that shape a directory walk, shared verbatim between query
 /// mode and `querymatter init` via `#[command(flatten)]`.
 ///
-/// Grouping them here keeps [`walk_opts`](WalkFlags::walk_opts),
-/// [`validate_excludes`](WalkFlags::validate_excludes), and
-/// [`ignore_files`](WalkFlags::ignore_files) — which only ever read these six
+/// Grouping them here keeps [`validate_excludes`](WalkFlags::validate_excludes)
+/// and [`ignore_files`](WalkFlags::ignore_files) — which only ever read these
 /// fields — off [`Cli`], so `init` reuses the exact same discovery semantics.
+/// Turning the raw flags into a [`WalkOpts`](crate::discover::WalkOpts) is
+/// [`Settings::walk_opts`](crate::settings::Settings::walk_opts)'s job, since
+/// only the resolver knows which layer won for each field.
 #[derive(Debug, Args)]
 pub struct WalkFlags {
-    /// File extensions (without the leading dot) to include.
-    #[arg(long, value_delimiter = ',', default_value = "md,markdown")]
-    pub ext: Vec<String>,
+    /// File extensions (without the leading dot) to include. [default: md,markdown]
+    #[arg(long, value_delimiter = ',')]
+    pub ext: Option<Vec<String>>,
 
     /// Honor `.gitignore`/`.ignore` rules while scanning.
     #[arg(long)]
     pub respect_gitignore: bool,
 
+    /// Ignore `.gitignore`/`.ignore` rules, overriding a config `true`.
+    #[arg(long, conflicts_with = "respect_gitignore")]
+    pub no_respect_gitignore: bool,
+
     /// Descend into hidden files and directories.
     #[arg(long)]
     pub hidden: bool,
+
+    /// Do not descend into hidden files and directories, overriding a config `true`.
+    #[arg(long, conflicts_with = "hidden")]
+    pub no_hidden: bool,
 
     /// Glob pattern excluding matching files; repeatable.
     #[arg(long)]
@@ -59,18 +68,6 @@ pub struct WalkFlags {
 }
 
 impl WalkFlags {
-    /// Builds the [`WalkOpts`] described by these flags (with an empty
-    /// `ignore_files`; the caller fills it from [`Self::ignore_files`]).
-    pub fn walk_opts(&self) -> WalkOpts {
-        WalkOpts {
-            exts: self.ext.clone(),
-            respect_gitignore: self.respect_gitignore,
-            hidden: self.hidden,
-            excludes: self.exclude.clone(),
-            ignore_files: Vec::new(),
-        }
-    }
-
     /// Rejects any `--exclude` glob that `globset` cannot compile, naming the
     /// bad pattern, so invalid input surfaces up front instead of being
     /// silently ignored deeper in discovery.
@@ -117,13 +114,13 @@ pub struct Cli {
     #[arg(short = 'e', long = "query")]
     pub query: Option<String>,
 
-    /// Output format for results.
-    #[arg(long, default_value = "table")]
-    pub format: Format,
+    /// Output format for results. [default: table]
+    #[arg(long, value_enum)]
+    pub format: Option<Format>,
 
-    /// Border style for `--format table` (ascii, unicode, compact, plain).
-    #[arg(long, env = "QUERYMATTER_TABLE_STYLE", default_value = "ascii")]
-    pub table_style: TableStyle,
+    /// Border style for `--format table`. [default: ascii]
+    #[arg(long, value_enum, env = "QUERYMATTER_TABLE_STYLE")]
+    pub table_style: Option<TableStyle>,
 
     /// Flags shared with `querymatter init` that shape the directory walk.
     #[command(flatten)]
@@ -464,20 +461,27 @@ mod tests {
         ]);
         assert!(cli.walk.hidden);
         assert!(cli.walk.respect_gitignore);
-        assert_eq!(cli.walk.ext, vec!["md".to_string(), "txt".to_string()]);
+        assert_eq!(
+            cli.walk.ext,
+            Some(vec!["md".to_string(), "txt".to_string()])
+        );
         assert_eq!(cli.walk.exclude, vec!["**/x/**".to_string()]);
     }
 
+    /// With nothing set, `Cli::table_style` stays `None`: clap no longer
+    /// supplies the ascii default, so an absent flag is indistinguishable
+    /// from an absent config entry — [`crate::settings::Settings`] is the
+    /// single place the built-in default is applied.
     #[test]
-    fn table_style_defaults_to_ascii() {
+    fn table_style_absent_when_not_given() {
         let cli = parse(&["querymatter"]);
-        assert_eq!(cli.table_style, TableStyle::Ascii);
+        assert_eq!(cli.table_style, None);
     }
 
     #[test]
     fn table_style_flag_parses() {
         let cli = parse(&["querymatter", "--table-style", "unicode"]);
-        assert_eq!(cli.table_style, TableStyle::Unicode);
+        assert_eq!(cli.table_style, Some(TableStyle::Unicode));
     }
 
     #[test]

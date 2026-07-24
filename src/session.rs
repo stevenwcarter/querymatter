@@ -9,18 +9,19 @@ use anyhow::Context;
 use crate::cache;
 use crate::query::{self, ResultTable};
 use crate::render::{self, Format, Output, TableStyle};
+use crate::settings::{Resolved, Settings, Source};
 use crate::store::{LoadReport, RecordStore};
 
 /// Owns the queryable store plus the current output format, and runs queries
 /// against them.
 pub struct Session {
     store: Box<dyn RecordStore>,
-    /// The format rendered results are produced in; mutable at runtime (the
-    /// REPL's `.format` command).
-    pub format: Format,
-    /// The border style used when rendering [`Format::Table`]; mutable at
-    /// runtime (the REPL's `.style` command).
-    pub style: TableStyle,
+    /// Every setting as resolved for this session; `.style`/`.format` mutate
+    /// the rendering ones in place.
+    settings: Settings,
+    /// The same resolution with the config layer removed, so `.unset` can
+    /// revert a setting to whatever would apply without the config file.
+    fallback: Settings,
     /// The `.querymatter` vault this session's store is backed by, when it
     /// is cache-backed. `None` for a live (no-cache) session, in which case
     /// [`refresh`](Self::refresh) falls back to an in-memory-only reload.
@@ -28,24 +29,35 @@ pub struct Session {
 }
 
 impl Session {
-    /// Builds a session over `store`, rendering results in `format` with
-    /// `style`'s table borders.
-    ///
-    /// `vault` is the `.querymatter` directory backing `store`, when it was
-    /// built via [`crate::store::InMemoryStore::from_cache`]; pass `None`
-    /// for a live (no-cache) store.
+    /// Builds a session over `store` with `settings`, keeping `fallback` —
+    /// the config-free resolution — for `.unset`.
     pub fn new(
         store: Box<dyn RecordStore>,
-        format: Format,
-        style: TableStyle,
+        settings: Settings,
+        fallback: Settings,
         vault: Option<PathBuf>,
     ) -> Self {
         Session {
             store,
-            format,
-            style,
+            settings,
+            fallback,
             vault,
         }
+    }
+
+    /// The format rendered results are produced in.
+    pub fn format(&self) -> Format {
+        self.settings.format.value
+    }
+
+    /// The border style used when rendering [`Format::Table`].
+    pub fn style(&self) -> TableStyle {
+        self.settings.table_style.value
+    }
+
+    /// Every setting, for `.settings`.
+    pub fn settings(&self) -> &Settings {
+        &self.settings
     }
 
     /// Parses and executes `sql`, returning the projected result table.
@@ -65,20 +77,24 @@ impl Session {
     /// caller adds exactly one when printing.
     pub fn render_statement(&self, statement: &Statement) -> anyhow::Result<String> {
         let table = self.run(&statement.sql)?;
-        let output = statement.terminator.output(self.format);
-        Ok(render::render(&table, output, self.style))
+        let output = statement.terminator.output(self.format());
+        Ok(render::render(&table, output, self.style()))
     }
 
-    /// Switches the output format used by
-    /// [`render_statement`](Self::render_statement).
-    pub fn set_format(&mut self, f: Format) {
-        self.format = f;
+    /// Switches the output format for the rest of this session only.
+    pub fn set_format(&mut self, format: Format) {
+        self.settings.format = Resolved {
+            value: format,
+            source: Source::Session,
+        };
     }
 
-    /// Switches the table border style used by
-    /// [`render_statement`](Self::render_statement).
+    /// Switches the table border style for the rest of this session only.
     pub fn set_style(&mut self, style: TableStyle) {
-        self.style = style;
+        self.settings.table_style = Resolved {
+            value: style,
+            source: Source::Session,
+        };
     }
 
     /// Rescans every tracked root, returning the combined load report.
@@ -350,8 +366,8 @@ mod tests {
             InMemoryStore::from_cache(td.path(), WalkOpts::default(), Freshness::PerFile);
         let mut session = Session::new(
             Box::new(store),
-            Format::Table,
-            TableStyle::Ascii,
+            Settings::default(),
+            Settings::default(),
             Some(td.path().to_path_buf()),
         );
 
@@ -392,7 +408,12 @@ mod tests {
 
         let (store, _report) =
             InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default());
-        let mut session = Session::new(Box::new(store), Format::Table, TableStyle::Ascii, None);
+        let mut session = Session::new(
+            Box::new(store),
+            Settings::default(),
+            Settings::default(),
+            None,
+        );
 
         fs::write(&a_path, "---\nstatus: final\n---\n").unwrap();
 
@@ -426,8 +447,8 @@ mod tests {
             InMemoryStore::from_cache(&vault, WalkOpts::default(), Freshness::PerFile);
         let mut session = Session::new(
             Box::new(store),
-            Format::Table,
-            TableStyle::Ascii,
+            Settings::default(),
+            Settings::default(),
             Some(vault.clone()),
         );
 
@@ -470,8 +491,8 @@ mod tests {
             InMemoryStore::from_cache(&vault, WalkOpts::default(), Freshness::PerFile);
         let mut session = Session::new(
             Box::new(store),
-            Format::Table,
-            TableStyle::Ascii,
+            Settings::default(),
+            Settings::default(),
             Some(vault.clone()),
         );
 

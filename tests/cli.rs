@@ -241,6 +241,78 @@ fn init_creates_manifest() {
     );
 }
 
+/// `init`'s walk flags parse into the "init" subcommand's own nested
+/// `ArgMatches`, not the top-level one `main` builds `Cli` from —
+/// `Settings::resolve_walk` must be handed that nested `ArgMatches`, or every
+/// init walk flag (`--hidden` included) would resolve as if it had never been
+/// passed, since `WalkFlags` is flattened separately onto `Cli` and
+/// `InitArgs` and each gets its own arg registration. Pins that
+/// `querymatter init --hidden` actually descends into a dotdir, and that the
+/// default (no `--hidden`) still skips it.
+#[test]
+fn init_hidden_flag_includes_dotdirs() {
+    let td = TempDir::new().unwrap();
+    fs::create_dir_all(td.path().join(".hidden")).unwrap();
+    fs::write(td.path().join(".hidden/a.md"), "---\nstatus: draft\n---\n").unwrap();
+    fs::write(td.path().join("visible.md"), "---\nstatus: draft\n---\n").unwrap();
+
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .arg("init")
+        .arg(td.path())
+        .assert()
+        .success();
+    let out = Command::cargo_bin("querymatter")
+        .unwrap()
+        .current_dir(td.path())
+        .args([
+            "-e",
+            "SELECT count(*) AS n",
+            "--format",
+            "csv",
+            "--force-cache",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(
+        String::from_utf8(out).unwrap().trim(),
+        "n\n1",
+        "without --hidden, init must skip the dotdir"
+    );
+
+    fs::remove_dir_all(td.path().join(".querymatter")).unwrap();
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .arg("init")
+        .arg("--hidden")
+        .arg(td.path())
+        .assert()
+        .success();
+    let out = Command::cargo_bin("querymatter")
+        .unwrap()
+        .current_dir(td.path())
+        .args([
+            "-e",
+            "SELECT count(*) AS n",
+            "--format",
+            "csv",
+            "--force-cache",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(
+        String::from_utf8(out).unwrap().trim(),
+        "n\n2",
+        "querymatter init --hidden must descend into dotdirs, not silently drop the flag"
+    );
+}
+
 #[test]
 fn init_in_git_repo_non_tty_succeeds_and_summarizes() {
     // The git-ignore offer runs after a successful cache build; in a non-TTY
@@ -853,4 +925,116 @@ fn lowercase_g_terminates_like_a_semicolon() {
         .success()
         .stdout(predicates::str::contains("+--"))
         .stdout(predicates::str::contains("1. row").not());
+}
+
+/// Points HOME and XDG_CONFIG_HOME at `dir` so a test never reads or writes
+/// the developer's real config. HOME covers macOS, where `directories` uses
+/// ~/Library/Application Support and ignores XDG_CONFIG_HOME.
+fn with_config_home<'a>(cmd: &'a mut Command, dir: &std::path::Path) -> &'a mut Command {
+    cmd.env("HOME", dir)
+        .env("XDG_CONFIG_HOME", dir)
+        .env_remove("QUERYMATTER_TABLE_STYLE")
+}
+
+/// Writes a config file into the fake config home `dir`.
+fn write_config(dir: &std::path::Path, body: &str) {
+    let path = dir.join("querymatter");
+    fs::create_dir_all(&path).unwrap();
+    fs::write(path.join("config.toml"), body).unwrap();
+}
+
+#[test]
+fn config_file_supplies_the_table_style() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "table_style = \"unicode\"\n");
+    let mut cmd = Command::cargo_bin("querymatter").unwrap();
+    with_config_home(&mut cmd, home.path())
+        .args(["-e", "SELECT status WHERE prd = '010'"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("╭"));
+}
+
+#[test]
+fn flag_overrides_the_config_file() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "table_style = \"unicode\"\n");
+    let mut cmd = Command::cargo_bin("querymatter").unwrap();
+    with_config_home(&mut cmd, home.path())
+        .args([
+            "-e",
+            "SELECT status WHERE prd = '010'",
+            "--table-style",
+            "ascii",
+        ])
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("+--"))
+        .stdout(predicates::str::contains("╭").not());
+}
+
+#[test]
+fn env_overrides_the_config_file() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "table_style = \"ascii\"\n");
+    let mut cmd = Command::cargo_bin("querymatter").unwrap();
+    with_config_home(&mut cmd, home.path())
+        .env("QUERYMATTER_TABLE_STYLE", "unicode")
+        .args(["-e", "SELECT status WHERE prd = '010'"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("╭"));
+}
+
+#[test]
+fn config_file_supplies_the_format() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "format = \"json\"\n");
+    let mut cmd = Command::cargo_bin("querymatter").unwrap();
+    let out = with_config_home(&mut cmd, home.path())
+        .args(["-e", "SELECT status WHERE prd = '010'"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v.as_array().unwrap().len(), 2);
+}
+
+/// A broken config blocks every command, so its message must name the file.
+#[test]
+fn malformed_config_exits_non_zero_naming_the_path() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "table_style = = broken\n");
+    let mut cmd = Command::cargo_bin("querymatter").unwrap();
+    with_config_home(&mut cmd, home.path())
+        .args(["-e", "SELECT status"])
+        .arg(td.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("config.toml"));
+}
+
+#[test]
+fn unknown_config_key_exits_non_zero_naming_the_key() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "tabel_style = \"unicode\"\n");
+    let mut cmd = Command::cargo_bin("querymatter").unwrap();
+    with_config_home(&mut cmd, home.path())
+        .args(["-e", "SELECT status"])
+        .arg(td.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("tabel_style"));
 }
