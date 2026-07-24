@@ -45,13 +45,19 @@ where
 {
     let workers = worker_count();
     if paths.len() <= 1 || workers <= 1 {
-        return paths
+        let mut results: Vec<(PathBuf, T)> = paths
             .into_iter()
             .map(|path| {
                 let result = f(&path);
                 (path, result)
             })
             .collect();
+        // Unconditional even here: a no-op for 0/1 elements, but keeps the
+        // "sorted by path" guarantee holding regardless of worker count —
+        // callers on a single-core host must see the same order as everyone
+        // else, not merely input order.
+        results.sort_by(|(a, _), (b, _)| a.cmp(b));
+        return results;
     }
 
     // `workers >= 2` and `paths.len() >= 2` here, so this is always >= 1 —
