@@ -15,6 +15,7 @@ pub enum Value {
     Float(f64),
     Str(String),
     List(Vec<Value>),
+    Map(IndexMap<String, Value>),
 }
 
 impl Value {
@@ -39,6 +40,7 @@ impl Value {
                 .map(Value::display)
                 .collect::<Vec<_>>()
                 .join(", "),
+            Value::Map(_) => compact_value(self),
         }
     }
 
@@ -53,6 +55,7 @@ impl Value {
             Value::Float(_) => "Float",
             Value::Str(_) => "Str",
             Value::List(_) => "List",
+            Value::Map(_) => "Map",
         }
     }
 
@@ -66,13 +69,41 @@ impl Value {
             Value::Int(i) => Some(*i as f64),
             Value::Float(f) => Some(*f),
             Value::Str(s) => s.trim().parse::<f64>().ok(),
-            Value::Bool(_) | Value::Null | Value::List(_) => None,
+            Value::Bool(_) | Value::Null | Value::List(_) | Value::Map(_) => None,
         }
     }
 
     /// Canonical string form used for lexicographic comparison.
     pub fn to_cmp_string(&self) -> String {
         self.display()
+    }
+}
+
+/// Compact, deterministic string for a `Value` used when a `Map` (or a map
+/// nested in one) is rendered flat (table/CSV). Mirrors
+/// `frontmatter::compact_pod` exactly: lists render WITH brackets, maps with
+/// braces, map keys sorted. This is intentionally different from
+/// `Value::display(List)` (bracket-less) — see spec §9.
+fn compact_value(v: &Value) -> String {
+    match v {
+        Value::Null => "null".to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Str(s) => s.clone(),
+        Value::List(items) => {
+            let rendered: Vec<_> = items.iter().map(compact_value).collect();
+            format!("[{}]", rendered.join(", "))
+        }
+        Value::Map(map) => {
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            let rendered: Vec<_> = entries
+                .iter()
+                .map(|(k, v)| format!("{k}: {}", compact_value(v)))
+                .collect();
+            format!("{{{}}}", rendered.join(", "))
+        }
     }
 }
 
@@ -239,6 +270,34 @@ mod tests {
     fn compare_null_is_none() {
         assert_eq!(compare_values(&Value::Null, &Value::Int(1)), None);
         assert_eq!(compare_values(&Value::Int(1), &Value::Null), None);
+    }
+    #[test]
+    fn map_display_matches_compact_pod_form() {
+        // keys sorted; a nested LIST inside a map renders WITH brackets,
+        // matching the old compact_pod output (NOT Value::display's bracket-less list).
+        let mut inner = IndexMap::new();
+        inner.insert("low".to_string(), Value::Int(5));
+        inner.insert("high".to_string(), Value::Int(10));
+        inner.insert(
+            "tags".to_string(),
+            Value::List(vec![Value::Str("a".into()), Value::Str("b".into())]),
+        );
+        let v = Value::Map(inner);
+        assert_eq!(v.display(), "{high: 10, low: 5, tags: [a, b]}");
+    }
+    #[test]
+    fn map_variant_name_and_as_number() {
+        let v = Value::Map(IndexMap::new());
+        assert_eq!(v.variant_name(), "Map");
+        assert_eq!(v.as_number(), None);
+    }
+    #[test]
+    fn nested_map_display_is_recursive() {
+        let mut inner = IndexMap::new();
+        inner.insert("x".to_string(), Value::Int(1));
+        let mut outer = IndexMap::new();
+        outer.insert("a".to_string(), Value::Map(inner));
+        assert_eq!(Value::Map(outer).display(), "{a: {x: 1}}");
     }
 }
 
