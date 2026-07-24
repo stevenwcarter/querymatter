@@ -34,7 +34,8 @@ use anyhow::Context;
 use clap::{ArgMatches, CommandFactory, FromArgMatches};
 
 use crate::cli::{
-    Cli, Command, CompletionsArgs, ConfigAction, ConfigArgs, InitArgs, QueryAction, QueryArgs,
+    Cli, Command, CompletionsArgs, ConfigAction, ConfigArgs, ExplainArgs, InitArgs, QueryAction,
+    QueryArgs,
 };
 use crate::config::Config;
 use crate::output::OutputSink;
@@ -137,6 +138,16 @@ fn dispatch(cli: &Cli, matches: &ArgMatches) -> anyhow::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Some(Command::Query(args)) => run_query_cmd(&args.action, cli, &config, matches),
+        Some(Command::Explain(args)) => {
+            // Same reasoning as `init` above: `ExplainArgs`'s flattened
+            // `WalkFlags` is matched under the "explain" subcommand's own
+            // nested `ArgMatches`, not the top-level one.
+            let sub_matches = matches
+                .subcommand_matches("explain")
+                .expect("Command::Explain parsed implies the explain subcommand matched");
+            run_explain(args, &config, sub_matches)?;
+            Ok(ExitCode::SUCCESS)
+        }
         Some(Command::Completions(_)) => unreachable!("handled above"),
         None => run_query(cli, &config, matches),
     }
@@ -234,6 +245,46 @@ fn prompt_add_gitignore(root: &Path) -> anyhow::Result<()> {
             "querymatter: added .querymatter/ to {}",
             root.join(".gitignore").display()
         );
+    }
+    Ok(())
+}
+
+/// Reports whether `args.path` would be discovered under the walk
+/// configuration resolved from `args.walk`/`config`, and — when it would be
+/// excluded — which filter layer is responsible, via [`discover::explain`].
+/// The verdict/reason line is printed to stdout: it's the command's data,
+/// not a diagnostic.
+///
+/// Root resolution: `explain` scans from the current directory, matching
+/// every other command's behavior with no `[DIRS]` given (see
+/// [`Cli::resolved_roots`]) — `explain` cannot itself accept a `[DIRS]`
+/// positional (see [`ExplainArgs`]'s doc comment), so "explain this path"
+/// means "would it be discovered by a query run right here". `args.path` is
+/// canonicalized and checked against that root; a path that doesn't exist,
+/// or resolves outside it, is a clean error rather than a silently wrong
+/// verdict.
+fn run_explain(args: &ExplainArgs, config: &Config, matches: &ArgMatches) -> anyhow::Result<()> {
+    let settings = Settings::resolve_walk(&args.walk, config, matches);
+    discover::validate_excludes(&settings.exclude.value)?;
+
+    let mut opts = settings.walk_opts();
+    opts.ignore_files = args.walk.ignore_files()?;
+
+    let cwd = env::current_dir().context("failed to determine the current directory")?;
+    let root = fs::canonicalize(&cwd)
+        .with_context(|| format!("cannot access directory {}", cwd.display()))?;
+    let target = fs::canonicalize(&args.path)
+        .with_context(|| format!("cannot access path {}", args.path.display()))?;
+    anyhow::ensure!(
+        target.starts_with(&root),
+        "{} is outside the current directory {} (explain's implicit scan root)",
+        args.path.display(),
+        root.display()
+    );
+
+    match discover::explain(&root, &target, &opts) {
+        discover::Explanation::Included => println!("included"),
+        discover::Explanation::Excluded(reason) => println!("excluded: {reason}"),
     }
     Ok(())
 }

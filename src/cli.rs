@@ -180,6 +180,8 @@ pub enum Command {
     Config(ConfigArgs),
     /// Save, list, inspect, run, or delete a saved named query.
     Query(QueryArgs),
+    /// Report whether a file would be discovered, and if not, why.
+    Explain(ExplainArgs),
     /// Print a shell completion script to stdout.
     Completions(CompletionsArgs),
 }
@@ -277,6 +279,24 @@ pub struct InitArgs {
     pub ttl: u64,
 
     /// Walk flags shared with query mode.
+    #[command(flatten)]
+    pub walk: WalkFlags,
+}
+
+/// Arguments for `querymatter explain <PATH>`.
+///
+/// `PATH` is the only positional — unlike query mode and `init`, `explain`
+/// has no `[DIRS]` to root the walk at, since clap cannot parse a top-level
+/// positional ahead of a subcommand name (`querymatter <dir> explain <path>`
+/// fails to parse `<dir>` as `Cli::dirs`). `run_explain` resolves the scan
+/// root itself instead — see its doc comment.
+#[derive(Debug, Args)]
+pub struct ExplainArgs {
+    /// The file to explain.
+    pub path: PathBuf,
+
+    /// Walk flags shared with query mode, so `--ext`/`--hidden`/`--exclude`/
+    /// etc. affect the explanation the same way they'd affect a real query.
     #[command(flatten)]
     pub walk: WalkFlags,
 }
@@ -701,6 +721,29 @@ mod tests {
                 other => panic!("expected Delete, got {other:?}"),
             },
             other => panic!("expected a Query subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explain_subcommand_parses_path_and_walk_flags() {
+        let cli = parse(&[
+            "querymatter",
+            "explain",
+            "notes/a.md",
+            "--hidden",
+            "--ext",
+            "md,mdx",
+        ]);
+        match cli.command {
+            Some(Command::Explain(args)) => {
+                assert_eq!(args.path, Path::new("notes/a.md"));
+                assert!(args.walk.hidden);
+                assert_eq!(
+                    args.walk.ext,
+                    Some(vec!["md".to_string(), "mdx".to_string()])
+                );
+            }
+            other => panic!("expected an Explain subcommand, got {other:?}"),
         }
     }
 

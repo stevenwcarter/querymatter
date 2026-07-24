@@ -1917,3 +1917,149 @@ fn malformed_queries_file_exits_non_zero_naming_the_path() {
         .failure()
         .stderr(predicates::str::contains("queries.toml"));
 }
+
+/// Builds a tree with one file each layer of `explain` can attribute an
+/// exclusion to: a plain included markdown file, a wrong-extension file, and
+/// a file inside a hidden directory.
+fn explain_tree() -> TempDir {
+    let td = TempDir::new().unwrap();
+    let w = |rel: &str, body: &str| {
+        let p = td.path().join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, body).unwrap();
+    };
+    w("keep.md", "---\nstatus: x\n---\n");
+    w("todo.txt", "x");
+    w(".draft/h.md", "---\nstatus: y\n---\n");
+    td
+}
+
+#[test]
+fn explain_reports_included_for_a_discovered_file() {
+    let td = explain_tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .current_dir(td.path())
+        .args(["explain", "keep.md"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("included"));
+}
+
+#[test]
+fn explain_attributes_wrong_extension() {
+    let td = explain_tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .current_dir(td.path())
+        .args(["explain", "todo.txt"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "excluded: extension 'txt' not in --ext (md, markdown)",
+        ));
+}
+
+#[test]
+fn explain_attributes_a_hidden_directory() {
+    let td = explain_tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .current_dir(td.path())
+        .args(["explain", ".draft/h.md"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "excluded: hidden directory '.draft' (pass --hidden to include)",
+        ));
+}
+
+/// The shared `WalkFlags` (here `--hidden`) must reach `explain` through its
+/// `#[command(flatten)]`, exactly like `init`'s — a hidden file explain would
+/// otherwise always report excluded regardless of the flag.
+#[test]
+fn explain_hidden_flag_flips_a_hidden_directory_file_to_included() {
+    let td = explain_tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .current_dir(td.path())
+        .args(["explain", ".draft/h.md", "--hidden"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("included"));
+}
+
+#[test]
+fn explain_attributes_an_exclude_glob_flag() {
+    let td = explain_tree();
+    fs::create_dir_all(td.path().join("templates")).unwrap();
+    fs::write(td.path().join("templates/t.md"), "---\nstatus: x\n---\n").unwrap();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .current_dir(td.path())
+        .args(["explain", "templates/t.md", "--exclude", "**/templates/**"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "excluded: matches --exclude glob '**/templates/**'",
+        ));
+}
+
+#[test]
+fn explain_nonexistent_path_is_a_clean_error() {
+    let td = explain_tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .current_dir(td.path())
+        .args(["explain", "no-such-file.md"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("no-such-file.md"));
+}
+
+/// A path outside the implicit scan root (the current directory) is a clean
+/// error rather than a silently wrong verdict.
+#[test]
+fn explain_path_outside_cwd_is_a_clean_error() {
+    let td = explain_tree();
+    let outside = TempDir::new().unwrap();
+    fs::write(outside.path().join("elsewhere.md"), "---\nstatus: x\n---\n").unwrap();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .current_dir(td.path())
+        .args(["explain"])
+        .arg(outside.path().join("elsewhere.md"))
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("outside"));
+}
+
+/// Property: `explain`'s verdict must match `discover()`'s actual membership
+/// for every file in a small tree exercising every filter layer at once.
+#[test]
+fn explain_verdict_matches_discover_membership_end_to_end() {
+    let td = explain_tree();
+    fs::create_dir_all(td.path().join("templates")).unwrap();
+    fs::write(td.path().join("templates/t.md"), "---\nstatus: x\n---\n").unwrap();
+    let home = TempDir::new().unwrap();
+
+    let cases = [
+        ("keep.md", true),
+        ("todo.txt", false),
+        (".draft/h.md", false),
+        ("templates/t.md", false),
+    ];
+    for (rel, included) in cases {
+        let assert = qm(home.path())
+            .current_dir(td.path())
+            .args(["explain", rel, "--exclude", "**/templates/**"])
+            .assert()
+            .success();
+        let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+        if included {
+            assert!(out.contains("included"), "{rel}: got {out:?}");
+        } else {
+            assert!(out.contains("excluded:"), "{rel}: got {out:?}");
+        }
+    }
+}
