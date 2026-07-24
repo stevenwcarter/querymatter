@@ -11,10 +11,10 @@
 //! `WHERE title = 'imported from "x"'`) is passed through the real parser
 //! untouched and never corrupted.
 //!
-//! Anything outside the supported subset — joins, subqueries, `HAVING`,
-//! whole-query `DISTINCT`, set operations, multiple statements, any clause that
-//! sqlparser parses but querymatter does not translate, or any node kind the
-//! lowering does not understand — is rejected with a [`ParseError`] rather than
+//! Anything outside the supported subset — joins, subqueries, whole-query
+//! `DISTINCT`, set operations, multiple statements, any clause that sqlparser
+//! parses but querymatter does not translate, or any node kind the lowering
+//! does not understand — is rejected with a [`ParseError`] rather than
 //! silently ignored.
 
 use sqlparser::ast as sql;
@@ -23,8 +23,8 @@ use sqlparser::parser::Parser;
 
 use crate::model::FileAttr;
 use crate::query::ast::{
-    Aggregate, BinOp, CmpOp, ColRef, Expr, Literal, OrderKey, OrderTarget, Predicate, Query,
-    ScalarFn, SelectExpr, SelectItem,
+    Aggregate, BinOp, CmpOp, ColRef, Expr, Having, HavingLeaf, Literal, OrderKey, OrderTarget,
+    Predicate, Query, ScalarFn, SelectExpr, SelectItem,
 };
 
 /// An error produced while parsing or lowering a query.
@@ -90,6 +90,7 @@ fn lower_query(query: &sql::Query) -> Result<Query, ParseError> {
 
     let filter = select.selection.as_ref().map(lower_predicate).transpose()?;
     let group_by = lower_group_by(&select.group_by)?;
+    let having = lower_having(select.having.as_ref(), &group_by)?;
     let order_by = lower_order_by(query.order_by.as_ref(), &aliases)?;
     let (limit, offset) = lower_limit(query.limit_clause.as_ref())?;
 
@@ -98,6 +99,7 @@ fn lower_query(query: &sql::Query) -> Result<Query, ParseError> {
         from_glob,
         filter,
         group_by,
+        having,
         order_by,
         limit,
         offset,
@@ -128,7 +130,6 @@ fn reject_unsupported_query_clauses(query: &sql::Query) -> Result<(), ParseError
 fn reject_unsupported_select_clauses(select: &sql::Select) -> Result<(), ParseError> {
     let clauses = [
         ("DISTINCT on the whole SELECT", select.distinct.is_some()),
-        ("HAVING clause", select.having.is_some()),
         ("SELECT INTO", select.into.is_some()),
         ("PREWHERE clause", select.prewhere.is_some()),
         ("QUALIFY clause", select.qualify.is_some()),
@@ -595,32 +596,42 @@ fn lower_binary(
     right: &sql::Expr,
 ) -> Result<Predicate, ParseError> {
     use sql::BinaryOperator as B;
-    let cmp = match op {
-        B::And => {
-            return Ok(Predicate::And(
-                Box::new(lower_predicate(left)?),
-                Box::new(lower_predicate(right)?),
-            ));
+    match op {
+        B::And => Ok(Predicate::And(
+            Box::new(lower_predicate(left)?),
+            Box::new(lower_predicate(right)?),
+        )),
+        B::Or => Ok(Predicate::Or(
+            Box::new(lower_predicate(left)?),
+            Box::new(lower_predicate(right)?),
+        )),
+        _ => {
+            let cmp =
+                cmp_op_from_binary(op).ok_or_else(|| unsupported(format!("operator `{op}`")))?;
+            Ok(Predicate::Compare(
+                lower_expr(left)?,
+                cmp,
+                lower_expr(right)?,
+            ))
         }
-        B::Or => {
-            return Ok(Predicate::Or(
-                Box::new(lower_predicate(left)?),
-                Box::new(lower_predicate(right)?),
-            ));
-        }
-        B::Eq => CmpOp::Eq,
-        B::NotEq => CmpOp::Ne,
-        B::Lt => CmpOp::Lt,
-        B::LtEq => CmpOp::Le,
-        B::Gt => CmpOp::Gt,
-        B::GtEq => CmpOp::Ge,
-        other => return Err(unsupported(format!("operator `{other}`"))),
-    };
-    Ok(Predicate::Compare(
-        lower_expr(left)?,
-        cmp,
-        lower_expr(right)?,
-    ))
+    }
+}
+
+/// Maps a `sqlparser` comparison operator to a [`CmpOp`], or `None` for
+/// anything else (a boolean connective, or an operator this subset doesn't
+/// support). Shared between [`lower_binary`] (`WHERE`) and
+/// [`lower_having_binary`] (`HAVING`).
+fn cmp_op_from_binary(op: &sql::BinaryOperator) -> Option<CmpOp> {
+    use sql::BinaryOperator as B;
+    match op {
+        B::Eq => Some(CmpOp::Eq),
+        B::NotEq => Some(CmpOp::Ne),
+        B::Lt => Some(CmpOp::Lt),
+        B::LtEq => Some(CmpOp::Le),
+        B::Gt => Some(CmpOp::Gt),
+        B::GtEq => Some(CmpOp::Ge),
+        _ => None,
+    }
 }
 
 /// Lowers a literal expression (a value, or a signed numeric literal).
@@ -695,6 +706,128 @@ fn lower_group_by(group_by: &sql::GroupByExpr) -> Result<Vec<ColRef>, ParseError
             exprs.iter().map(lower_col_ref).collect()
         }
         sql::GroupByExpr::All(_) => Err(unsupported("GROUP BY ALL")),
+    }
+}
+
+/// Lowers a `HAVING` clause into a [`Having`] tree, or `None` when the query
+/// has no `HAVING`. `HAVING` on an ungrouped query (`group_by` empty) is
+/// rejected — it only makes sense to filter on group aggregates once there
+/// are groups.
+fn lower_having(
+    having: Option<&sql::Expr>,
+    group_by: &[ColRef],
+) -> Result<Option<Having>, ParseError> {
+    let Some(expr) = having else {
+        return Ok(None);
+    };
+    if group_by.is_empty() {
+        return Err(unsupported("HAVING requires GROUP BY"));
+    }
+    Ok(Some(lower_having_expr(expr, group_by)?))
+}
+
+/// Lowers one `HAVING` expression node: a boolean connective/negation
+/// recurses, and a comparison lowers via [`lower_having_binary`].
+fn lower_having_expr(expr: &sql::Expr, group_by: &[ColRef]) -> Result<Having, ParseError> {
+    match expr {
+        sql::Expr::BinaryOp { left, op, right } => lower_having_binary(left, op, right, group_by),
+        sql::Expr::Nested(inner) => lower_having_expr(inner, group_by),
+        sql::Expr::UnaryOp {
+            op: sql::UnaryOperator::Not,
+            expr,
+        } => Ok(Having::Not(Box::new(lower_having_expr(expr, group_by)?))),
+        _ => Err(unsupported("this HAVING expression")),
+    }
+}
+
+/// Lowers a `HAVING` binary operation: `AND`/`OR` recurse, anything else must
+/// be a comparison between a [`HavingLeaf`] and a literal (see
+/// [`lower_having_compare`]).
+fn lower_having_binary(
+    left: &sql::Expr,
+    op: &sql::BinaryOperator,
+    right: &sql::Expr,
+    group_by: &[ColRef],
+) -> Result<Having, ParseError> {
+    use sql::BinaryOperator as B;
+    match op {
+        B::And => Ok(Having::And(
+            Box::new(lower_having_expr(left, group_by)?),
+            Box::new(lower_having_expr(right, group_by)?),
+        )),
+        B::Or => Ok(Having::Or(
+            Box::new(lower_having_expr(left, group_by)?),
+            Box::new(lower_having_expr(right, group_by)?),
+        )),
+        _ => {
+            let cmp =
+                cmp_op_from_binary(op).ok_or_else(|| unsupported(format!("operator `{op}`")))?;
+            lower_having_compare(left, cmp, right, group_by)
+        }
+    }
+}
+
+/// Lowers a `HAVING` comparison. This subset only supports a [`HavingLeaf`]
+/// (an aggregate call or a grouping-key column) compared against a plain
+/// literal — never aggregate-vs-aggregate or an arbitrary expression. The
+/// leaf may appear on either side (`count(*) > 1` or `1 < count(*)`); when
+/// it's on the right, the operator is flipped so `Having::Compare` always
+/// reads `leaf op literal`.
+fn lower_having_compare(
+    left: &sql::Expr,
+    cmp: CmpOp,
+    right: &sql::Expr,
+    group_by: &[ColRef],
+) -> Result<Having, ParseError> {
+    if let Some(leaf) = try_having_leaf(left, group_by)? {
+        return Ok(Having::Compare(leaf, cmp, lower_literal(right)?));
+    }
+    if let Some(leaf) = try_having_leaf(right, group_by)? {
+        return Ok(Having::Compare(
+            leaf,
+            flip_cmp_op(cmp),
+            lower_literal(left)?,
+        ));
+    }
+    Err(unsupported("this HAVING comparison"))
+}
+
+/// Attempts to lower `expr` as a [`HavingLeaf`]: `Ok(None)` when `expr` isn't
+/// shaped like a leaf at all (so the caller should try the other side of the
+/// comparison), `Err` when it IS leaf-shaped but fails to lower — an unknown
+/// function, or a column that isn't one of `group_by`'s keys — which is a
+/// hard error rather than a fallback.
+fn try_having_leaf(
+    expr: &sql::Expr,
+    group_by: &[ColRef],
+) -> Result<Option<HavingLeaf>, ParseError> {
+    match expr {
+        sql::Expr::Function(func) => Ok(Some(HavingLeaf::Agg(lower_aggregate(func)?))),
+        sql::Expr::Identifier(_) | sql::Expr::CompoundIdentifier(_) => {
+            let col = lower_col_ref(expr)?;
+            if group_by.contains(&col) {
+                Ok(Some(HavingLeaf::Group(col)))
+            } else {
+                Err(unsupported(format!(
+                    "HAVING column `{}` must be a GROUP BY key",
+                    col.label()
+                )))
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Reverses a comparison operator (for a `HAVING` leaf found on the
+/// right-hand side, e.g. `1 < count(*)` becomes `count(*) > 1`).
+fn flip_cmp_op(op: CmpOp) -> CmpOp {
+    match op {
+        CmpOp::Eq => CmpOp::Eq,
+        CmpOp::Ne => CmpOp::Ne,
+        CmpOp::Lt => CmpOp::Gt,
+        CmpOp::Le => CmpOp::Ge,
+        CmpOp::Gt => CmpOp::Lt,
+        CmpOp::Ge => CmpOp::Le,
     }
 }
 
@@ -1190,9 +1323,69 @@ mod tests {
     }
 
     #[test]
-    fn rejects_having() {
+    fn having_lowers_to_compare_of_agg_and_literal() {
+        let q = parse("SELECT status, count(*) AS n GROUP BY status HAVING count(*) > 1").unwrap();
+        assert_eq!(
+            q.having,
+            Some(Having::Compare(
+                HavingLeaf::Agg(Aggregate::CountStar),
+                CmpOp::Gt,
+                Literal::Int(1)
+            ))
+        );
+    }
+    #[test]
+    fn having_leaf_may_be_a_grouping_key_column() {
+        let q = parse("SELECT status GROUP BY status HAVING status = 'draft'").unwrap();
+        assert_eq!(
+            q.having,
+            Some(Having::Compare(
+                HavingLeaf::Group(ColRef::Field("status".into())),
+                CmpOp::Eq,
+                Literal::Str("draft".into())
+            ))
+        );
+    }
+    #[test]
+    fn having_leaf_on_right_flips_operator() {
+        let q = parse("SELECT status GROUP BY status HAVING 1 < count(*)").unwrap();
+        assert_eq!(
+            q.having,
+            Some(Having::Compare(
+                HavingLeaf::Agg(Aggregate::CountStar),
+                CmpOp::Gt,
+                Literal::Int(1)
+            ))
+        );
+    }
+    #[test]
+    fn having_supports_and_or_not() {
+        let q = parse(
+            "SELECT status GROUP BY status HAVING count(*) > 1 AND NOT (status = 'draft' OR status = 'x')",
+        )
+        .unwrap();
+        assert!(matches!(q.having, Some(Having::And(_, _))));
+    }
+    #[test]
+    fn having_non_group_key_column_is_unsupported() {
+        // `prd` isn't a GROUP BY key, so referencing it in HAVING is as
+        // invalid as selecting it would be under GROUP BY.
         assert!(matches!(
-            parse("SELECT status GROUP BY status HAVING count(*) > 1"),
+            parse("SELECT status GROUP BY status HAVING prd = '010'"),
+            Err(ParseError::Unsupported(_))
+        ));
+    }
+    #[test]
+    fn having_without_group_by_is_unsupported() {
+        assert!(matches!(
+            parse("SELECT status HAVING count(*) > 1"),
+            Err(ParseError::Unsupported(_))
+        ));
+    }
+    #[test]
+    fn having_aggregate_vs_aggregate_is_unsupported() {
+        assert!(matches!(
+            parse("SELECT status GROUP BY status HAVING count(*) > sum(prd)"),
             Err(ParseError::Unsupported(_))
         ));
     }

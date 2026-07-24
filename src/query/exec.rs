@@ -1,5 +1,5 @@
-//! The query executor: filter / project / order / limit, plus `GROUP BY` and
-//! aggregate functions.
+//! The query executor: filter / project / order / limit, plus `GROUP BY`,
+//! aggregate functions, and `HAVING` group filtering.
 //!
 //! [`execute`] evaluates a parsed [`Query`] against a set of [`Record`]s and
 //! produces a [`ResultTable`]. It dispatches between two pipelines: the
@@ -18,8 +18,8 @@ use regex::Regex;
 use crate::model::{FileAttr, Record, Value, compare_values};
 use crate::query::ResultTable;
 use crate::query::ast::{
-    Aggregate, BinOp, CmpOp, ColRef, Expr, Literal, OrderKey, OrderTarget, Predicate, Query,
-    ScalarFn, SelectExpr, SelectItem,
+    Aggregate, BinOp, CmpOp, ColRef, Expr, Having, HavingLeaf, Literal, OrderKey, OrderTarget,
+    Predicate, Query, ScalarFn, SelectExpr, SelectItem,
 };
 
 /// An error that can occur while executing a parsed [`Query`].
@@ -127,13 +127,15 @@ fn execute_ungrouped<'a>(
     Ok(ResultTable { headers, rows })
 }
 
-/// The filter / group / aggregate / order / limit pipeline for a query with
-/// a `GROUP BY` clause and/or aggregate `SELECT` items.
+/// The filter / group / aggregate / `HAVING` / order / limit pipeline for a
+/// query with a `GROUP BY` clause and/or aggregate `SELECT` items.
 ///
 /// With aggregates but no `GROUP BY`, every filtered row is treated as one
 /// group (see [`group_rows`]). Group order is made deterministic by sorting
 /// on the key tuple before `ORDER BY` is applied, so results are stable even
-/// when the query has no explicit ordering.
+/// when the query has no explicit ordering. `HAVING`, when present, drops
+/// groups after their `SELECT` row is projected but before `ORDER BY` /
+/// `LIMIT` / `OFFSET` run — see [`eval_having`].
 fn execute_grouped<'a>(
     q: &Query,
     records: impl Iterator<Item = &'a Record>,
@@ -150,8 +152,15 @@ fn execute_grouped<'a>(
         .into_iter()
         .map(|group| {
             let row = project_group(&group, &items);
-            (group.key, row)
+            (group, row)
         })
+        .filter(|(group, _)| match &q.having {
+            // SQL 3VL, same rule as WHERE: a group is kept only when HAVING
+            // is definitely true; unknown/false both drop it.
+            Some(having) => eval_having(having, group, &q.group_by) == Some(true),
+            None => true,
+        })
+        .map(|(group, row)| (group.key, row))
         .collect();
 
     let order = resolve_group_order_targets(&q.order_by, &headers, &q.group_by)?;
@@ -338,6 +347,48 @@ fn compute_aggregate(agg: &Aggregate, rows: &[&Record]) -> Value {
                 .collect::<Vec<_>>()
                 .join(", "),
         ),
+    }
+}
+
+/// Evaluates a `HAVING` predicate tree against one group under SQL
+/// three-valued logic (3VL), mirroring [`eval_predicate`]'s handling for
+/// `WHERE`. `group_by` is `q.group_by`, needed to resolve a
+/// [`HavingLeaf::Group`] leaf's value from the group's key tuple by
+/// position — see [`eval_having_leaf`].
+fn eval_having(having: &Having, group: &Group<'_>, group_by: &[ColRef]) -> Option<bool> {
+    match having {
+        Having::Compare(leaf, op, lit) => {
+            let value = eval_having_leaf(leaf, group, group_by);
+            eval_compare(&value, op, &literal_value(lit))
+        }
+        Having::And(a, b) => three_valued_and(
+            eval_having(a, group, group_by),
+            eval_having(b, group, group_by),
+        ),
+        Having::Or(a, b) => three_valued_or(
+            eval_having(a, group, group_by),
+            eval_having(b, group, group_by),
+        ),
+        Having::Not(inner) => three_valued_not(eval_having(inner, group, group_by)),
+    }
+}
+
+/// Resolves a `HAVING` comparison leaf's value: an aggregate is computed
+/// fresh from the group's rows (it need not appear in `SELECT` — standard
+/// SQL allows `HAVING` to reference an unselected aggregate); a grouping-key
+/// leaf is read from the group's key tuple, at the position `col` occupies in
+/// `group_by`. `parse::lower_having` guarantees every [`HavingLeaf::Group`]
+/// is one of `group_by`'s keys, so the position lookup always succeeds for a
+/// query built by the parser; `Value::Null` is a defensive fallback only
+/// reachable from a hand-built AST that bypasses that guarantee.
+fn eval_having_leaf(leaf: &HavingLeaf, group: &Group<'_>, group_by: &[ColRef]) -> Value {
+    match leaf {
+        HavingLeaf::Agg(agg) => compute_aggregate(agg, &group.rows),
+        HavingLeaf::Group(col) => group_by
+            .iter()
+            .position(|g| g == col)
+            .map(|idx| group.key[idx].clone())
+            .unwrap_or(Value::Null),
     }
 }
 
@@ -1660,5 +1711,83 @@ mod agg_tests {
         let q = parse("SELECT count(*) AS n WHERE status = 'nope'").unwrap();
         let t = execute(&q, recs().iter()).unwrap();
         assert_eq!(t.rows, vec![vec![Value::Int(0)]]);
+    }
+
+    #[test]
+    fn having_filters_groups() {
+        // status: draft x1, synced x2 (see `recs()`); only the synced group
+        // clears `count(*) > 1`.
+        let q = parse(
+            "SELECT status, count(*) AS n GROUP BY status HAVING count(*) > 1 ORDER BY status",
+        )
+        .unwrap();
+        let t = execute(&q, recs().iter()).unwrap();
+        assert_eq!(
+            t.rows,
+            vec![vec![Value::Str("synced".into()), Value::Int(2)]]
+        );
+    }
+    #[test]
+    fn having_can_reference_aggregate_not_selected() {
+        // `count(*)` never appears in SELECT, only in HAVING — standard SQL
+        // still allows filtering on an aggregate that isn't projected.
+        let q = parse("SELECT status GROUP BY status HAVING count(*) > 1").unwrap();
+        let t = execute(&q, recs().iter()).unwrap();
+        assert_eq!(t.rows, vec![vec![Value::Str("synced".into())]]);
+    }
+    #[test]
+    fn having_can_reference_a_grouping_key() {
+        let q =
+            parse("SELECT status, count(*) AS n GROUP BY status HAVING status = 'draft'").unwrap();
+        let t = execute(&q, recs().iter()).unwrap();
+        assert_eq!(
+            t.rows,
+            vec![vec![Value::Str("draft".into()), Value::Int(1)]]
+        );
+    }
+    #[test]
+    fn having_and_or_not_combination() {
+        // Both groups pass `count(*) >= 1`; only `draft` also passes
+        // `NOT (count(*) > 1)` — pins that the boolean connectives evaluate
+        // per-group exactly like WHERE's.
+        let q = parse(
+            "SELECT status, count(*) AS n GROUP BY status HAVING count(*) >= 1 AND NOT (count(*) > 1) ORDER BY status",
+        )
+        .unwrap();
+        let t = execute(&q, recs().iter()).unwrap();
+        assert_eq!(
+            t.rows,
+            vec![vec![Value::Str("draft".into()), Value::Int(1)]]
+        );
+    }
+    #[test]
+    fn having_unknown_drops_the_group() {
+        // `avg(n)` over a group with no numeric `n` values is `Value::Null`;
+        // comparing NULL against a literal is unknown under 3VL, which drops
+        // the group exactly like an unknown WHERE would drop a row — not a
+        // hard non-match.
+        let rows = [rec_n("s/a.md", "draft", Value::Str("n/a".into()))];
+        let q = parse("SELECT status GROUP BY status HAVING avg(n) > 1").unwrap();
+        let t = execute(&q, rows.iter()).unwrap();
+        assert!(t.rows.is_empty());
+    }
+    #[test]
+    fn having_applies_before_order_and_limit() {
+        // Three status groups; HAVING keeps only the two with more than one
+        // row, and ORDER BY / LIMIT then apply to that already-filtered set
+        // (a LIMIT 1 that counted the dropped group would return "y", not "x").
+        let rows = [
+            rec_n("s/a.md", "x", Value::Int(1)),
+            rec_n("s/b.md", "x", Value::Int(1)),
+            rec_n("s/c.md", "y", Value::Int(1)),
+            rec_n("s/d.md", "y", Value::Int(1)),
+            rec_n("s/e.md", "z", Value::Int(1)),
+        ];
+        let q = parse(
+            "SELECT status, count(*) AS n GROUP BY status HAVING count(*) > 1 ORDER BY status LIMIT 1",
+        )
+        .unwrap();
+        let t = execute(&q, rows.iter()).unwrap();
+        assert_eq!(t.rows, vec![vec![Value::Str("x".into()), Value::Int(2)]]);
     }
 }

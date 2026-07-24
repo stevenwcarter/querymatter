@@ -24,6 +24,10 @@ pub struct Query {
     pub filter: Option<Predicate>,
     /// `GROUP BY` keys, in order; empty when the query is not grouped.
     pub group_by: Vec<ColRef>,
+    /// The `HAVING` predicate over group aggregates, if any. Only meaningful
+    /// alongside a non-empty `group_by` — the parser rejects `HAVING` on an
+    /// ungrouped query rather than leaving this representable.
+    pub having: Option<Having>,
     /// `ORDER BY` keys, in order; empty when the query is unordered.
     pub order_by: Vec<OrderKey>,
     /// `LIMIT` row cap, if given.
@@ -164,6 +168,38 @@ pub enum Predicate {
     Not(Box<Predicate>),
 }
 
+/// A `HAVING` predicate tree: group-level filtering, evaluated once per group
+/// after its aggregates (and any grouping-key projection) are computed.
+///
+/// Structurally this mirrors [`Predicate`]'s boolean connectives, but its
+/// only leaf is a comparison between a [`HavingLeaf`] and a plain [`Literal`]
+/// (e.g. `count(*) > 1`) — `HAVING` in this subset never compares two
+/// aggregates, nor an arbitrary expression; see [`HavingLeaf`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum Having {
+    /// A comparison of a group aggregate or grouping key against a literal.
+    Compare(HavingLeaf, CmpOp, Literal),
+    /// Logical conjunction.
+    And(Box<Having>, Box<Having>),
+    /// Logical disjunction.
+    Or(Box<Having>, Box<Having>),
+    /// Logical negation.
+    Not(Box<Having>),
+}
+
+/// The left-hand side of a [`Having`] comparison: either one of the query's
+/// `GROUP BY` keys (resolved from the group's key tuple) or an aggregate
+/// function computed over the group's rows. The aggregate need not appear in
+/// the `SELECT` list — standard SQL allows `HAVING` to reference an aggregate
+/// that isn't projected.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HavingLeaf {
+    /// A `GROUP BY` key column.
+    Group(ColRef),
+    /// An aggregate over the group's rows.
+    Agg(Aggregate),
+}
+
 /// A comparison operator.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CmpOp {
@@ -245,8 +281,8 @@ impl SelectExpr {
 
 impl ColRef {
     /// The textual label for this column (`status`, `file.name`, …), used in
-    /// default headers and aggregate rendering.
-    fn label(&self) -> String {
+    /// default headers, aggregate rendering, and `HAVING` error messages.
+    pub(crate) fn label(&self) -> String {
         match self {
             ColRef::Field(name) => name.clone(),
             ColRef::File(attr) => file_attr_label(*attr).to_string(),
