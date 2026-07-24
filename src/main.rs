@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use clap::{ArgMatches, CommandFactory, FromArgMatches};
 
-use crate::cli::{Cli, Command, InitArgs};
+use crate::cli::{Cli, Command, ConfigAction, InitArgs};
 use crate::config::Config;
 use crate::session::{Session, split_statements};
 use crate::settings::Settings;
@@ -53,6 +53,7 @@ fn main() -> anyhow::Result<()> {
                 .expect("Command::Init parsed implies the init subcommand matched");
             run_init(args, &config, sub_matches)
         }
+        Some(Command::Config(args)) => run_config(&args.action, &cli, &config, &matches),
         None => run_query(&cli, &config, &matches),
     }
 }
@@ -135,6 +136,64 @@ fn prompt_add_gitignore(root: &Path) -> anyhow::Result<()> {
             "querymatter: added .querymatter/ to {}",
             root.join(".gitignore").display()
         );
+    }
+    Ok(())
+}
+
+/// Runs a `querymatter config` action.
+///
+/// Output discipline: the data (`list` rows, `get`'s value, `path`) goes to
+/// stdout so it can be piped; `set`/`unset` confirmations go to stderr,
+/// matching `init`'s no-stdout convention.
+fn run_config(
+    action: &ConfigAction,
+    cli: &Cli,
+    config: &Config,
+    matches: &ArgMatches,
+) -> anyhow::Result<()> {
+    match action {
+        ConfigAction::List => {
+            println!("{}", Settings::resolve(cli, config, matches).rows());
+        }
+        ConfigAction::Get { key } => {
+            let settings = Settings::resolve(cli, config, matches);
+            println!("{}", settings.value_of(*key));
+            println!("values: {}", key.allowed());
+        }
+        ConfigAction::Set { key, value } => {
+            let mut updated = config.clone();
+            config::set(&mut updated, *key, value)?;
+            let path = config::save(&updated)?;
+            eprintln!(
+                "querymatter: set {} = {value} in {}",
+                key.as_str(),
+                path.display()
+            );
+        }
+        ConfigAction::Unset { key } => {
+            let mut updated = config.clone();
+            let was_present = config::get(config, *key).is_some();
+            config::unset(&mut updated, *key);
+            let path = config::save(&updated)?;
+            if was_present {
+                eprintln!(
+                    "querymatter: removed {} from {}",
+                    key.as_str(),
+                    path.display()
+                );
+            } else {
+                eprintln!(
+                    "querymatter: {} was not set in {}",
+                    key.as_str(),
+                    path.display()
+                );
+            }
+        }
+        ConfigAction::Path => {
+            let path = config::config_path()
+                .context("cannot determine a config directory for this user")?;
+            println!("{}", path.display());
+        }
     }
     Ok(())
 }

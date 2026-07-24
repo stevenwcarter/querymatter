@@ -19,6 +19,7 @@ use clap::{Args, Parser, Subcommand};
 use globset::Glob;
 
 use crate::cache::Freshness;
+use crate::config::ConfigKey;
 use crate::render::{Format, TableStyle};
 
 /// The six flags that shape a directory walk, shared verbatim between query
@@ -158,6 +159,45 @@ pub struct Cli {
 pub enum Command {
     /// Build a `.querymatter` cache over a directory tree for faster queries.
     Init(InitArgs),
+    /// Show or change the persistent configuration.
+    Config(ConfigArgs),
+}
+
+/// Arguments for `querymatter config <ACTION>`.
+#[derive(Debug, Args)]
+pub struct ConfigArgs {
+    /// What to do with the configuration.
+    #[command(subcommand)]
+    pub action: ConfigAction,
+}
+
+/// The `querymatter config` actions.
+#[derive(Debug, Subcommand)]
+pub enum ConfigAction {
+    /// List every setting, its value, and where that value came from.
+    List,
+    /// Show one setting's value and the values it accepts.
+    Get {
+        /// The setting to show.
+        #[arg(value_enum)]
+        key: ConfigKey,
+    },
+    /// Set one setting in the config file.
+    Set {
+        /// The setting to change.
+        #[arg(value_enum)]
+        key: ConfigKey,
+        /// The new value; a comma-separated list for `ext` and `exclude`.
+        value: String,
+    },
+    /// Remove one setting from the config file.
+    Unset {
+        /// The setting to remove.
+        #[arg(value_enum)]
+        key: ConfigKey,
+    },
+    /// Print the config file's path, whether or not it exists.
+    Path,
 }
 
 /// Arguments for `querymatter init [DIR]`.
@@ -252,8 +292,9 @@ impl Cli {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command};
+    use super::{Cli, Command, ConfigAction};
     use crate::cache::Freshness;
+    use crate::config::ConfigKey;
     use crate::render::{Format, TableStyle};
     use clap::{CommandFactory, FromArgMatches};
     use std::fs;
@@ -499,5 +540,50 @@ mod tests {
     fn format_flag_accepts_markdown_alias() {
         let cli = parse(&["querymatter", "--format", "markdown"]);
         assert_eq!(cli.format, Some(Format::Md));
+    }
+
+    #[test]
+    fn config_list_parses() {
+        match parse(&["querymatter", "config", "list"]).command {
+            Some(Command::Config(args)) => assert!(matches!(args.action, ConfigAction::List)),
+            other => panic!("expected a Config subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_set_parses_key_and_value() {
+        match parse(&["querymatter", "config", "set", "table_style", "unicode"]).command {
+            Some(Command::Config(args)) => match args.action {
+                ConfigAction::Set { key, value } => {
+                    assert_eq!(key, ConfigKey::TableStyle);
+                    assert_eq!(value, "unicode");
+                }
+                other => panic!("expected Set, got {other:?}"),
+            },
+            other => panic!("expected a Config subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_get_and_unset_and_path_parse() {
+        assert!(matches!(
+            parse(&["querymatter", "config", "get", "format"]).command,
+            Some(Command::Config(_))
+        ));
+        assert!(matches!(
+            parse(&["querymatter", "config", "unset", "hidden"]).command,
+            Some(Command::Config(_))
+        ));
+        assert!(matches!(
+            parse(&["querymatter", "config", "path"]).command,
+            Some(Command::Config(_))
+        ));
+    }
+
+    /// Keys are spelled snake_case, matching the TOML file exactly.
+    #[test]
+    fn config_key_is_rejected_when_misspelled() {
+        assert!(try_parse(&["querymatter", "config", "get", "table-style"]).is_err());
+        assert!(try_parse(&["querymatter", "config", "get", "bogus"]).is_err());
     }
 }

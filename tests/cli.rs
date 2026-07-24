@@ -1055,3 +1055,91 @@ fn unknown_config_key_exits_non_zero_naming_the_key() {
         .failure()
         .stderr(predicates::str::contains("tabel_style"));
 }
+
+#[test]
+fn config_set_then_query_honors_it() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    let mut cmd = Command::cargo_bin("querymatter").unwrap();
+    with_config_home(&mut cmd, home.path())
+        .args(["config", "set", "table_style", "unicode"])
+        .assert()
+        .success();
+    let mut cmd = Command::cargo_bin("querymatter").unwrap();
+    with_config_home(&mut cmd, home.path())
+        .args(["-e", "SELECT status WHERE prd = '010'"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("╭"));
+}
+
+#[test]
+fn config_list_names_the_source_of_each_value() {
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "table_style = \"unicode\"\n");
+    let mut cmd = Command::cargo_bin("querymatter").unwrap();
+    with_config_home(&mut cmd, home.path())
+        .args(["config", "list"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("table_style"))
+        .stdout(predicates::str::contains("unicode"))
+        .stdout(predicates::str::contains("(config)"))
+        .stdout(predicates::str::contains("(default)"));
+}
+
+#[test]
+fn config_get_prints_the_value_and_allowed_values() {
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "table_style = \"unicode\"\n");
+    let mut cmd = Command::cargo_bin("querymatter").unwrap();
+    with_config_home(&mut cmd, home.path())
+        .args(["config", "get", "table_style"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("unicode"))
+        .stdout(predicates::str::contains("ascii"))
+        .stdout(predicates::str::contains("compact"));
+}
+
+/// A rejected value must not touch the file.
+#[test]
+fn config_set_rejects_a_bad_value_and_leaves_the_file_alone() {
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "table_style = \"unicode\"\n");
+    let before = fs::read_to_string(home.path().join("querymatter/config.toml")).unwrap();
+    let mut cmd = Command::cargo_bin("querymatter").unwrap();
+    with_config_home(&mut cmd, home.path())
+        .args(["config", "set", "table_style", "fancy"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("fancy"))
+        .stderr(predicates::str::contains("unicode"));
+    let after = fs::read_to_string(home.path().join("querymatter/config.toml")).unwrap();
+    assert_eq!(before, after, "a rejected set must not rewrite the file");
+}
+
+#[test]
+fn config_unset_removes_the_key() {
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "table_style = \"unicode\"\n");
+    let mut cmd = Command::cargo_bin("querymatter").unwrap();
+    with_config_home(&mut cmd, home.path())
+        .args(["config", "unset", "table_style"])
+        .assert()
+        .success();
+    let text = fs::read_to_string(home.path().join("querymatter/config.toml")).unwrap();
+    assert!(!text.contains("table_style"), "got:\n{text}");
+}
+
+#[test]
+fn config_path_prints_a_path_on_stdout() {
+    let home = TempDir::new().unwrap();
+    let mut cmd = Command::cargo_bin("querymatter").unwrap();
+    with_config_home(&mut cmd, home.path())
+        .args(["config", "path"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("config.toml"));
+}

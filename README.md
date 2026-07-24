@@ -100,7 +100,9 @@ available alongside frontmatter fields:
 | `--table-style <STYLE>` | Border style for `--format table`: `ascii` (default), `unicode`, `compact`, or `plain`. Also settable per-shell with `QUERYMATTER_TABLE_STYLE`; the flag wins. Ignored by `json`/`csv`/`tsv`/`md`. In the REPL this is just the *initial* style — `.style` changes it live. |
 | `--ext <LIST>` | Comma-separated extensions to include. Default `md,markdown`. |
 | `--respect-gitignore` | Honor `.gitignore`/`.ignore` while walking. **Off by default** — see below. |
+| `--no-respect-gitignore` | Ignore `.gitignore`/`.ignore` rules, overriding a config `respect_gitignore = true`. |
 | `--hidden` | Descend into hidden files/directories (e.g. `.git`, `.obsidian`). Off by default. |
+| `--no-hidden` | Do not descend into hidden files/directories, overriding a config `hidden = true`. |
 | `--exclude <GLOB>` | Path glob to skip. Repeatable, e.g. `--exclude '**/templates/**'`. |
 | `--ignore-file <PATH>` | Apply a gitignore-style ignore file. Repeatable; applied in order after the auto-discovered cwd `.querymatterignore`. |
 | `--no-ignore-file` | Skip auto-discovering `.querymatterignore` in the current directory. Explicit `--ignore-file`s still apply. |
@@ -219,6 +221,57 @@ Positional `[DIRS]` restrict a vault query at **directory granularity** — a
 directory that isn't already part of the cached vault matches nothing; it is
 not live-scanned as a fallback. Point `init` at the tree you want covered, or
 pass `--no-cache` for an ad-hoc scan outside it.
+
+## Configuration
+
+Persistent settings live in a single user-global TOML file. `querymatter config
+path` prints its location — on Linux that is
+`~/.config/querymatter/config.toml`.
+
+```toml
+format            = "table"     # table, json, csv, tsv, md
+table_style       = "unicode"   # ascii, unicode, compact, plain
+ext               = ["md", "markdown"]
+respect_gitignore = true
+hidden            = false
+exclude           = ["**/templates/**"]
+```
+
+Every key is optional; an absent key falls through to the next layer. Values
+resolve per key, independently:
+
+```
+flag  >  environment  >  config file  >  built-in default
+```
+
+So a configured `hidden = true` still scans hidden files when you pass no flag,
+and `--no-hidden` turns it back off for one run. `--table-style` additionally
+reads `QUERYMATTER_TABLE_STYLE`, which outranks the file but loses to the flag.
+
+| Command | Meaning |
+| --- | --- |
+| `config list` | Every setting, its resolved value, and which layer supplied it. |
+| `config get <KEY>` | One setting's value, then the values it accepts. |
+| `config set <KEY> <VALUE>` | Write the setting to the config file. `ext` and `exclude` take a comma-separated list. |
+| `config unset <KEY>` | Remove the setting, returning it to the next layer. |
+| `config path` | Print the config file's path, whether or not it exists. |
+
+```console
+$ querymatter config set table_style unicode
+querymatter: set table_style = unicode in ~/.config/querymatter/config.toml
+
+$ querymatter config list
+format             table        (default)
+table_style        unicode      (config)
+ext                md,markdown  (default)
+respect_gitignore  false        (default)
+hidden             false        (default)
+exclude            (none)       (default)
+```
+
+A malformed config file, an unknown key, or an invalid value is a hard error
+naming the file — a typo must not silently do nothing. The file is read once,
+at startup.
 
 ## REPL dot-commands
 

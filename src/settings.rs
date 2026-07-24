@@ -184,6 +184,11 @@ impl Settings {
             .join("\n")
     }
 
+    /// One setting's value, spelled the way `config set` accepts it.
+    pub fn value_of(&self, key: ConfigKey) -> String {
+        self.cells()[&key].0.clone()
+    }
+
     /// Each key's displayed value and source.
     fn cells(&self) -> BTreeMap<ConfigKey, (String, Source)> {
         BTreeMap::from([
