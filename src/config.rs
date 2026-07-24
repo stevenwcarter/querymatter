@@ -39,6 +39,8 @@ pub struct Config {
     pub hidden: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exclude: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lenient: Option<bool>,
 }
 
 /// One configurable setting, named identically on the command line and in the
@@ -60,6 +62,8 @@ pub enum ConfigKey {
     Hidden,
     #[value(name = "exclude")]
     Exclude,
+    #[value(name = "lenient")]
+    Lenient,
 }
 
 /// What a [`ConfigKey`] accepts, for `config get` and for error messages.
@@ -82,13 +86,14 @@ impl fmt::Display for Allowed {
 
 impl ConfigKey {
     /// Every key, in listing order.
-    pub const ALL: [ConfigKey; 6] = [
+    pub const ALL: [ConfigKey; 7] = [
         ConfigKey::Format,
         ConfigKey::TableStyle,
         ConfigKey::Ext,
         ConfigKey::RespectGitignore,
         ConfigKey::Hidden,
         ConfigKey::Exclude,
+        ConfigKey::Lenient,
     ];
 
     /// The key's name, identical on the command line and in the TOML file.
@@ -100,6 +105,7 @@ impl ConfigKey {
             ConfigKey::RespectGitignore => "respect_gitignore",
             ConfigKey::Hidden => "hidden",
             ConfigKey::Exclude => "exclude",
+            ConfigKey::Lenient => "lenient",
         }
     }
 
@@ -108,7 +114,9 @@ impl ConfigKey {
         match self {
             ConfigKey::Format => Allowed::OneOf(&["table", "json", "csv", "tsv", "md"]),
             ConfigKey::TableStyle => Allowed::OneOf(&["ascii", "unicode", "compact", "plain"]),
-            ConfigKey::RespectGitignore | ConfigKey::Hidden => Allowed::OneOf(&["true", "false"]),
+            ConfigKey::RespectGitignore | ConfigKey::Hidden | ConfigKey::Lenient => {
+                Allowed::OneOf(&["true", "false"])
+            }
             ConfigKey::Ext | ConfigKey::Exclude => Allowed::List,
         }
     }
@@ -181,6 +189,7 @@ pub fn set(config: &mut Config, key: ConfigKey, value: &str) -> anyhow::Result<(
         ConfigKey::Hidden => config.hidden = Some(parse_bool(key, value)?),
         ConfigKey::Ext => config.ext = Some(split_list(value)),
         ConfigKey::Exclude => config.exclude = Some(parse_exclude_list(value)?),
+        ConfigKey::Lenient => config.lenient = Some(parse_bool(key, value)?),
     }
     Ok(())
 }
@@ -206,6 +215,7 @@ pub fn unset(config: &mut Config, key: ConfigKey) {
         ConfigKey::Hidden => config.hidden = None,
         ConfigKey::Ext => config.ext = None,
         ConfigKey::Exclude => config.exclude = None,
+        ConfigKey::Lenient => config.lenient = None,
     }
 }
 
@@ -219,6 +229,7 @@ pub fn get(config: &Config, key: ConfigKey) -> Option<String> {
         ConfigKey::Hidden => config.hidden.map(|b| b.to_string()),
         ConfigKey::Ext => config.ext.as_ref().map(|list| list.join(",")),
         ConfigKey::Exclude => config.exclude.as_ref().map(|list| list.join(",")),
+        ConfigKey::Lenient => config.lenient.map(|b| b.to_string()),
     }
 }
 
@@ -499,6 +510,7 @@ mod tests {
             (ConfigKey::RespectGitignore, "true"),
             (ConfigKey::Hidden, "false"),
             (ConfigKey::Exclude, "**/x/**,**/y/**"),
+            (ConfigKey::Lenient, "true"),
         ] {
             set(&mut config, key, value).unwrap();
             assert_eq!(get(&config, key).as_deref(), Some(value), "for {key:?}");

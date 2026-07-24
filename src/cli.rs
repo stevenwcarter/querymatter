@@ -115,6 +115,17 @@ pub struct Cli {
     #[arg(long, value_enum, env = "QUERYMATTER_TABLE_STYLE")]
     pub table_style: Option<TableStyle>,
 
+    /// Disable unknown-column validation, treating an unknown
+    /// SELECT/WHERE/GROUP BY/ORDER BY/HAVING column as NULL instead of
+    /// failing the query with a suggestion.
+    #[arg(long)]
+    pub lenient: bool,
+
+    /// Force strict unknown-column validation, overriding a config `lenient
+    /// = true`.
+    #[arg(long, conflicts_with = "lenient")]
+    pub no_lenient: bool,
+
     /// Flags shared with `querymatter init` that shape the directory walk.
     #[command(flatten)]
     pub walk: WalkFlags,

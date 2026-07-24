@@ -1422,3 +1422,73 @@ fn completions_survive_a_malformed_config() {
         .success()
         .stdout(predicates::str::contains("querymatter"));
 }
+
+/// A typo'd column (`staus` for `status`) must fail the query with a
+/// non-zero exit and a message naming both the offending column and the
+/// nearest real one, in every mode — here, one-shot `-e`.
+#[test]
+fn unknown_column_exits_nonzero_with_suggestion() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["-e", "SELECT staus"])
+        .arg(td.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("staus"))
+        .stderr(predicates::str::contains("status"));
+}
+
+/// `--lenient` restores the pre-validation escape hatch: the same typo'd
+/// query that fails above must succeed (as NULL) under the flag.
+#[test]
+fn lenient_flag_allows_unknown_column() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["-e", "SELECT staus", "--lenient"])
+        .arg(td.path())
+        .assert()
+        .success();
+}
+
+/// The same escape hatch, persisted via `config set lenient true` rather than
+/// passed as a flag each time — pins the config-layer precedence, not just
+/// the flag.
+#[test]
+fn configured_lenient_allows_unknown_column_without_the_flag() {
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "lenient = true\n");
+    let td = tree();
+
+    qm(home.path())
+        .args(["-e", "SELECT staus"])
+        .arg(td.path())
+        .assert()
+        .success();
+}
+
+/// `--no-lenient` overrides a configured `lenient = true` back to strict for
+/// one invocation — the same symmetry `--no-hidden` gives `hidden`.
+#[test]
+fn no_lenient_overrides_configured_lenient() {
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["config", "set", "lenient", "true"])
+        .assert()
+        .success();
+    let td = tree();
+
+    qm(home.path())
+        .args(["-e", "SELECT staus", "--no-lenient"])
+        .arg(td.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("staus"));
+
+    qm(home.path())
+        .args(["-e", "SELECT staus"])
+        .arg(td.path())
+        .assert()
+        .success();
+}

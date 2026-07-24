@@ -182,7 +182,7 @@ impl Session {
     /// the offending SQL as context.
     pub fn run(&self, sql: &str) -> anyhow::Result<ResultTable> {
         let query = query::parse(sql).with_context(|| format!("failed to parse query: {sql}"))?;
-        query::execute(&query, self.store.records())
+        query::execute(&query, self.store.records(), self.settings.lenient.value)
             .with_context(|| format!("failed to execute query: {sql}"))
     }
 

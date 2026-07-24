@@ -68,6 +68,7 @@ pub struct Settings {
     pub respect_gitignore: Resolved<bool>,
     pub hidden: Resolved<bool>,
     pub exclude: Resolved<Vec<String>>,
+    pub lenient: Resolved<bool>,
 }
 
 impl Default for Settings {
@@ -83,6 +84,7 @@ impl Default for Settings {
             respect_gitignore: Resolved::new(false, Source::Default),
             hidden: Resolved::new(false, Source::Default),
             exclude: Resolved::new(Vec::new(), Source::Default),
+            lenient: Resolved::new(false, Source::Default),
         }
     }
 }
@@ -103,6 +105,13 @@ impl Settings {
                 config.table_style,
                 defaults.table_style.value,
                 source_of(matches, "table_style"),
+            ),
+            lenient: resolve_bool(
+                matches,
+                "lenient",
+                "no_lenient",
+                config.lenient,
+                defaults.lenient.value,
             ),
             ..Settings::resolve_walk(&cli.walk, config, matches)
         }
@@ -220,6 +229,10 @@ impl Settings {
                 ConfigKey::Exclude,
                 (list(&self.exclude.value), self.exclude.source),
             ),
+            (
+                ConfigKey::Lenient,
+                (self.lenient.value.to_string(), self.lenient.source),
+            ),
         ])
     }
 }
@@ -329,6 +342,7 @@ mod tests {
         assert!(!s.hidden.value);
         assert!(!s.respect_gitignore.value);
         assert!(s.exclude.value.is_empty());
+        assert!(!s.lenient.value);
     }
 
     /// The defaults the resolver produces with nothing set must be exactly
@@ -343,6 +357,7 @@ mod tests {
         assert_eq!(s.respect_gitignore.value, d.respect_gitignore.value);
         assert_eq!(s.hidden.value, d.hidden.value);
         assert_eq!(s.exclude.value, d.exclude.value);
+        assert_eq!(s.lenient.value, d.lenient.value);
     }
 
     #[test]
@@ -420,6 +435,33 @@ mod tests {
     }
 
     #[test]
+    fn lenient_flag_beats_a_configured_false() {
+        let config = config_with(|c| c.lenient = Some(false));
+        let s = resolve(&["querymatter", "--lenient"], &config);
+        assert!(s.lenient.value);
+        assert_eq!(s.lenient.source, Source::Flag);
+    }
+
+    #[test]
+    fn lenient_config_beats_default() {
+        let config = config_with(|c| c.lenient = Some(true));
+        let s = resolve(&["querymatter"], &config);
+        assert!(s.lenient.value);
+        assert_eq!(s.lenient.source, Source::Config);
+    }
+
+    /// Without a negation flag there would be no way to turn a configured
+    /// `true` back to strict for one invocation.
+    #[test]
+    fn no_lenient_overrides_a_configured_true() {
+        let config = config_with(|c| c.lenient = Some(true));
+        assert!(resolve(&["querymatter"], &config).lenient.value);
+        let s = resolve(&["querymatter", "--no-lenient"], &config);
+        assert!(!s.lenient.value);
+        assert_eq!(s.lenient.source, Source::Flag);
+    }
+
+    #[test]
     fn a_flag_and_its_negation_together_are_rejected() {
         let mut command = Cli::command().mut_arg("table_style", |a| a.env(None::<&str>));
         assert!(
@@ -435,6 +477,12 @@ mod tests {
                     "--respect-gitignore",
                     "--no-respect-gitignore"
                 ])
+                .is_err()
+        );
+        let mut command = Cli::command().mut_arg("table_style", |a| a.env(None::<&str>));
+        assert!(
+            command
+                .try_get_matches_from_mut(["querymatter", "--lenient", "--no-lenient"])
                 .is_err()
         );
     }
