@@ -634,7 +634,9 @@ fn numeric_result(v: f64, is_float: bool) -> Value {
 /// `IS NOT NULL` are ever determinate for a NULL field.
 fn eval_predicate(record: &Record, pred: &Predicate) -> Option<bool> {
     match pred {
-        Predicate::Compare(col, op, lit) => eval_compare(&resolve_col(record, col), op, lit),
+        Predicate::Compare(left, op, right) => {
+            eval_compare(&eval_expr(record, left), op, &eval_expr(record, right))
+        }
         Predicate::Like(col, pattern, negated) => {
             let value = resolve_col(record, col);
             if value.is_null() {
@@ -648,11 +650,10 @@ fn eval_predicate(record: &Record, pred: &Predicate) -> Option<bool> {
             if value.is_null() {
                 return None;
             }
-            let base = Some(
-                literals
-                    .iter()
-                    .any(|lit| eval_compare(&value, &CmpOp::Eq, lit) == Some(true)),
-            );
+            let base =
+                Some(literals.iter().any(|lit| {
+                    eval_compare(&value, &CmpOp::Eq, &literal_value(lit)) == Some(true)
+                }));
             maybe_negate(base, *negated)
         }
         // The only predicate that is determinate — and true — for a NULL field.
@@ -695,37 +696,33 @@ fn three_valued_or(a: Option<bool>, b: Option<bool>) -> Option<bool> {
     }
 }
 
-/// Compares `value` against a literal per the coercion rule, under 3VL.
+/// Compares `left` against `right` under 3VL, both already evaluated via
+/// [`eval_expr`]. `right`'s type picks the coercion rule — mirroring how a
+/// `Literal`'s type drove this comparison before both sides became arbitrary
+/// expressions.
 ///
-/// A NULL `value` yields `None` (unknown) — the only source of unknown here.
-/// Otherwise the result is always `Some(_)`: a string literal compares
-/// `to_cmp_string()`; a numeric literal requires `value` to also be numeric;
-/// a non-null value that can't be coerced/ordered against the literal (a
-/// numeric literal vs a non-numeric value, or a `NULL` literal) fails the
-/// predicate as `Some(false)`, per the spec's "the row fails the predicate".
-fn eval_compare(value: &Value, op: &CmpOp, lit: &Literal) -> Option<bool> {
-    if value.is_null() {
+/// `Null` on either side yields `None` (unknown) — the only source of
+/// unknown here. Otherwise the result is always `Some(_)`: a string `right`
+/// compares `to_cmp_string()`; a numeric (`Int`/`Float`) `right` requires
+/// `left` to also be numeric — a non-numeric `left` fails the predicate as
+/// `Some(false)` rather than being unknown, per the spec's "the row fails
+/// the predicate"; a `Bool` or `List` `right` falls back to the general
+/// [`compare_values`] ordering.
+fn eval_compare(left: &Value, op: &CmpOp, right: &Value) -> Option<bool> {
+    if left.is_null() || right.is_null() {
         return None;
     }
-    let ordering = match lit {
-        Literal::Str(s) => Some(value.to_cmp_string().cmp(s)),
-        Literal::Int(_) | Literal::Float(_) => match (value.as_number(), literal_as_number(lit)) {
-            (Some(v), Some(l)) => v.partial_cmp(&l),
+    let ordering = match right {
+        Value::Str(s) => Some(left.to_cmp_string().cmp(s)),
+        Value::Int(_) | Value::Float(_) => match (left.as_number(), right.as_number()) {
+            (Some(l), Some(r)) => l.partial_cmp(&r),
             _ => None,
         },
-        Literal::Bool(b) => compare_values(value, &Value::Bool(*b)),
-        Literal::Null => None,
+        Value::Bool(_) | Value::List(_) => compare_values(left, right),
+        // Handled by the early return above.
+        Value::Null => unreachable!("right-hand Null is excluded above"),
     };
     Some(ordering.is_some_and(|ord| apply_cmp(op, ord)))
-}
-
-/// The `f64` value of an `Int`/`Float` literal, or `None` for other kinds.
-fn literal_as_number(lit: &Literal) -> Option<f64> {
-    match lit {
-        Literal::Int(i) => Some(*i as f64),
-        Literal::Float(f) => Some(*f),
-        Literal::Str(_) | Literal::Bool(_) | Literal::Null => None,
-    }
 }
 
 /// Interprets an `Ordering` per comparison operator.
@@ -1099,6 +1096,67 @@ mod tests {
             t.rows,
             vec![vec![Value::Int(3)], vec![Value::Str("5".into())]]
         );
+    }
+
+    #[test]
+    fn where_column_to_column_and_scalar() {
+        // Column-to-column: `start < end` matches only the row where it holds.
+        let bounds = [
+            rec(
+                "s",
+                "s/a.md",
+                &[("start", Value::Int(1)), ("end", Value::Int(5))],
+            ),
+            rec(
+                "s",
+                "s/b.md",
+                &[("start", Value::Int(5)), ("end", Value::Int(5))],
+            ),
+        ];
+        let cmp = parse("SELECT start WHERE start < end").unwrap();
+        assert_eq!(
+            execute(&cmp, bounds.iter()).unwrap().rows,
+            vec![vec![Value::Int(1)]]
+        );
+
+        // A scalar expression on the left, a literal on the right.
+        let draft = [rec(
+            "s",
+            "s/c.md",
+            &[("status", Value::Str("Draft".into()))],
+        )];
+        let scalar = parse("SELECT status WHERE lower(status) = 'draft'").unwrap();
+        assert_eq!(
+            execute(&scalar, draft.iter()).unwrap().rows,
+            vec![vec![Value::Str("Draft".into())]]
+        );
+
+        // Arithmetic on the left, a column on the right.
+        let arith_rows = [rec(
+            "s",
+            "s/d.md",
+            &[("start", Value::Int(4)), ("end", Value::Int(5))],
+        )];
+        let arith = parse("SELECT start WHERE start + 1 = end").unwrap();
+        assert_eq!(
+            execute(&arith, arith_rows.iter()).unwrap().rows,
+            vec![vec![Value::Int(4)]]
+        );
+    }
+
+    #[test]
+    fn where_null_operand_is_unknown_not_match() {
+        // `missing` is absent from every record below, so it resolves to
+        // `Value::Null`; comparing it against `status` (present on both
+        // rows) must be unknown — not a match, and not an error — the same
+        // 3VL rule a NULL field already follows on the literal-comparison
+        // side (column validation for a genuinely unknown field is T9).
+        let rows = [
+            rec("s", "s/a.md", &[("status", Value::Str("draft".into()))]),
+            rec("s", "s/b.md", &[("status", Value::Str("synced".into()))]),
+        ];
+        let q = parse("SELECT status WHERE missing = status").unwrap();
+        assert!(execute(&q, rows.iter()).unwrap().rows.is_empty());
     }
 
     #[test]

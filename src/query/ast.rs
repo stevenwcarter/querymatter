@@ -142,8 +142,9 @@ pub enum Aggregate {
 /// A `WHERE` predicate tree.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Predicate {
-    /// A comparison of a column against a literal, e.g. `status = 'draft'`.
-    Compare(ColRef, CmpOp, Literal),
+    /// A comparison of two expressions, e.g. `status = 'draft'`,
+    /// `start < end`, or `lower(status) = 'draft'`.
+    Compare(Expr, CmpOp, Expr),
     /// `col [NOT] LIKE '<pattern>'`; the `bool` is `true` when negated.
     Like(ColRef, String, /* negated */ bool),
     /// `col [NOT] IN (<literals>)`; the `bool` is `true` when negated.

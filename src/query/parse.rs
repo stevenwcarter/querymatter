@@ -555,8 +555,9 @@ fn lower_predicate(expr: &sql::Expr) -> Result<Predicate, ParseError> {
     }
 }
 
-/// Lowers a binary operation: a boolean connective (`AND`/`OR`) or a comparison
-/// of a column against a literal.
+/// Lowers a binary operation: a boolean connective (`AND`/`OR`) or a
+/// comparison of two expressions (columns, literals, scalar calls, or
+/// arithmetic), lowered via [`lower_expr`] on both sides.
 fn lower_binary(
     left: &sql::Expr,
     op: &sql::BinaryOperator,
@@ -585,9 +586,9 @@ fn lower_binary(
         other => return Err(unsupported(format!("operator `{other}`"))),
     };
     Ok(Predicate::Compare(
-        lower_col_ref(left)?,
+        lower_expr(left)?,
         cmp,
-        lower_literal(right)?,
+        lower_expr(right)?,
     ))
 }
 
@@ -787,7 +788,11 @@ mod tests {
             SelectExpr::Expr(Expr::Col(ColRef::File(FileAttr::Folder)))
         );
         match q.filter.unwrap() {
-            Predicate::Compare(ColRef::File(FileAttr::Ext), CmpOp::Eq, Literal::Str(s)) => {
+            Predicate::Compare(
+                Expr::Col(ColRef::File(FileAttr::Ext)),
+                CmpOp::Eq,
+                Expr::Lit(Literal::Str(s)),
+            ) => {
                 assert_eq!(s, "md")
             }
             p => panic!("unexpected {p:?}"),
@@ -1080,9 +1085,9 @@ mod tests {
         assert_eq!(
             q.filter,
             Some(Predicate::Compare(
-                ColRef::Field("title".into()),
+                Expr::Col(ColRef::Field("title".into())),
                 CmpOp::Eq,
-                Literal::Str("imported from \"archive\"".into())
+                Expr::Lit(Literal::Str("imported from \"archive\"".into()))
             ))
         );
     }
@@ -1160,12 +1165,14 @@ mod tests {
     /// sqlparser AST Debug dump (which contains struct-literal braces).
     #[test]
     fn unsupported_messages_have_no_ast_debug_dump() {
-        // A CAST in WHERE, a subquery, and a non-literal IN value all route
-        // through catch-all arms that used to `{:?}` the node.
+        // A CAST in a comparison, an IN subquery, and a BETWEEN all route
+        // through catch-all arms that used to `{:?}` the node. (Arithmetic on
+        // a comparison's RHS, e.g. `status = status + 1`, is no longer one of
+        // these — Task 3 made both comparison sides full expressions.)
         for sql in [
             "SELECT status WHERE CAST(prd AS INT) = 1",
             "SELECT status WHERE status IN (SELECT status)",
-            "SELECT status WHERE status = status + 1",
+            "SELECT status WHERE status BETWEEN 'a' AND 'z'",
         ] {
             let err = crate::query::parse(sql).unwrap_err();
             let msg = err.to_string();
