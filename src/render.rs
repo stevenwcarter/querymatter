@@ -32,6 +32,7 @@ pub enum Format {
     /// Tab-separated values with a header row.
     Tsv,
     /// A Markdown table.
+    #[value(alias = "markdown")]
     Md,
 }
 

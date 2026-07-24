@@ -15,6 +15,7 @@ use anyhow::{Context, bail};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
+use crate::cache::write_atomic;
 use crate::render::{Format, TableStyle};
 
 /// The persisted settings, as read from and written to `config.toml`.
@@ -153,13 +154,20 @@ pub fn save(config: &Config) -> anyhow::Result<PathBuf> {
 }
 
 /// Writes `config` to `path`, creating any missing parent directories.
+///
+/// Writes atomically (temp file in the same directory, then `rename` over
+/// `path`, via [`write_atomic`]) so a process killed mid-write or a full disk
+/// can never leave a truncated `config.toml` behind — since [`load_from`]
+/// treats a malformed file as a hard error, a truncated file would otherwise
+/// block every subsequent invocation until hand-fixed.
 pub fn save_to(path: &Path, config: &Config) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("cannot create config directory {}", parent.display()))?;
     }
     let text = toml::to_string_pretty(config).context("failed to serialize the config")?;
-    fs::write(path, text).with_context(|| format!("cannot write config file {}", path.display()))
+    write_atomic(path, text.as_bytes())
+        .with_context(|| format!("cannot write config file {}", path.display()))
 }
 
 /// Sets `key` to `value` in `config`, validating first: a rejected value
@@ -249,6 +257,7 @@ mod tests {
     use super::*;
     // `to_possible_value()` is a `ValueEnum` method; the trait must be in scope.
     use clap::ValueEnum;
+    use std::collections::BTreeSet;
     use tempfile::tempdir;
 
     #[test]
@@ -297,6 +306,36 @@ mod tests {
         let path = td.path().join("a").join("b").join("config.toml");
         save_to(&path, &Config::default()).unwrap();
         assert!(path.is_file());
+    }
+
+    /// `save_to` writes atomically (temp file + rename, [`write_atomic`]):
+    /// an already-existing, valid config file must still be intact and
+    /// parseable after a subsequent `save_to` call, with no stray temp file
+    /// left behind. Guards against the truncated-file failure mode a plain
+    /// `fs::write` risks on a kill or a full disk mid-write.
+    #[test]
+    fn save_to_leaves_an_intact_parseable_file_with_no_stray_temp_file() {
+        let td = tempdir().unwrap();
+        let path = td.path().join("config.toml");
+        let mut original = Config::default();
+        set(&mut original, ConfigKey::TableStyle, "unicode").unwrap();
+        save_to(&path, &original).unwrap();
+
+        let mut updated = Config::default();
+        set(&mut updated, ConfigKey::Format, "json").unwrap();
+        save_to(&path, &updated).unwrap();
+
+        assert_eq!(load_from(&path).unwrap(), updated);
+
+        let stray_files: Vec<_> = std::fs::read_dir(td.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name() != path.file_name().unwrap())
+            .collect();
+        assert!(
+            stray_files.is_empty(),
+            "leftover temp file: {stray_files:?}"
+        );
     }
 
     #[test]
@@ -348,10 +387,27 @@ mod tests {
         assert_eq!(config, Config::default(), "a rejected set must not mutate");
     }
 
+    /// The enum case (`table_style = "fancy"`, above) is guarded by
+    /// `parse_enum` returning before any assignment. The boolean keys go
+    /// through a separate function, `parse_bool`, and are safe today only by
+    /// the same `?`-short-circuit ordering — an invariant a later refactor of
+    /// `set`'s match arms could break silently. Pinned explicitly per this
+    /// project's spec-discipline rule against skipping a test because a
+    /// current invariant "makes it safe".
     #[test]
-    fn set_rejects_a_non_boolean() {
+    fn set_rejects_a_non_boolean_leaving_config_untouched() {
         let mut config = Config::default();
+        let before = config.clone();
         assert!(set(&mut config, ConfigKey::Hidden, "yes").is_err());
+        assert_eq!(config, before);
+    }
+
+    #[test]
+    fn set_rejects_a_non_boolean_respect_gitignore_leaving_config_untouched() {
+        let mut config = Config::default();
+        let before = config.clone();
+        assert!(set(&mut config, ConfigKey::RespectGitignore, "yes").is_err());
+        assert_eq!(config, before);
     }
 
     #[test]
@@ -411,6 +467,28 @@ mod tests {
             let possible = key.to_possible_value().expect("no variant is skipped");
             assert_eq!(possible.get_name(), key.as_str(), "for {key:?}");
         }
+    }
+
+    /// `ConfigKey::ALL` is hand-written while `value_variants()` is
+    /// macro-derived from the enum itself; a new variant added without
+    /// updating `ALL` would compile clean (the exhaustive matches in
+    /// `as_str`/`allowed`/`set`/`unset`/`get` force *those* to be updated,
+    /// but nothing forces `ALL`) and silently drop the key from any listing
+    /// built from `ALL`. Pinning the two in agreement catches that drift.
+    #[test]
+    fn all_agrees_with_value_variants() {
+        let variants = <ConfigKey as clap::ValueEnum>::value_variants();
+        assert_eq!(
+            ConfigKey::ALL.len(),
+            variants.len(),
+            "ConfigKey::ALL and value_variants() must have the same length"
+        );
+        let all_set: BTreeSet<ConfigKey> = ConfigKey::ALL.into_iter().collect();
+        let variants_set: BTreeSet<ConfigKey> = variants.iter().copied().collect();
+        assert_eq!(
+            all_set, variants_set,
+            "ConfigKey::ALL and value_variants() must name the same keys"
+        );
     }
 
     #[test]

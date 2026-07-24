@@ -254,7 +254,7 @@ impl Cli {
 mod tests {
     use super::{Cli, Command};
     use crate::cache::Freshness;
-    use crate::render::TableStyle;
+    use crate::render::{Format, TableStyle};
     use clap::{CommandFactory, FromArgMatches};
     use std::fs;
     use std::path::Path;
@@ -487,5 +487,17 @@ mod tests {
     #[test]
     fn bad_table_style_is_rejected() {
         assert!(try_parse(&["querymatter", "--table-style", "fancy"]).is_err());
+    }
+
+    /// Regression: adding `clap::ValueEnum` to `Format` switched `--format`
+    /// from a `FromStr`-based parser (which accepts `markdown` as an alias
+    /// for `md`) to the `ValueEnum` parser, which by default knows only
+    /// canonical spellings. This goes through clap's real parsing, not
+    /// `Format::from_str` directly — that's the layer the regression lived
+    /// in and the layer `FromStr`-only unit tests couldn't catch.
+    #[test]
+    fn format_flag_accepts_markdown_alias() {
+        let cli = parse(&["querymatter", "--format", "markdown"]);
+        assert_eq!(cli.format, Some(Format::Md));
     }
 }

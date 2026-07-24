@@ -47,6 +47,23 @@ fn oneshot_json_is_clean_stdout() {
     assert_eq!(v.as_array().unwrap().len(), 2);
 }
 
+/// Regression: `Format` gaining `clap::ValueEnum` switched `--format`'s
+/// inferred parser away from `FromStr` (which accepts `markdown` as an alias
+/// for `md`) to the `ValueEnum` parser, which by default only knows
+/// canonical spellings. This runs the real binary end to end, the layer the
+/// regression actually broke.
+#[test]
+fn format_markdown_alias_is_accepted_by_the_real_binary() {
+    let td = tree();
+    Command::cargo_bin("querymatter")
+        .unwrap()
+        .args(["-e", "SELECT status", "--format", "markdown"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("| status |"));
+}
+
 #[test]
 fn batch_mode_from_stdin() {
     let td = tree();
