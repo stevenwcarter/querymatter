@@ -17,7 +17,10 @@ use crate::model::Value;
 use crate::query::ResultTable;
 
 /// The output format a rendered [`ResultTable`] can take.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum Format {
     /// An aligned, bordered table, with borders drawn per the selected
     /// [`TableStyle`].
@@ -59,7 +62,18 @@ impl FromStr for Format {
 /// Orthogonal to [`Format`], and consulted for `Format::Table` alone: `md` is
 /// a fixed Markdown dialect, and json/csv/tsv are data interchange, so all
 /// four ignore it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    clap::ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum TableStyle {
     /// `comfy-table`'s default ASCII borders (`+---+`), safe on any terminal.
     #[default]
@@ -267,6 +281,8 @@ fn write_delimited(table: &ResultTable, delimiter: u8) -> csv::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use clap::ValueEnum;
+
     use super::*;
     use crate::model::Value;
     use crate::query::ResultTable;
@@ -303,6 +319,64 @@ mod tests {
         assert_eq!("md".parse::<Format>().unwrap(), Format::Md);
         assert_eq!("markdown".parse::<Format>().unwrap(), Format::Md);
         assert!("bogus".parse::<Format>().is_err());
+    }
+
+    /// Every value clap will offer as a completion must also parse through
+    /// `FromStr`, which is what the REPL's `.format`/`.style`/`.set` use. If
+    /// these ever diverge, a value you can tab-complete becomes a value the
+    /// REPL rejects.
+    #[test]
+    fn format_value_enum_agrees_with_from_str() {
+        for variant in <Format as clap::ValueEnum>::value_variants() {
+            let possible = variant.to_possible_value().expect("no variant is skipped");
+            let name = possible.get_name();
+            assert_eq!(
+                name.parse::<Format>().expect("clap's name must parse"),
+                *variant,
+                "clap offers {name:?} but FromStr disagrees"
+            );
+        }
+    }
+
+    #[test]
+    fn table_style_value_enum_agrees_with_from_str() {
+        for variant in <TableStyle as clap::ValueEnum>::value_variants() {
+            let possible = variant.to_possible_value().expect("no variant is skipped");
+            let name = possible.get_name();
+            assert_eq!(
+                name.parse::<TableStyle>().expect("clap's name must parse"),
+                *variant,
+                "clap offers {name:?} but FromStr disagrees"
+            );
+        }
+    }
+
+    /// The TOML spelling must match the CLI spelling exactly, so a config file
+    /// and a command line never disagree about what "md" means.
+    #[test]
+    fn format_serde_spelling_matches_cli() {
+        assert_eq!(toml_value(&Format::Md), "md");
+        assert_eq!(toml_value(&Format::Table), "table");
+        assert_eq!(toml_value(&Format::Json), "json");
+        assert_eq!(toml_value(&Format::Csv), "csv");
+        assert_eq!(toml_value(&Format::Tsv), "tsv");
+    }
+
+    #[test]
+    fn table_style_serde_spelling_matches_cli() {
+        assert_eq!(toml_value(&TableStyle::Ascii), "ascii");
+        assert_eq!(toml_value(&TableStyle::Unicode), "unicode");
+        assert_eq!(toml_value(&TableStyle::Compact), "compact");
+        assert_eq!(toml_value(&TableStyle::Plain), "plain");
+    }
+
+    /// Serializes `value` the way it will appear in `config.toml`.
+    fn toml_value<T: serde::Serialize>(value: &T) -> String {
+        serde_json::to_value(value)
+            .expect("these enums serialize as plain strings")
+            .as_str()
+            .expect("as a JSON string")
+            .to_string()
     }
     #[test]
     fn table_snapshot() {
