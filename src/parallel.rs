@@ -3,13 +3,14 @@
 //! refresh in [`crate::cache`] to spread the disk-bound read+parse step of a
 //! scan across all cores.
 //!
-//! Deliberately minimal — no thread pool crate, no shared mutable state
-//! beyond the immutable `paths` each worker reads from. Every unit of work is
-//! an independent `path -> T`, so the only coordination needed is splitting
-//! `paths` into chunks, running each chunk on its own thread, and joining the
-//! results back together **sorted by path** — the same order a serial
-//! `paths.iter().map(f)` would have produced, regardless of which worker
-//! thread happens to finish first.
+//! Deliberately minimal — no thread pool crate. Every unit of work is an
+//! independent `path -> T`, and the only shared state is a single
+//! [`AtomicUsize`] cursor: each worker `fetch_add`s the next index and
+//! processes that path (work-stealing), so a slow path never strands the
+//! other cores idle. Workers write only into their own local buffers; the
+//! results are joined back together **sorted by path** — the same order a
+//! serial `paths.iter().map(f)` would have produced, regardless of which
+//! worker thread happens to finish first.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
