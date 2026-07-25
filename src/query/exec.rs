@@ -13,6 +13,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::time::SystemTime;
 
+use chrono::{DateTime, Duration, Months, SecondsFormat, Utc};
 use globset::Glob;
 use indexmap::IndexMap;
 use regex::Regex;
@@ -20,8 +21,8 @@ use regex::Regex;
 use crate::model::{FileAttr, Record, Value, compare_values};
 use crate::query::ResultTable;
 use crate::query::ast::{
-    Aggregate, BinOp, CmpOp, ColRef, Expr, Having, HavingLeaf, Literal, OrderKey, OrderTarget,
-    Predicate, Query, ScalarFn, SelectExpr, SelectItem,
+    Aggregate, BinOp, CmpOp, ColRef, DateUnit, Expr, Having, HavingLeaf, Literal, OrderKey,
+    OrderTarget, Predicate, Query, RelDate, ScalarFn, SelectExpr, SelectItem,
 };
 
 /// An error that can occur while executing a parsed [`Query`].
@@ -79,7 +80,7 @@ pub fn execute<'a>(
 ) -> Result<ResultTable, ExecError> {
     let records: Vec<&Record> = records.collect();
     let schema = sorted_field_union(&records);
-    execute_with_schema(q, records.into_iter(), &schema, lenient)
+    execute_with_schema_at(q, records.into_iter(), &schema, lenient, SystemTime::now())
 }
 
 /// Like [`execute`], but validates against an explicit `schema` instead of
@@ -102,6 +103,31 @@ pub fn execute_with_schema<'a>(
     schema: &[String],
     lenient: bool,
 ) -> Result<ResultTable, ExecError> {
+    execute_with_schema_at(q, records, schema, lenient, SystemTime::now())
+}
+
+/// Like [`execute_with_schema`], but resolves relative-date literals
+/// (`'today'`, `'-7d'`, …) against an explicit `now` instead of the wall
+/// clock.
+///
+/// This is the seam both public entry points ([`execute`] and
+/// [`execute_with_schema`]) delegate through — the earliest point they
+/// share — so a relative-date literal is resolved to a concrete
+/// `Literal::Str` date (see [`rewrite_relative_dates`]) before column
+/// validation and the filter/group pipeline ever run; `eval_expr` and
+/// `eval_having` never see a `Literal::RelativeDate`. Tests call this
+/// directly to pin resolution against a fixed instant.
+fn execute_with_schema_at<'a>(
+    q: &Query,
+    records: impl Iterator<Item = &'a Record>,
+    schema: &[String],
+    lenient: bool,
+    now: SystemTime,
+) -> Result<ResultTable, ExecError> {
+    let mut resolved = q.clone();
+    rewrite_relative_dates(&mut resolved, now);
+    let q = &resolved;
+
     let records: Vec<&Record> = records.collect();
     if !lenient && !schema.is_empty() {
         validate_columns(q, schema)?;
@@ -110,6 +136,120 @@ pub fn execute_with_schema<'a>(
         return execute_grouped(q, records.into_iter());
     }
     execute_ungrouped(q, records.into_iter())
+}
+
+/// Replaces every `Literal::RelativeDate` in `q` with the `Literal::Str`
+/// ISO-8601 date/datetime it resolves to against `now` (see
+/// [`resolve_reldate`]). Walks every literal position in the query tree —
+/// `SELECT` expressions, the `WHERE` predicate (comparison operands, `IN`
+/// lists, `MEMBER OF`'s literal), and `HAVING` — so no relative-date literal
+/// can reach evaluation unresolved, regardless of where in the query it
+/// appears.
+fn rewrite_relative_dates(q: &mut Query, now: SystemTime) {
+    for item in &mut q.select {
+        if let SelectExpr::Expr(expr) = &mut item.expr {
+            rewrite_expr_literals(expr, now);
+        }
+    }
+    if let Some(pred) = &mut q.filter {
+        rewrite_predicate_literals(pred, now);
+    }
+    if let Some(having) = &mut q.having {
+        rewrite_having_literals(having, now);
+    }
+}
+
+/// Walks `expr`'s literal positions for [`rewrite_relative_dates`]: a bare
+/// literal resolves directly, and a scalar/binary expression recurses into
+/// its arguments/operands.
+fn rewrite_expr_literals(expr: &mut Expr, now: SystemTime) {
+    match expr {
+        Expr::Lit(lit) => rewrite_literal(lit, now),
+        Expr::Col(_) => {}
+        Expr::Scalar(_, args) => {
+            for arg in args {
+                rewrite_expr_literals(arg, now);
+            }
+        }
+        Expr::Binary(_, l, r) => {
+            rewrite_expr_literals(l, now);
+            rewrite_expr_literals(r, now);
+        }
+    }
+}
+
+/// Walks a `WHERE` predicate tree's literal positions for
+/// [`rewrite_relative_dates`]: both `Compare` operands, every `IN` list
+/// element, and `MEMBER OF`'s literal. `Like`'s pattern is a plain `String`
+/// (never a `Literal`) and `IsNull` carries no literal at all, so neither
+/// needs a rewrite.
+fn rewrite_predicate_literals(pred: &mut Predicate, now: SystemTime) {
+    match pred {
+        Predicate::Compare(l, _, r) => {
+            rewrite_expr_literals(l, now);
+            rewrite_expr_literals(r, now);
+        }
+        Predicate::In(_, literals, _) => {
+            for lit in literals {
+                rewrite_literal(lit, now);
+            }
+        }
+        Predicate::MemberOf(lit, _, _) => rewrite_literal(lit, now),
+        Predicate::Like(..) | Predicate::IsNull(..) => {}
+        Predicate::And(a, b) | Predicate::Or(a, b) => {
+            rewrite_predicate_literals(a, now);
+            rewrite_predicate_literals(b, now);
+        }
+        Predicate::Not(inner) => rewrite_predicate_literals(inner, now),
+    }
+}
+
+/// Walks a `HAVING` predicate tree's literal positions for
+/// [`rewrite_relative_dates`].
+fn rewrite_having_literals(having: &mut Having, now: SystemTime) {
+    match having {
+        Having::Compare(_, _, lit) => rewrite_literal(lit, now),
+        Having::And(a, b) | Having::Or(a, b) => {
+            rewrite_having_literals(a, now);
+            rewrite_having_literals(b, now);
+        }
+        Having::Not(inner) => rewrite_having_literals(inner, now),
+    }
+}
+
+/// Resolves `lit` in place when it's a `Literal::RelativeDate`; any other
+/// literal is left untouched.
+fn rewrite_literal(lit: &mut Literal, now: SystemTime) {
+    if let Literal::RelativeDate(rd) = lit {
+        *lit = Literal::Str(resolve_reldate(*rd, now));
+    }
+}
+
+/// Resolves a [`RelDate`] to its concrete ISO-8601 rendering, anchored at
+/// `now`. `today` and an offset resolve to a plain `%Y-%m-%d` date, so they
+/// compare lexicographically against a frontmatter date field of the same
+/// shape; `now` resolves to a full RFC3339 instant. `mo`/`y` offsets use
+/// calendar-aware arithmetic ([`Months`]), since a fixed 30/365-day
+/// [`Duration`] would drift across month/year boundaries; `d`/`w` use
+/// [`Duration`] directly, since those units are already fixed-length.
+fn resolve_reldate(rd: RelDate, now: SystemTime) -> String {
+    let now_utc = DateTime::<Utc>::from(now);
+    match rd {
+        RelDate::Now => now_utc.to_rfc3339_opts(SecondsFormat::Secs, true),
+        RelDate::Today => now_utc.date_naive().format("%Y-%m-%d").to_string(),
+        RelDate::Offset { n, unit } => {
+            let d = now_utc.date_naive();
+            let shifted = match unit {
+                DateUnit::Day => d + Duration::days(n),
+                DateUnit::Week => d + Duration::weeks(n),
+                DateUnit::Month if n >= 0 => d + Months::new(n as u32),
+                DateUnit::Month => d - Months::new((-n) as u32),
+                DateUnit::Year if n >= 0 => d + Months::new(12 * n as u32),
+                DateUnit::Year => d - Months::new(12 * (-n) as u32),
+            };
+            shifted.format("%Y-%m-%d").to_string()
+        }
+    }
 }
 
 /// Checks every column `q.referenced_fields()` touches against `schema`,
@@ -799,6 +939,16 @@ fn literal_value(lit: &Literal) -> Value {
         Literal::Float(f) => Value::Float(*f),
         Literal::Bool(b) => Value::Bool(*b),
         Literal::Null => Value::Null,
+        // `execute_with_schema_at` runs `rewrite_relative_dates` before the
+        // filter/group pipeline (and before `HAVING` evaluation, which also
+        // calls this), resolving every `RelativeDate` to a `Literal::Str`.
+        // This function has no clock to resolve one itself, so reaching
+        // here would mean a `Literal::RelativeDate` survived the rewrite —
+        // a bug in the rewrite's traversal, not a state `eval_expr`/
+        // `eval_having` should ever see in practice.
+        Literal::RelativeDate(_) => {
+            unreachable!("relative-date literals are resolved before evaluation")
+        }
     }
 }
 
@@ -1926,6 +2076,84 @@ mod tests {
         let t = execute(&q, rows.iter(), false).unwrap();
         assert_eq!(t.headers, vec!["estimate.low"]);
         assert_eq!(t.rows, vec![vec![Value::Int(5)]]);
+    }
+
+    #[test]
+    fn relative_date_resolves_against_injected_now() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        // now = 2026-07-24T00:00:00Z ; '-7d' must resolve to "2026-07-17".
+        //
+        // Note: 1_784_851_200 is the correct epoch second for
+        // 2026-07-24T00:00:00Z (verified independently via `python3
+        // -c 'datetime.datetime(2026,7,24,tzinfo=timezone.utc).timestamp()'`).
+        // The task brief's suggested constant, 1_784_246_400, is actually
+        // 2026-07-17T00:00:00Z — a week earlier than its own comment claims
+        // — which would make BOTH assertions below fail (see task-5-report.md).
+        let now = UNIX_EPOCH + Duration::from_secs(1_784_851_200);
+
+        let in_range = rec(
+            "s",
+            "s/a.md",
+            &[("created", Value::Str("2026-07-20".into()))],
+        );
+        let q = parse("SELECT file.name WHERE created >= '-7d'").unwrap();
+        let t = execute_with_schema_at(
+            &q,
+            std::iter::once(&in_range),
+            &["created".to_string()],
+            false,
+            now,
+        )
+        .unwrap();
+        assert_eq!(t.rows, vec![vec![Value::Str("a.md".into())]]);
+
+        let out_of_range = rec(
+            "s",
+            "s/b.md",
+            &[("created", Value::Str("2026-07-10".into()))],
+        );
+        let t = execute_with_schema_at(
+            &q,
+            std::iter::once(&out_of_range),
+            &["created".to_string()],
+            false,
+            now,
+        )
+        .unwrap();
+        assert!(t.rows.is_empty());
+    }
+
+    #[test]
+    fn reldate_resolution_uses_calendar_arithmetic_and_now_form() {
+        // `today`/offset resolve to a plain `%Y-%m-%d`; `now` resolves to a
+        // full RFC3339 instant; `mo`/`y` use calendar (not fixed-length)
+        // arithmetic — pinned directly against the fixed instant.
+        use std::time::{Duration, UNIX_EPOCH};
+        let now = UNIX_EPOCH + Duration::from_secs(1_784_851_200); // 2026-07-24T00:00:00Z
+
+        assert_eq!(resolve_reldate(RelDate::Today, now), "2026-07-24");
+        assert_eq!(resolve_reldate(RelDate::Now, now), "2026-07-24T00:00:00Z");
+        assert_eq!(
+            resolve_reldate(
+                RelDate::Offset {
+                    n: -2,
+                    unit: DateUnit::Month
+                },
+                now
+            ),
+            "2026-05-24"
+        );
+        assert_eq!(
+            resolve_reldate(
+                RelDate::Offset {
+                    n: -1,
+                    unit: DateUnit::Year
+                },
+                now
+            ),
+            "2025-07-24"
+        );
     }
 }
 

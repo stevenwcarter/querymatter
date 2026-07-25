@@ -240,6 +240,78 @@ pub enum Literal {
     Bool(bool),
     /// The `NULL` literal.
     Null,
+    /// A relative-date literal (`'today'`, `'-7d'`, …), parsed but not yet
+    /// resolved to a concrete date — see [`RelDate`]. The parser produces
+    /// this straight from a quoted string that matches the grammar (see
+    /// `query::parse`'s string-literal lowering); the executor resolves it
+    /// to a plain `Literal::Str` ISO-8601 date/datetime before evaluation
+    /// ever sees it (`query::exec`'s relative-date rewrite), so this
+    /// variant is clock-free by construction.
+    RelativeDate(RelDate),
+}
+
+/// A relative-date literal, as parsed from a quoted string by
+/// [`RelDate::parse`] — clock-free: it names *what* to resolve, not the
+/// resolved value. Resolution against a concrete instant happens only in
+/// `exec::resolve_reldate`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RelDate {
+    /// `'today'` — the current date.
+    Today,
+    /// `'now'` — the current instant.
+    Now,
+    /// A signed offset from today/now, e.g. `'-7d'`, `'+3w'`, `'-2mo'`.
+    Offset {
+        /// The signed magnitude (already carries the `+`/`-` sign).
+        n: i64,
+        /// The offset's unit.
+        unit: DateUnit,
+    },
+}
+
+/// The unit of a [`RelDate::Offset`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DateUnit {
+    /// `d` — days.
+    Day,
+    /// `w` — weeks.
+    Week,
+    /// `mo` — calendar months.
+    Month,
+    /// `y` — calendar years.
+    Year,
+}
+
+impl RelDate {
+    /// Parses a relative-date token under a strict, anchored grammar:
+    /// `today | now | [+-]<int>(d|w|mo|y)`, case-insensitive for the bare
+    /// `today`/`now` keywords. Anything else — including a sign-less offset
+    /// (`7d`), an unrecognized unit (`-7m`, `-7x`), or a bare number
+    /// (`-7`) — is not a relative date and returns `None`, leaving the
+    /// caller free to treat the string as a plain string literal.
+    pub fn parse(s: &str) -> Option<RelDate> {
+        let s = s.trim();
+        match s.to_ascii_lowercase().as_str() {
+            "today" => return Some(RelDate::Today),
+            "now" => return Some(RelDate::Now),
+            _ => {}
+        }
+        let (sign, rest) = match s.strip_prefix('-') {
+            Some(r) => (-1, r),
+            None => (1, s.strip_prefix('+')?),
+        };
+        let (digits, unit) = if let Some(d) = rest.strip_suffix("mo") {
+            (d, DateUnit::Month)
+        } else if let Some(d) = rest.strip_suffix('d') {
+            (d, DateUnit::Day)
+        } else if let Some(d) = rest.strip_suffix('w') {
+            (d, DateUnit::Week)
+        } else {
+            (rest.strip_suffix('y')?, DateUnit::Year)
+        };
+        let n: i64 = digits.parse().ok()?;
+        Some(RelDate::Offset { n: sign * n, unit })
+    }
 }
 
 /// One `ORDER BY` key: what to sort on and in which direction.
@@ -479,6 +551,32 @@ fn literal_label(lit: &Literal) -> String {
         Literal::Float(f) => f.to_string(),
         Literal::Bool(b) => b.to_string(),
         Literal::Null => "NULL".to_string(),
+        Literal::RelativeDate(rd) => format!("'{}'", reldate_source(rd)),
+    }
+}
+
+/// Renders a [`RelDate`] back to the source token it was parsed from
+/// (`today`, `now`, `-7d`, `+3w`, …), for [`literal_label`]'s default-header
+/// rendering.
+fn reldate_source(rd: &RelDate) -> String {
+    match rd {
+        RelDate::Today => "today".to_string(),
+        RelDate::Now => "now".to_string(),
+        RelDate::Offset { n, unit } => {
+            let sign = if *n < 0 { '-' } else { '+' };
+            format!("{sign}{}{}", n.unsigned_abs(), date_unit_suffix(*unit))
+        }
+    }
+}
+
+/// The source-grammar suffix for a [`DateUnit`] (`d`/`w`/`mo`/`y`), for
+/// [`reldate_source`].
+fn date_unit_suffix(unit: DateUnit) -> &'static str {
+    match unit {
+        DateUnit::Day => "d",
+        DateUnit::Week => "w",
+        DateUnit::Month => "mo",
+        DateUnit::Year => "y",
     }
 }
 
@@ -558,5 +656,44 @@ mod tests {
     fn referenced_fields_includes_order_by_bare_aggregate_column() {
         let q = parse("SELECT status GROUP BY status ORDER BY sum(n) DESC").unwrap();
         assert!(q.referenced_fields().contains("n"));
+    }
+
+    #[test]
+    fn reldate_parse_grammar() {
+        use super::{DateUnit, RelDate};
+        assert_eq!(RelDate::parse("today"), Some(RelDate::Today));
+        assert_eq!(RelDate::parse("now"), Some(RelDate::Now));
+        assert_eq!(
+            RelDate::parse("-7d"),
+            Some(RelDate::Offset {
+                n: -7,
+                unit: DateUnit::Day
+            })
+        );
+        assert_eq!(
+            RelDate::parse("+3w"),
+            Some(RelDate::Offset {
+                n: 3,
+                unit: DateUnit::Week
+            })
+        );
+        assert_eq!(
+            RelDate::parse("-2mo"),
+            Some(RelDate::Offset {
+                n: -2,
+                unit: DateUnit::Month
+            })
+        );
+        assert_eq!(
+            RelDate::parse("-1y"),
+            Some(RelDate::Offset {
+                n: -1,
+                unit: DateUnit::Year
+            })
+        );
+        // rejects
+        for bad in ["7d", "-7m", "-7x", "tomorrow", "draft", "-7", ""] {
+            assert_eq!(RelDate::parse(bad), None, "should reject {bad}");
+        }
     }
 }

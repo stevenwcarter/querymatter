@@ -24,7 +24,7 @@ use sqlparser::parser::Parser;
 use crate::model::FileAttr;
 use crate::query::ast::{
     Aggregate, BinOp, CmpOp, ColRef, Expr, Having, HavingLeaf, Literal, OrderKey, OrderTarget,
-    Predicate, Query, ScalarFn, SelectExpr, SelectItem,
+    Predicate, Query, RelDate, ScalarFn, SelectExpr, SelectItem,
 };
 
 /// An error produced while parsing or lowering a query.
@@ -694,18 +694,27 @@ fn negate_literal(expr: &sql::Expr) -> Result<Literal, ParseError> {
 
 /// Maps a `sqlparser` value literal to a querymatter [`Literal`].
 fn value_to_literal(value: &sql::Value) -> Result<Literal, ParseError> {
+    if let Some(s) = raw_string(value) {
+        return Ok(lower_string_literal(s));
+    }
     match value {
         sql::Value::Number(n, _) => parse_number(n),
-        sql::Value::SingleQuotedString(s)
-        | sql::Value::DoubleQuotedString(s)
-        | sql::Value::TripleSingleQuotedString(s)
-        | sql::Value::TripleDoubleQuotedString(s)
-        | sql::Value::EscapedStringLiteral(s)
-        | sql::Value::UnicodeStringLiteral(s)
-        | sql::Value::NationalStringLiteral(s) => Ok(Literal::Str(s.clone())),
         sql::Value::Boolean(b) => Ok(Literal::Bool(*b)),
         sql::Value::Null => Ok(Literal::Null),
         _ => Err(unsupported("this literal value")),
+    }
+}
+
+/// Lowers a quoted string literal's text, resolving it to
+/// [`Literal::RelativeDate`] when it matches the strict relative-date
+/// grammar (`today`/`now`/`[+-]<int>(d|w|mo|y)`, see [`RelDate::parse`]); any
+/// other string — the overwhelming majority — stays a plain `Literal::Str`,
+/// e.g. `'draft'` (spec §9: no pre-existing string literal is
+/// reinterpreted).
+fn lower_string_literal(s: &str) -> Literal {
+    match RelDate::parse(s) {
+        Some(rd) => Literal::RelativeDate(rd),
+        None => Literal::Str(s.to_string()),
     }
 }
 
@@ -720,12 +729,36 @@ fn parse_number(n: &str) -> Result<Literal, ParseError> {
     }
 }
 
-/// Extracts a string literal, rejecting non-string values (used for `LIKE`
-/// patterns).
+/// Extracts a string literal's raw text, rejecting non-string values (used
+/// for `LIKE` patterns). This bypasses [`lower_string_literal`]'s
+/// relative-date check deliberately: `Predicate::Like`'s pattern is a plain
+/// `String`, never a [`Literal`], so a pattern that happens to match the
+/// relative-date grammar (e.g. `LIKE '-7d'`) must still match literally,
+/// not be rejected as "not a string".
 fn string_literal(expr: &sql::Expr) -> Result<String, ParseError> {
-    match lower_literal(expr)? {
-        Literal::Str(s) => Ok(s),
-        _ => Err(unsupported("LIKE pattern must be a string")),
+    let sql::Expr::Value(value) = expr else {
+        return Err(unsupported("LIKE pattern must be a string"));
+    };
+    raw_string(&value.value)
+        .map(str::to_string)
+        .ok_or_else(|| unsupported("LIKE pattern must be a string"))
+}
+
+/// Extracts a quoted string literal's raw text from a `sqlparser` value
+/// node, or `None` for anything else (a number, boolean, `NULL`, …). Shared
+/// between [`lower_string_literal`] (general literal lowering, which
+/// additionally checks the relative-date grammar) and [`string_literal`]
+/// (`LIKE` patterns, which must not).
+fn raw_string(value: &sql::Value) -> Option<&str> {
+    match value {
+        sql::Value::SingleQuotedString(s)
+        | sql::Value::DoubleQuotedString(s)
+        | sql::Value::TripleSingleQuotedString(s)
+        | sql::Value::TripleDoubleQuotedString(s)
+        | sql::Value::EscapedStringLiteral(s)
+        | sql::Value::UnicodeStringLiteral(s)
+        | sql::Value::NationalStringLiteral(s) => Some(s),
+        _ => None,
     }
 }
 
@@ -1328,6 +1361,17 @@ mod tests {
     }
 
     #[test]
+    fn header_derivation_for_relative_date_literal() {
+        // A bare relative-date literal in the SELECT list renders back to
+        // its source token, not a resolved date (rendering has no clock —
+        // resolution only happens in `exec`).
+        let header = |sql: &str| parse(sql).unwrap().select[0].header();
+        assert_eq!(header("SELECT '-7d'"), "'-7d'");
+        assert_eq!(header("SELECT 'today'"), "'today'");
+        assert_eq!(header("SELECT '+3w'"), "'+3w'");
+    }
+
+    #[test]
     fn lower_expr_scalar_and_arithmetic_shapes() {
         let q = parse("SELECT lower(status), a + b, a || '-' || status").unwrap();
         assert_eq!(
@@ -1665,5 +1709,50 @@ mod tests {
     fn file_attr_still_special_and_no_nesting() {
         assert!(parse("SELECT file.name").is_ok());
         assert!(parse("SELECT file.name.x").is_err()); // file.* has no nesting
+    }
+
+    #[test]
+    fn relative_date_string_lowers_to_reldate_literal() {
+        use crate::query::ast::{DateUnit, RelDate};
+        let q = parse("SELECT file.name WHERE created >= '-7d'").unwrap();
+        assert_eq!(
+            q.filter,
+            Some(Predicate::Compare(
+                Expr::Col(ColRef::Field(vec!["created".into()])),
+                CmpOp::Ge,
+                Expr::Lit(Literal::RelativeDate(RelDate::Offset {
+                    n: -7,
+                    unit: DateUnit::Day
+                }))
+            ))
+        );
+
+        // A non-matching string stays a plain `Str` literal — no
+        // pre-existing string literal is reinterpreted (spec §9).
+        let q2 = parse("SELECT file.name WHERE status = 'draft'").unwrap();
+        assert_eq!(
+            q2.filter,
+            Some(Predicate::Compare(
+                Expr::Col(ColRef::Field(vec!["status".into()])),
+                CmpOp::Eq,
+                Expr::Lit(Literal::Str("draft".into()))
+            ))
+        );
+    }
+
+    #[test]
+    fn like_pattern_resembling_reldate_stays_literal_text() {
+        // `Predicate::Like`'s pattern is a plain `String`, never a
+        // `Literal` — it must never be reinterpreted as a relative date
+        // even when the pattern text happens to match the grammar.
+        let q = parse("SELECT file.name WHERE jira LIKE '-7d'").unwrap();
+        assert_eq!(
+            q.filter,
+            Some(Predicate::Like(
+                ColRef::Field(vec!["jira".into()]),
+                "-7d".into(),
+                false
+            ))
+        );
     }
 }
