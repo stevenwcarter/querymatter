@@ -1638,7 +1638,41 @@ mod tests {
     #[test]
     fn parses_timer_on_off() {
         assert_eq!(parse_dot(".timer on"), DotCommand::Timer(Some(true)));
+        assert_eq!(parse_dot(".timer off"), DotCommand::Timer(Some(false)));
         assert_eq!(parse_dot(".timer"), DotCommand::Timer(None));
+    }
+
+    /// An unrecognized `.timer` argument is `Unknown` carrying the whole
+    /// line — mirrors `header_bad_arg_is_unknown_command`: there's no
+    /// `on`/`off` equivalent worth naming individually, so the existing
+    /// unknown-command error path handles it directly.
+    #[test]
+    fn timer_bad_arg_is_unknown_command() {
+        assert_eq!(
+            parse_dot(".timer maybe"),
+            DotCommand::Unknown(".timer maybe".to_string())
+        );
+    }
+
+    /// `dispatch_dot` wires `.timer on` through to `Session::set_timer`,
+    /// reusing the same `Session` builder `dispatch_header_off_sets_session`
+    /// uses — the timer setting defaults to `off`, so this also proves the
+    /// dispatch actually flips it rather than the default coincidentally
+    /// matching.
+    #[test]
+    fn dispatch_timer_on_sets_session() {
+        let td = tempdir().unwrap();
+        fs::write(td.path().join("a.md"), "---\nstatus: draft\n---\n").unwrap();
+        let mut session = query_cmd_test_session(td.path());
+        assert!(!session.timer(), "timer must default to off");
+        let mut sink = OutputSink::Stdout;
+
+        assert!(!dispatch_dot(
+            DotCommand::Timer(Some(true)),
+            &mut session,
+            &mut sink
+        ));
+        assert!(session.timer());
     }
 
     /// The startup banner must name the record count and hint at both
