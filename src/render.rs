@@ -5,6 +5,7 @@
 //! Every format is returned with no trailing newline, so a caller (the REPL
 //! printer) can add exactly one when it prints the result.
 
+use std::io::IsTerminal;
 use std::str::FromStr;
 
 use comfy_table::Table;
@@ -144,13 +145,26 @@ pub fn render(table: &ResultTable, output: Output, style: TableStyle, header: bo
     }
 }
 
+/// Table width-fitting is enabled only when stdout is a real terminal, so
+/// piped/redirected output stays byte-identical (the interchange-format rule).
+fn want_dynamic_width(is_tty: bool) -> bool {
+    is_tty
+}
+
 /// Renders `table` via `comfy-table` with `style`'s borders.
 ///
 /// [`TableStyle::Ascii`] deliberately loads no preset at all rather than
 /// loading `ASCII_FULL`: `comfy-table`'s own default is what shipped, so
 /// leaving it untouched keeps the default output provably unchanged.
+///
+/// Width fitting to the terminal is applied here (gated by
+/// [`want_dynamic_width`]), not in [`new_table`]/[`render_markdown`]: Markdown
+/// is a fixed interchange format and must stay terminal-independent.
 fn render_table(table: &ResultTable, style: TableStyle, header: bool) -> String {
     let mut ct = new_table(table, header);
+    if want_dynamic_width(std::io::stdout().is_terminal()) {
+        ct.set_content_arrangement(comfy_table::ContentArrangement::Dynamic);
+    }
     match style {
         TableStyle::Ascii => {}
         TableStyle::Unicode => {
@@ -756,5 +770,36 @@ mod tests {
         let s = render(&table(), Output::Vertical, TableStyle::Ascii, true);
         assert!(s.contains(" 1. row "), "got:\n{s}");
         assert!(s.contains(" 2. row "), "got:\n{s}");
+    }
+
+    #[test]
+    fn table_uses_dynamic_arrangement_only_on_a_tty() {
+        // non-TTY: no dynamic width (byte-identical to today).
+        assert!(!want_dynamic_width(false));
+        // TTY: dynamic width on.
+        assert!(want_dynamic_width(true));
+    }
+
+    /// `render_markdown` never consults the terminal, so its output is fixed
+    /// regardless of whether stdout is a TTY.
+    #[test]
+    fn markdown_render_is_terminal_independent() {
+        let a = render(
+            &table(),
+            Output::Format(Format::Md),
+            TableStyle::Ascii,
+            true,
+        );
+        let b = render(
+            &table(),
+            Output::Format(Format::Md),
+            TableStyle::Ascii,
+            true,
+        );
+        assert_eq!(a, b);
+        assert!(
+            a.contains("status"),
+            "md keeps its header/content, got:\n{a}"
+        );
     }
 }
