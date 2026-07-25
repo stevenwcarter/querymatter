@@ -180,6 +180,23 @@ fn rewrite_expr_literals(expr: &mut Expr, now: SystemTime) {
                 rewrite_expr_literals(arg, now);
             }
         }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+        } => {
+            if let Some(op) = operand {
+                rewrite_expr_literals(op, now);
+            }
+            for (cond, then) in whens {
+                rewrite_expr_literals(cond, now);
+                rewrite_expr_literals(then, now);
+            }
+            if let Some(e) = else_expr {
+                rewrite_expr_literals(e, now);
+            }
+        }
+        Expr::Predicate(pred) => rewrite_predicate_literals(pred, now),
     }
 }
 
@@ -521,6 +538,42 @@ fn expr_columns(expr: &Expr) -> Vec<&ColRef> {
         Expr::Scalar(_, args) => args.iter().flat_map(expr_columns).collect(),
         Expr::Binary(_, l, r) => expr_columns(l).into_iter().chain(expr_columns(r)).collect(),
         Expr::Coalesce(args) => args.iter().flat_map(expr_columns).collect(),
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+        } => {
+            let mut cols: Vec<&ColRef> = operand
+                .as_deref()
+                .into_iter()
+                .flat_map(expr_columns)
+                .collect();
+            for (cond, then) in whens {
+                cols.extend(expr_columns(cond));
+                cols.extend(expr_columns(then));
+            }
+            cols.extend(else_expr.as_deref().into_iter().flat_map(expr_columns));
+            cols
+        }
+        Expr::Predicate(pred) => predicate_columns(pred),
+    }
+}
+
+/// Every column a `WHERE`-style predicate tree references, mirroring
+/// [`expr_columns`] but for [`Predicate`] — used when a `CASE WHEN`
+/// condition ([`Expr::Predicate`]) reaches [`expr_columns`].
+fn predicate_columns(pred: &Predicate) -> Vec<&ColRef> {
+    match pred {
+        Predicate::Compare(l, _, r) => expr_columns(l).into_iter().chain(expr_columns(r)).collect(),
+        Predicate::Like(col, _, _) | Predicate::In(col, _, _) | Predicate::IsNull(col, _) => {
+            vec![col]
+        }
+        Predicate::MemberOf(_, col, _) => vec![col],
+        Predicate::And(a, b) | Predicate::Or(a, b) => predicate_columns(a)
+            .into_iter()
+            .chain(predicate_columns(b))
+            .collect(),
+        Predicate::Not(inner) => predicate_columns(inner),
     }
 }
 
@@ -946,10 +999,18 @@ fn resolve_col(record: &Record, col: &ColRef) -> Value {
 /// pseudo-column resolves via [`resolve_col`], a literal evaluates to its
 /// `Value`, a scalar-function call evaluates its arguments first then
 /// applies [`apply_scalar`], a binary op evaluates both sides then applies
-/// [`apply_binary`], and `COALESCE` evaluates its arguments left to right,
-/// short-circuiting on the first non-null. Used by both the ungrouped
+/// [`apply_binary`], `COALESCE` evaluates its arguments left to right,
+/// short-circuiting on the first non-null, `CASE` picks its first matching
+/// arm (see below), and `Expr::Predicate` evaluates a `WHERE`-style
+/// predicate to a `Value::Bool`/`Value::Null`. Used by both the ungrouped
 /// projection (per row, [`expand_select`]) and the grouped projection (over
 /// a group's representative row, [`eval_group_expr`]).
+///
+/// `CASE` evaluation: the searched form (`operand: None`) returns the first
+/// `WHEN` arm whose condition is truthy (via [`is_truthy`]); the simple form
+/// (`operand: Some`) returns the first arm whose value equals the operand
+/// (via [`eval_compare`], the same equality `IN`/`MEMBER OF` use). Neither
+/// matching falls through to `else_expr`, or `Value::Null` with no `ELSE`.
 pub(crate) fn eval_expr(record: &Record, expr: &Expr) -> Value {
     match expr {
         Expr::Col(col) => resolve_col(record, col),
@@ -968,7 +1029,43 @@ pub(crate) fn eval_expr(record: &Record, expr: &Expr) -> Value {
             .map(|arg| eval_expr(record, arg))
             .find(|v| !v.is_null())
             .unwrap_or(Value::Null),
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+        } => {
+            match operand {
+                None => {
+                    for (cond, then) in whens {
+                        if is_truthy(&eval_expr(record, cond)) {
+                            return eval_expr(record, then);
+                        }
+                    }
+                }
+                Some(op) => {
+                    let target = eval_expr(record, op);
+                    for (val, then) in whens {
+                        let candidate = eval_expr(record, val);
+                        if eval_compare(&target, &CmpOp::Eq, &candidate) == Some(true) {
+                            return eval_expr(record, then);
+                        }
+                    }
+                }
+            }
+            else_expr
+                .as_deref()
+                .map_or(Value::Null, |e| eval_expr(record, e))
+        }
+        Expr::Predicate(pred) => eval_predicate(record, pred).map_or(Value::Null, Value::Bool),
     }
+}
+
+/// Whether `v` counts as a `CASE WHEN` condition being satisfied: only
+/// `Value::Bool(true)` is truthy — `Value::Null` (the 3VL-unknown result an
+/// `Expr::Predicate` condition can produce) and any other value are not,
+/// mirroring [`filter_records`]'s "only `Some(true)` keeps a row" rule.
+fn is_truthy(v: &Value) -> bool {
+    matches!(v, Value::Bool(true))
 }
 
 /// Converts a literal constant to the `Value` it evaluates to.
@@ -1633,6 +1730,34 @@ mod tests {
         assert_eq!(
             execute(&all_null, rows[1..2].iter(), false).unwrap().rows,
             vec![vec![Value::Null]]
+        );
+    }
+
+    #[test]
+    fn searched_case_selects_first_true_branch() {
+        let rows = [
+            rec("s", "s/a.md", &[("status", Value::Str("draft".into()))]),
+            rec("s", "s/b.md", &[("status", Value::Str("done".into()))]),
+        ];
+        let q = parse("SELECT CASE WHEN status = 'draft' THEN 'D' ELSE 'X' END").unwrap();
+        assert_eq!(
+            execute(&q, rows.iter(), false).unwrap().rows,
+            vec![vec![Value::Str("D".into())], vec![Value::Str("X".into())]]
+        );
+    }
+
+    #[test]
+    fn simple_case_matches_operand() {
+        let rows = [
+            rec("s", "s/a.md", &[("status", Value::Str("done".into()))]),
+            rec("s", "s/b.md", &[("status", Value::Str("other".into()))]),
+        ];
+        let q = parse("SELECT CASE status WHEN 'draft' THEN 'D' WHEN 'done' THEN 'Z' END").unwrap();
+        assert_eq!(
+            execute(&q, rows.iter(), false).unwrap().rows,
+            // "done" matches the second WHEN; "other" matches no WHEN and
+            // there's no ELSE, so it falls back to `Value::Null`.
+            vec![vec![Value::Str("Z".into())], vec![Value::Null]]
         );
     }
 

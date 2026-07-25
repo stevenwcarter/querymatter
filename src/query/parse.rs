@@ -297,8 +297,60 @@ fn lower_expr(expr: &sql::Expr) -> Result<Expr, ParseError> {
         } => lower_substr(expr, substring_from, substring_for),
         sql::Expr::BinaryOp { left, op, right } => lower_expr_binary(left, op, right),
         sql::Expr::Nested(inner) => lower_expr(inner),
+        sql::Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => lower_case(operand, conditions, else_result),
         _ => Err(unsupported("this SELECT expression")),
     }
+}
+
+/// Lowers a `CASE [operand] WHEN cond THEN val ... [ELSE val] END`
+/// expression.
+///
+/// In the searched form (`operand: None`), each `WHEN` condition is a full
+/// `WHERE`-style predicate — lowered via [`lower_predicate`] and wrapped in
+/// [`Expr::Predicate`] — so a searched `CASE` gets the same
+/// comparison/`LIKE`/`IN`/`MEMBER OF`/`AND`/`OR`/`NOT` grammar `WHERE`
+/// already supports, rather than a second, narrower boolean grammar. In the
+/// simple form (`operand: Some`), each `WHEN` is a plain value the operand
+/// is compared against for equality (`exec::eval_expr`), so it lowers via
+/// [`lower_expr`] like any other value position. Every sub-expression lowers
+/// through `lower_expr`/`lower_predicate`, so a relative-date string literal
+/// inside a `CASE` arm is resolved to `RelDate` the same as anywhere else.
+fn lower_case(
+    operand: &Option<Box<sql::Expr>>,
+    conditions: &[sql::CaseWhen],
+    else_result: &Option<Box<sql::Expr>>,
+) -> Result<Expr, ParseError> {
+    let operand = operand
+        .as_deref()
+        .map(lower_expr)
+        .transpose()?
+        .map(Box::new);
+    let whens = conditions
+        .iter()
+        .map(|when| {
+            let cond = if operand.is_some() {
+                lower_expr(&when.condition)?
+            } else {
+                Expr::Predicate(Box::new(lower_predicate(&when.condition)?))
+            };
+            Ok((cond, lower_expr(&when.result)?))
+        })
+        .collect::<Result<Vec<_>, ParseError>>()?;
+    let else_expr = else_result
+        .as_deref()
+        .map(lower_expr)
+        .transpose()?
+        .map(Box::new);
+    Ok(Expr::Case {
+        operand,
+        whens,
+        else_expr,
+    })
 }
 
 /// Lowers a scalar-function call (`lower(...)`, `ltrim(...)`, `replace(...)`,
