@@ -369,6 +369,22 @@ mod tests {
     }
 
     #[test]
+    fn md_no_header_omits_header_row() {
+        let s = render(
+            &table(),
+            Output::Format(Format::Md),
+            TableStyle::Ascii,
+            false,
+        );
+        assert!(!s.contains("status"), "header must be gone, got:\n{s}");
+        assert!(
+            !s.contains("---"),
+            "orphan header separator row must be gone, got:\n{s}"
+        );
+        assert!(s.contains("synced"));
+    }
+
+    #[test]
     fn table_no_header_omits_header_row() {
         let s = render(
             &table(),
