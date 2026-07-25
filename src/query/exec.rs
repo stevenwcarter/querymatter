@@ -732,15 +732,45 @@ fn compare_key_tuple(a: &[Value], b: &[Value]) -> Ordering {
         .unwrap_or(Ordering::Equal)
 }
 
+/// One `SELECT` item's projection state while [`project_group`] folds a
+/// group's rows: a non-aggregate expression just carries the expression to
+/// evaluate afterward (it only ever looks at the group's representative
+/// row, never the whole group — see [`eval_group_expr`]), while an aggregate
+/// carries a running [`AggState`] to be updated once per row.
+enum ProjectedItem<'a> {
+    Expr(&'a Expr),
+    Agg(AggState<'a>),
+}
+
 /// Projects one group's row: a non-aggregate expression is evaluated over
-/// the group's representative row, an aggregate is computed over the
-/// group's records.
+/// the group's representative row; every aggregate `SELECT` item instead
+/// gets its own [`AggState`], and ALL of them are folded together over a
+/// SINGLE pass through `group.rows` — rather than each aggregate rescanning
+/// the group on its own (which is what calling [`compute_aggregate`] once
+/// per item would do). The more aggregates a query projects, the more this
+/// saves.
 fn project_group(group: &Group<'_>, items: &[GroupedSelectItem]) -> Vec<Value> {
-    items
+    let mut projected: Vec<ProjectedItem<'_>> = items
         .iter()
         .map(|item| match item {
-            GroupedSelectItem::Expr(expr) => eval_group_expr(&group.rows, expr),
-            GroupedSelectItem::Agg(agg) => compute_aggregate(agg, &group.rows),
+            GroupedSelectItem::Expr(expr) => ProjectedItem::Expr(expr),
+            GroupedSelectItem::Agg(agg) => ProjectedItem::Agg(AggState::new(agg)),
+        })
+        .collect();
+
+    for record in &group.rows {
+        for item in &mut projected {
+            if let ProjectedItem::Agg(state) = item {
+                state.update(record);
+            }
+        }
+    }
+
+    projected
+        .into_iter()
+        .map(|item| match item {
+            ProjectedItem::Expr(expr) => eval_group_expr(&group.rows, expr),
+            ProjectedItem::Agg(state) => state.finish(),
         })
         .collect()
 }
@@ -770,35 +800,166 @@ fn empty_record() -> Record {
     )
 }
 
-/// Computes one aggregate function's value over a group's rows.
-fn compute_aggregate(agg: &Aggregate, rows: &[&Record]) -> Value {
-    match agg {
-        Aggregate::CountStar => Value::Int(rows.len() as i64),
-        Aggregate::Count(col, false) => Value::Int(non_null_values(rows, col).count() as i64),
-        Aggregate::Count(col, true) => {
-            let distinct: BTreeSet<String> = non_null_values(rows, col)
-                .map(|v| v.to_cmp_string())
-                .collect();
-            Value::Int(distinct.len() as i64)
+/// One aggregate call's running state, updated one row at a time. This is
+/// the single source of truth for every aggregate's NULL-handling and
+/// finalization rule, shared by two callers with different scanning needs:
+/// [`project_group`] builds one `AggState` per `SELECT` aggregate and folds
+/// a group's rows into all of them in one pass, while [`compute_aggregate`]
+/// below folds a group's rows into just one — for `HAVING`
+/// ([`eval_having_leaf`]) and a bare `ORDER BY` aggregate
+/// ([`resolve_group_order_targets`]), which each only ever need a single
+/// aggregate's value.
+enum AggState<'a> {
+    /// `count(*)` — every row counts, `NULL` or not.
+    CountStar(i64),
+    /// `count(col)` — counts only `col`'s non-null values.
+    Count { col: &'a ColRef, count: i64 },
+    /// `count(distinct col)` — the distinct non-null values seen, keyed by
+    /// [`Value::to_cmp_string`] (matching [`Value`] equality for the
+    /// purposes of this count).
+    CountDistinct {
+        col: &'a ColRef,
+        seen: BTreeSet<String>,
+    },
+    /// `sum(col)` — the running total of `col`'s numeric-coercible values;
+    /// `NULL` and non-numeric values are both skipped (mirroring
+    /// [`Value::as_number`], which returns `None` for both), so an
+    /// all-skipped group sums to the identity `0.0`.
+    Sum { col: &'a ColRef, sum: f64 },
+    /// `avg(col)` — the running sum and count of `col`'s numeric-coercible
+    /// values; `finish` divides by `count`, or yields `NULL` if `count` is
+    /// still zero (no numeric values seen).
+    Avg {
+        col: &'a ColRef,
+        sum: f64,
+        count: usize,
+    },
+    /// `min(col)`/`max(col)` — the running extreme of `col`'s non-null
+    /// values via [`compare_values`], starting at `NULL` (no extreme picked
+    /// yet). `want` is the [`Ordering`] that means "this value replaces the
+    /// running extreme" (`Less` for `MIN`, `Greater` for `MAX`).
+    Extreme {
+        col: &'a ColRef,
+        want: Ordering,
+        best: Value,
+    },
+    /// `group_concat(col)` — `col`'s non-null values, `display`-rendered and
+    /// collected in row order; `finish` joins them with `", "`.
+    GroupConcat { col: &'a ColRef, parts: Vec<String> },
+}
+
+impl<'a> AggState<'a> {
+    /// A zeroed/empty accumulator for `agg`, ready to fold in rows one at a
+    /// time via [`AggState::update`].
+    fn new(agg: &'a Aggregate) -> Self {
+        match agg {
+            Aggregate::CountStar => AggState::CountStar(0),
+            Aggregate::Count(col, false) => AggState::Count { col, count: 0 },
+            Aggregate::Count(col, true) => AggState::CountDistinct {
+                col,
+                seen: BTreeSet::new(),
+            },
+            Aggregate::Sum(col) => AggState::Sum { col, sum: 0.0 },
+            Aggregate::Avg(col) => AggState::Avg {
+                col,
+                sum: 0.0,
+                count: 0,
+            },
+            Aggregate::Min(col) => AggState::Extreme {
+                col,
+                want: Ordering::Less,
+                best: Value::Null,
+            },
+            Aggregate::Max(col) => AggState::Extreme {
+                col,
+                want: Ordering::Greater,
+                best: Value::Null,
+            },
+            Aggregate::GroupConcat(col) => AggState::GroupConcat {
+                col,
+                parts: Vec::new(),
+            },
         }
-        Aggregate::Sum(col) => Value::Float(numeric_values(rows, col).sum()),
-        Aggregate::Avg(col) => {
-            let nums: Vec<f64> = numeric_values(rows, col).collect();
-            if nums.is_empty() {
-                Value::Null
-            } else {
-                Value::Float(nums.iter().sum::<f64>() / nums.len() as f64)
+    }
+
+    /// Folds one more row into the running state. Call once per row in the
+    /// group, in row order — order matters for `GROUP_CONCAT`.
+    fn update(&mut self, record: &Record) {
+        match self {
+            AggState::CountStar(count) => *count += 1,
+            AggState::Count { col, count } => {
+                if !resolve_col(record, col).is_null() {
+                    *count += 1;
+                }
+            }
+            AggState::CountDistinct { col, seen } => {
+                let value = resolve_col(record, col);
+                if !value.is_null() {
+                    seen.insert(value.to_cmp_string());
+                }
+            }
+            AggState::Sum { col, sum } => {
+                if let Some(n) = resolve_col(record, col).as_number() {
+                    *sum += n;
+                }
+            }
+            AggState::Avg { col, sum, count } => {
+                if let Some(n) = resolve_col(record, col).as_number() {
+                    *sum += n;
+                    *count += 1;
+                }
+            }
+            AggState::Extreme { col, want, best } => {
+                let value = resolve_col(record, col);
+                if !value.is_null() {
+                    match compare_values(&value, best) {
+                        Some(ord) if ord == *want => *best = value,
+                        Some(_) => {}
+                        // `best` is still `Null` (no extreme picked yet): take `value`.
+                        None => *best = value,
+                    }
+                }
+            }
+            AggState::GroupConcat { col, parts } => {
+                let value = resolve_col(record, col);
+                if !value.is_null() {
+                    parts.push(value.display());
+                }
             }
         }
-        Aggregate::Min(col) => extreme_value(rows, col, Ordering::Less),
-        Aggregate::Max(col) => extreme_value(rows, col, Ordering::Greater),
-        Aggregate::GroupConcat(col) => Value::Str(
-            non_null_values(rows, col)
-                .map(|v| v.display())
-                .collect::<Vec<_>>()
-                .join(", "),
-        ),
     }
+
+    /// The aggregate's final value, once every row in the group has been
+    /// folded in via [`AggState::update`].
+    fn finish(self) -> Value {
+        match self {
+            AggState::CountStar(count) => Value::Int(count),
+            AggState::Count { count, .. } => Value::Int(count),
+            AggState::CountDistinct { seen, .. } => Value::Int(seen.len() as i64),
+            AggState::Sum { sum, .. } => Value::Float(sum),
+            AggState::Avg { sum, count, .. } => {
+                if count == 0 {
+                    Value::Null
+                } else {
+                    Value::Float(sum / count as f64)
+                }
+            }
+            AggState::Extreme { best, .. } => best,
+            AggState::GroupConcat { parts, .. } => Value::Str(parts.join(", ")),
+        }
+    }
+}
+
+/// Computes one aggregate function's value over a group's rows: builds a
+/// single [`AggState`] and folds every row into it. See [`AggState`]'s doc
+/// for why this and [`project_group`] share the same accumulator instead of
+/// each re-implementing per-aggregate NULL handling.
+fn compute_aggregate(agg: &Aggregate, rows: &[&Record]) -> Value {
+    let mut state = AggState::new(agg);
+    for record in rows {
+        state.update(record);
+    }
+    state.finish()
 }
 
 /// Evaluates a `HAVING` predicate tree against one group under SQL
@@ -841,33 +1002,6 @@ fn eval_having_leaf(leaf: &HavingLeaf, group: &Group<'_>, group_by: &[ColRef]) -
             .map(|idx| group.key[idx].clone())
             .unwrap_or(Value::Null),
     }
-}
-
-/// The non-null values of `col` across `rows`, in row order.
-fn non_null_values<'a>(rows: &'a [&Record], col: &'a ColRef) -> impl Iterator<Item = Value> + 'a {
-    rows.iter()
-        .map(move |record| resolve_col(record, col))
-        .filter(|v| !v.is_null())
-}
-
-/// The numeric-coercible values of `col` across `rows`; `NULL` and
-/// non-numeric values are both skipped (mirroring `Value::as_number`, which
-/// already returns `None` for both).
-fn numeric_values<'a>(rows: &'a [&Record], col: &'a ColRef) -> impl Iterator<Item = f64> + 'a {
-    rows.iter()
-        .filter_map(move |record| resolve_col(record, col).as_number())
-}
-
-/// `MIN`/`MAX` over `col`'s non-null values via [`compare_values`], `Null`
-/// when there are none. `want` is the ordering that means "this value
-/// replaces the running extreme" (`Less` for `MIN`, `Greater` for `MAX`).
-fn extreme_value(rows: &[&Record], col: &ColRef, want: Ordering) -> Value {
-    non_null_values(rows, col).fold(Value::Null, |acc, v| match compare_values(&v, &acc) {
-        Some(ord) if ord == want => v,
-        Some(_) => acc,
-        // `acc` is still `Null` (no extreme picked yet): take `v`.
-        None => v,
-    })
 }
 
 /// An `ORDER BY` target for the grouped path, resolved once against the
@@ -2984,6 +3118,51 @@ mod agg_tests {
         let q = parse("SELECT count(*) AS rows, count(n) AS non_null").unwrap();
         let t = execute(&q, rows.iter(), false).unwrap();
         assert_eq!(t.rows, vec![vec![Value::Int(3), Value::Int(2)]]);
+    }
+    #[test]
+    fn multiple_aggregates_per_group_match_single_pass() {
+        // Characterization test for the single-pass `project_group`
+        // refactor (Task 11/W40): projects five aggregates over the SAME
+        // column, across two groups, with a `NULL` in each group's `n`
+        // column — so COUNT(*)'s row count, SUM/AVG's numeric-only count,
+        // and MIN/MAX's non-null skipping are all exercised at once. Pins
+        // the exact per-group values; must stay green whether each
+        // aggregate rescans the group (today) or all five are folded from
+        // one pass over the group's rows (after the refactor).
+        let rows = [
+            rec_n("s/a.md", "draft", Value::Int(2)),
+            rec_n("s/b.md", "draft", Value::Int(4)),
+            rec_n("s/c.md", "draft", Value::Null),
+            rec_n("s/d.md", "synced", Value::Int(10)),
+            rec_n("s/e.md", "synced", Value::Null),
+        ];
+        let q = parse(
+            "SELECT status, count(*) AS c, sum(n) AS s, avg(n) AS a, min(n) AS mn, max(n) AS mx \
+             GROUP BY status ORDER BY status",
+        )
+        .unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec![
+                    Value::Str("draft".into()),
+                    Value::Int(3),
+                    Value::Float(6.0),
+                    Value::Float(3.0),
+                    Value::Int(2),
+                    Value::Int(4),
+                ],
+                vec![
+                    Value::Str("synced".into()),
+                    Value::Int(2),
+                    Value::Float(10.0),
+                    Value::Float(10.0),
+                    Value::Int(10),
+                    Value::Int(10),
+                ],
+            ]
+        );
     }
     #[test]
     fn order_by_ungrouped_column_errors() {
