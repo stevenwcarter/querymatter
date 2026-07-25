@@ -2290,29 +2290,43 @@ mod tests {
 
     #[test]
     fn extreme_offset_magnitude_falls_back_to_str_and_does_not_panic() {
-        // A 15-digit offset is well within `i64` (so `digits.parse()`
-        // succeeds) but far beyond `RelDate::parse`'s max offset magnitude;
-        // `RelDate::parse` rejects it, so it stays a plain `Literal::Str`
-        // rather than reaching `resolve_reldate` and overflowing/panicking
-        // `chrono::Duration::days`.
-        let q = parse("SELECT file.name WHERE created = '-999999999999999d'").unwrap();
-        assert_eq!(
-            q.filter,
-            Some(Predicate::Compare(
-                Expr::Col(ColRef::Field(vec!["created".into()])),
-                CmpOp::Eq,
-                Expr::Lit(Literal::Str("-999999999999999d".into()))
-            ))
-        );
+        // Each of these is malformed/out-of-bound enough that
+        // `RelDate::parse` must reject it, so it stays a plain
+        // `Literal::Str` rather than reaching `resolve_reldate` and
+        // overflowing/panicking `chrono::Duration::days`/`weeks`:
+        //
+        // - a 15-digit offset: within `i64`, but far beyond
+        //   `RelDate::parse`'s max offset magnitude;
+        // - a doubled or misplaced sign (`--…`, `-+…`, `+-…`): without the
+        //   all-digits check on `digits`, the embedded second sign would
+        //   let a huge NEGATIVE `n` sail past the `> MAX_OFFSET_MAGNITUDE`
+        //   check (which only catches large *positive* values), then get
+        //   flipped back to a huge *positive* value by `sign * n` —
+        //   bypassing the bound entirely. Reproduced end-to-end
+        //   (`TimeDelta::days out of bounds`) before the all-digits guard
+        //   was added; see task-5-report.md.
+        for token in ["-999999999999999d", "--999999999999999d", "-+7d", "+-7d"] {
+            let sql = format!("SELECT file.name WHERE created = '{token}'");
+            let q = parse(&sql).unwrap();
+            assert_eq!(
+                q.filter,
+                Some(Predicate::Compare(
+                    Expr::Col(ColRef::Field(vec!["created".into()])),
+                    CmpOp::Eq,
+                    Expr::Lit(Literal::Str(token.into()))
+                )),
+                "{token} should stay a plain string literal"
+            );
 
-        let row = rec(
-            "s",
-            "s/a.md",
-            &[("created", Value::Str("2026-07-17".into()))],
-        );
-        // Must not panic; the literal text never matches a real date.
-        let t = execute(&q, std::iter::once(&row), false).unwrap();
-        assert!(t.rows.is_empty());
+            let row = rec(
+                "s",
+                "s/a.md",
+                &[("created", Value::Str("2026-07-17".into()))],
+            );
+            // Must not panic; the literal text never matches a real date.
+            let t = execute(&q, std::iter::once(&row), false).unwrap();
+            assert!(t.rows.is_empty(), "{token} should match no rows");
+        }
     }
 }
 

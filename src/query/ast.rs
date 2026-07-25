@@ -296,12 +296,14 @@ const MAX_OFFSET_MAGNITUDE: i64 = 100_000;
 
 impl RelDate {
     /// Parses a relative-date token under a strict, anchored grammar:
-    /// `today | now | [+-]<int>(d|w|mo|y)`, case-insensitive for the bare
-    /// `today`/`now` keywords. Anything else — including a sign-less offset
-    /// (`7d`), an unrecognized unit (`-7m`, `-7x`), a bare number (`-7`), or
-    /// an offset magnitude beyond [`MAX_OFFSET_MAGNITUDE`] — is not a
-    /// relative date and returns `None`, leaving the caller free to treat
-    /// the string as a plain string literal.
+    /// `today | now | [+-]<digits>(d|w|mo|y)`, case-insensitive for the bare
+    /// `today`/`now` keywords — exactly one leading sign, then only ASCII
+    /// digits. Anything else — including a sign-less offset (`7d`), a
+    /// doubled or misplaced sign (`--7d`, `-+7d`), an unrecognized unit
+    /// (`-7m`, `-7x`), a bare number (`-7`), or an offset magnitude beyond
+    /// [`MAX_OFFSET_MAGNITUDE`] — is not a relative date and returns `None`,
+    /// leaving the caller free to treat the string as a plain string
+    /// literal.
     pub fn parse(s: &str) -> Option<RelDate> {
         let s = s.trim();
         match s.to_ascii_lowercase().as_str() {
@@ -322,6 +324,19 @@ impl RelDate {
         } else {
             (rest.strip_suffix('y')?, DateUnit::Year)
         };
+        // `digits` must be a clean unsigned integer — no embedded sign, no
+        // whitespace. Without this, `i64::from_str` accepting its own
+        // leading `-`/`+` would let a *second* sign character slip through
+        // as part of `digits` (e.g. `--999999999999999d` strips only the
+        // outer `-` into `sign`, leaving `digits = "-999999999999999"`),
+        // producing a huge negative `n` that passes the `> MAX_OFFSET_MAGNITUDE`
+        // check (it's negative, not too large) only to be flipped back to a
+        // huge *positive* value by `sign * n` below — bypassing the bound
+        // entirely and reaching `resolve_reldate`'s `Duration::days`/`weeks`
+        // with a value that panics on overflow.
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
         let n: i64 = digits.parse().ok()?;
         if n > MAX_OFFSET_MAGNITUDE {
             return None;
@@ -717,6 +732,21 @@ mod tests {
             "-7",
             "",
             "-999999999999999d",
+            // A doubled or misplaced sign must never slip an embedded `-`/
+            // `+` into `digits`: `i64::from_str` accepts its own leading
+            // sign, so without an explicit all-digits check on `digits`,
+            // `--999999999999999d` would strip only the outer `-`, parse
+            // the huge NEGATIVE remainder as `n` (sailing past the
+            // `> MAX_OFFSET_MAGNITUDE` check, which only catches large
+            // *positive* values), then flip it back to a huge positive
+            // value via `sign * n` — bypassing the bound entirely and
+            // reaching `resolve_reldate`'s `Duration::days` with a value
+            // that panics on overflow (reproduced end-to-end in
+            // `exec::tests` before this guard was added; see
+            // task-5-report.md).
+            "--999999999999999d",
+            "-+7d",
+            "+-7d",
         ] {
             assert_eq!(RelDate::parse(bad), None, "should reject {bad}");
         }
