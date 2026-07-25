@@ -3057,6 +3057,111 @@ mod tests {
             assert!(t.rows.is_empty(), "{token} should match no rows");
         }
     }
+
+    #[test]
+    fn order_by_date_field_is_chronological_with_nulls_last() {
+        // I3 (W57 characterization): now that a strict-ISO `created` field
+        // auto-detects to `Value::Date` at ingest, `ORDER BY created` must
+        // still sort chronologically (== lexically for ISO dates) and place
+        // a record with no `created` field (`Value::Null`) last — for both
+        // directions — exactly as it did back when the field was a plain
+        // `Value::Str` (see `null_field_sorts_last_asc_and_desc` above).
+        let rows = [
+            rec(
+                "s",
+                "s/a.md",
+                &[(
+                    "created",
+                    Value::Date(NaiveDate::from_ymd_opt(2026, 7, 24).unwrap()),
+                )],
+            ),
+            rec(
+                "s",
+                "s/b.md",
+                &[(
+                    "created",
+                    Value::Date(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()),
+                )],
+            ),
+            rec(
+                "s",
+                "s/c.md",
+                &[(
+                    "created",
+                    Value::Date(NaiveDate::from_ymd_opt(2026, 12, 31).unwrap()),
+                )],
+            ),
+            rec("s", "s/d.md", &[]), // no `created` field -> Value::Null
+        ];
+
+        let asc = parse("SELECT file.name ORDER BY created ASC").unwrap();
+        let t_asc = execute(&asc, rows.iter(), false).unwrap();
+        assert_eq!(
+            t_asc.rows,
+            vec![
+                vec![Value::Str("b.md".into())],
+                vec![Value::Str("a.md".into())],
+                vec![Value::Str("c.md".into())],
+                vec![Value::Str("d.md".into())],
+            ]
+        );
+
+        // NULL stays last under DESC too — only the non-null comparison
+        // reverses (see `order_cmp`).
+        let desc = parse("SELECT file.name ORDER BY created DESC").unwrap();
+        let t_desc = execute(&desc, rows.iter(), false).unwrap();
+        assert_eq!(
+            t_desc.rows,
+            vec![
+                vec![Value::Str("c.md".into())],
+                vec![Value::Str("a.md".into())],
+                vec![Value::Str("b.md".into())],
+                vec![Value::Str("d.md".into())],
+            ]
+        );
+    }
+
+    #[test]
+    fn order_by_mixed_date_and_string_column_is_panic_free_with_defined_order() {
+        // I4 (W57 characterization): a field that auto-detected to
+        // `Value::Date` on some records but stayed `Value::Str` on another
+        // (e.g. a non-ISO value like "someday") must still sort without
+        // panicking, via `model::compare_dates`'s ISO-text fallback for any
+        // pairing that mixes `Date` with `Str`.
+        let rows = [
+            rec(
+                "s",
+                "s/a.md",
+                &[(
+                    "created",
+                    Value::Date(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()),
+                )],
+            ),
+            rec("s", "s/b.md", &[("created", Value::Str("someday".into()))]),
+            rec(
+                "s",
+                "s/c.md",
+                &[(
+                    "created",
+                    Value::Date(NaiveDate::from_ymd_opt(2026, 6, 1).unwrap()),
+                )],
+            ),
+        ];
+        let q = parse("SELECT file.name ORDER BY created ASC").unwrap();
+        // Must not panic (a non-transitive comparator would corrupt the sort
+        // or panic outright); "2026-01-01" < "2026-06-01" < "someday"
+        // lexically, so the two dated rows sort first, in date order, and
+        // the non-date string sorts last — a defined total order.
+        let t = execute(&q, rows.iter(), false).unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec![Value::Str("a.md".into())],
+                vec![Value::Str("c.md".into())],
+                vec![Value::Str("b.md".into())],
+            ]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3322,6 +3427,38 @@ mod agg_tests {
         let q = parse("SELECT min(n) AS lo, max(n) AS hi").unwrap();
         let t = execute(&q, rows.iter(), false).unwrap();
         assert_eq!(t.rows, vec![vec![Value::Null, Value::Null]]);
+    }
+    #[test]
+    fn min_and_max_over_date_column() {
+        // I3 (W57 characterization): MIN/MAX over a `Value::Date` column
+        // must resolve chronologically (== lexically for ISO dates), just
+        // as `min_and_max_over_column` above pins for an `Int` column.
+        let rows = [
+            rec_n(
+                "s/a.md",
+                "draft",
+                Value::Date(NaiveDate::from_ymd_opt(2026, 7, 24).unwrap()),
+            ),
+            rec_n(
+                "s/b.md",
+                "draft",
+                Value::Date(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()),
+            ),
+            rec_n(
+                "s/c.md",
+                "draft",
+                Value::Date(NaiveDate::from_ymd_opt(2026, 12, 31).unwrap()),
+            ),
+        ];
+        let q = parse("SELECT min(n) AS lo, max(n) AS hi").unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
+        assert_eq!(
+            t.rows,
+            vec![vec![
+                Value::Date(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()),
+                Value::Date(NaiveDate::from_ymd_opt(2026, 12, 31).unwrap()),
+            ]]
+        );
     }
     #[test]
     fn count_col_counts_non_null_only() {

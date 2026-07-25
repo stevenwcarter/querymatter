@@ -2581,3 +2581,100 @@ fn explain_verdict_matches_discover_membership_end_to_end() {
         }
     }
 }
+
+/// I2 (W57 characterization): a strict-ISO `created` field auto-detects to
+/// `Value::Date` at ingest rather than staying `Value::Str`, and the
+/// relative-date literal it's compared against resolves to an ISO string —
+/// pin that `WHERE created > '-7d'` still returns exactly the rows it would
+/// have before dates existed, end to end through the real binary. Fixture
+/// dates are computed from the real clock (this codebase has no `--now`
+/// override for the CLI, unlike `execute_with_schema_at`'s test-only seam),
+/// so the test stays correct regardless of when it runs.
+#[test]
+fn relative_date_filter_matches_after_auto_detected_date_type() {
+    use chrono::{DateTime, Duration, Utc};
+
+    // `chrono`'s "clock" feature is off (see Cargo.toml), so read the real
+    // time via `std::time::SystemTime::now()` and convert, rather than
+    // `Utc::now()` directly — the same pattern `model::system_time_to_iso`
+    // and `query::exec::resolve_reldate` already use.
+    let today = DateTime::<Utc>::from(std::time::SystemTime::now()).date_naive();
+    let recent = (today - Duration::days(3)).format("%Y-%m-%d").to_string();
+    let old = (today - Duration::days(30)).format("%Y-%m-%d").to_string();
+
+    let td = TempDir::new().unwrap();
+    fs::write(
+        td.path().join("recent.md"),
+        format!("---\ncreated: {recent}\n---\n"),
+    )
+    .unwrap();
+    fs::write(
+        td.path().join("old.md"),
+        format!("---\ncreated: {old}\n---\n"),
+    )
+    .unwrap();
+
+    let home = TempDir::new().unwrap();
+    let out = qm(home.path())
+        .args([
+            "-e",
+            "SELECT file.name WHERE created > '-7d'",
+            "--format",
+            "csv",
+        ])
+        .arg(td.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(
+        String::from_utf8(out).unwrap().trim(),
+        "file.name\nrecent.md"
+    );
+}
+
+/// I1 (W57 characterization): a `Value::Date` field must render its ISO text
+/// byte-identical to the source frontmatter string, across every output
+/// format — a date must not render any differently from the `Value::Str` it
+/// would have been before auto-detection.
+#[test]
+fn date_field_renders_verbatim_across_csv_json_table() {
+    let td = TempDir::new().unwrap();
+    fs::write(td.path().join("a.md"), "---\ncreated: 2026-03-15\n---\n").unwrap();
+    let home = TempDir::new().unwrap();
+
+    let csv = qm(home.path())
+        .args(["-e", "SELECT created", "--format", "csv"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(
+        String::from_utf8(csv).unwrap().trim(),
+        "created\n2026-03-15"
+    );
+
+    let json = qm(home.path())
+        .args(["-e", "SELECT created", "--format", "json"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
+    assert_eq!(
+        v.as_array().unwrap()[0]["created"],
+        serde_json::Value::String("2026-03-15".into())
+    );
+
+    qm(home.path())
+        .args(["-e", "SELECT created", "--format", "table"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("2026-03-15"));
+}
