@@ -859,15 +859,31 @@ fn canonicalize_dirs(dirs: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
 /// statement that fails aborts the run: its error propagates to `main`,
 /// which reports it on stderr and exits non-zero. Statements that ran before
 /// it have already been written.
+///
+/// A failing statement's error is prefixed with its 1-based position —
+/// `statement N of M failed: ...` — whenever the batch has more than one
+/// statement (design W36), so a partial `--output` run tells the caller
+/// exactly which statement to blame. A lone statement needs no "1 of 1"
+/// noise, so the prefix is omitted when `M == 1`. This is batch/`-e`/`query
+/// run` only; the REPL runs statements one at a time via its own loop and is
+/// unaffected.
 fn run_statements(session: &Session, input: &str, output: Option<&Path>) -> anyhow::Result<usize> {
     let mut sink = match output {
         Some(path) => OutputSink::open_file(path)
             .with_context(|| format!("cannot write results to {}", path.display()))?,
         None => OutputSink::Stdout,
     };
+    let statements = split_statements(input);
+    let total = statements.len();
     let mut total_rows = 0;
-    for statement in split_statements(input) {
-        let (rendered, rows) = session.render_statement_counted(&statement)?;
+    for (i, statement) in statements.iter().enumerate() {
+        let (rendered, rows) =
+            session
+                .render_statement_counted(statement)
+                .map_err(|e| match total {
+                    1 => e,
+                    _ => e.context(format!("statement {} of {total} failed", i + 1)),
+                })?;
         sink.write_block(&rendered)
             .context("failed to write query results")?;
         total_rows += rows;

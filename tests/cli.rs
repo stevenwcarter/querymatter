@@ -346,6 +346,37 @@ fn batch_good_then_bad_exits_nonzero() {
         .failure();
 }
 
+/// A batch/`-e` run of 3 statements whose 2nd fails must name its 1-based
+/// position in the error, so a partial `--output` run tells the caller
+/// exactly which statement to blame (design W36).
+#[test]
+fn batch_failure_names_the_statement_index() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg("-e")
+        .arg("SELECT status; SELECT bogus((( ; SELECT status")
+        .arg(td.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("statement 2 of 3"));
+}
+
+/// A lone failing statement needs no "N of M" attribution — `1 of 1` would
+/// just be noise.
+#[test]
+fn single_statement_failure_is_not_indexed() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg("-e")
+        .arg("SELECT bogus(((")
+        .arg(td.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("statement 1 of 1").not());
+}
+
 #[test]
 fn querymatterignore_in_cwd_excludes_matches() {
     let td = TempDir::new().unwrap();
