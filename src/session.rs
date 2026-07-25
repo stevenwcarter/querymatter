@@ -292,7 +292,7 @@ impl Session {
         for record in self.store.records() {
             total += 1;
             for name in record.field_names() {
-                let value = record.field(name);
+                let value = record.field(&[name.into()]);
                 let stat = raw.entry(name.to_string()).or_default();
                 stat.variants.insert(value.variant_name());
                 if !value.is_null() {

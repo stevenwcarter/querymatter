@@ -64,12 +64,15 @@ pub enum SelectExpr {
     Agg(Aggregate),
 }
 
-/// A reference to a queryable column: either a frontmatter field or a `file.*`
-/// pseudo-column.
+/// A reference to a queryable column: either a frontmatter field (possibly
+/// dotted into a nested `Value::Map`) or a `file.*` pseudo-column.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ColRef {
-    /// A YAML frontmatter field, named verbatim.
-    Field(String),
+    /// A YAML frontmatter field path: a bare field is one segment
+    /// (`status`); each further segment indexes into a nested `Value::Map`
+    /// (`estimate.low` lowers to `["estimate", "low"]`). Never empty for any
+    /// `ColRef` the parser builds.
+    Field(Vec<String>),
     /// A `file.*` pseudo-column (`file.name`, `file.path`, …).
     File(FileAttr),
 }
@@ -265,7 +268,9 @@ pub enum OrderTarget {
 }
 
 impl Query {
-    /// Every `ColRef::Field` name this query references, across every
+    /// Every `ColRef::Field`'s top-level path segment this query references
+    /// (e.g. `estimate` for `estimate.low` — a sub-key is dynamic and is
+    /// never checked against the schema, see spec §3.4), across every
     /// column position: `SELECT` (including a column nested inside a
     /// `Expr::Scalar`/`Expr::Binary` argument or an aggregate's argument),
     /// `WHERE`, `GROUP BY`, `ORDER BY` (a bare column or an aggregate
@@ -309,12 +314,18 @@ impl Query {
     }
 }
 
-/// Adds `col`'s field name to `fields` when it's a frontmatter field; a
-/// `file.*` pseudo-column contributes nothing (see
-/// [`Query::referenced_fields`]).
+/// Adds `col`'s top-level field-path segment to `fields` when it's a
+/// frontmatter field; a `file.*` pseudo-column contributes nothing (see
+/// [`Query::referenced_fields`]). Only the top-level segment is added — a
+/// dotted path's sub-keys are dynamic and aren't checked against the schema
+/// (spec §3.4). `path` is always non-empty for any `ColRef::Field` the
+/// parser builds; the `first()` guard is a defensive no-op for a hand-built
+/// empty path.
 fn collect_col_field(col: &ColRef, fields: &mut BTreeSet<String>) {
-    if let ColRef::Field(name) = col {
-        fields.insert(name.clone());
+    if let ColRef::Field(path) = col
+        && let Some(top) = path.first()
+    {
+        fields.insert(top.clone());
     }
 }
 
@@ -414,11 +425,12 @@ impl SelectExpr {
 }
 
 impl ColRef {
-    /// The textual label for this column (`status`, `file.name`, …), used in
-    /// default headers, aggregate rendering, and `HAVING` error messages.
+    /// The textual label for this column (`status`, `estimate.low`,
+    /// `file.name`, …), used in default headers, aggregate rendering, and
+    /// `HAVING` error messages.
     pub(crate) fn label(&self) -> String {
         match self {
-            ColRef::Field(name) => name.clone(),
+            ColRef::Field(path) => path.join("."),
             ColRef::File(attr) => file_attr_label(*attr).to_string(),
         }
     }

@@ -253,7 +253,7 @@ impl InMemoryStore {
                     .unwrap_or(rel);
                 let fields = record
                     .field_names()
-                    .map(|name| (name.to_string(), record.field(name)))
+                    .map(|name| (name.to_string(), record.field(&[name.into()])))
                     .collect();
                 by_dir.entry(dir).or_default().push(CachedFile {
                     rel_path,
@@ -495,7 +495,7 @@ mod tests {
         let (mut store, _report) =
             InMemoryStore::from_cache(td.path(), WalkOpts::default(), Freshness::PerFile, None);
         assert_eq!(
-            store.records().next().unwrap().field("status"),
+            store.records().next().unwrap().field(&["status".into()]),
             Value::Str("draft".into())
         );
 
@@ -508,7 +508,7 @@ mod tests {
         assert_eq!(report.skipped, 0);
 
         assert_eq!(
-            store.records().next().unwrap().field("status"),
+            store.records().next().unwrap().field(&["status".into()]),
             Value::Str("in-progress".into()),
             "in-memory records must reflect the edit"
         );
@@ -550,7 +550,7 @@ mod tests {
         let (mut store, _report) =
             InMemoryStore::from_cache(td.path(), WalkOpts::default(), Freshness::PerFile, None);
         assert_eq!(
-            store.records().next().unwrap().field("status"),
+            store.records().next().unwrap().field(&["status".into()]),
             Value::Str("draft".into())
         );
 
@@ -571,7 +571,7 @@ mod tests {
         let report = store.refresh(td.path(), None);
         assert_eq!(report.skipped, 0);
         assert_eq!(
-            store.records().next().unwrap().field("status"),
+            store.records().next().unwrap().field(&["status".into()]),
             Value::Str("ready".into()),
             "whole-vault refresh must FORCE a re-parse, not reuse the stale cached value"
         );
@@ -589,7 +589,7 @@ mod tests {
             InMemoryStore::from_cache(td.path(), WalkOpts::default(), Freshness::ForceCache, None);
         assert_eq!(report.skipped, 0);
         assert_eq!(
-            store.records().next().unwrap().field("status"),
+            store.records().next().unwrap().field(&["status".into()]),
             Value::Str("draft".into()),
             "ForceCache must never re-read the changed file"
         );
@@ -657,7 +657,7 @@ mod tests {
         assert_eq!(report.skipped, 0);
 
         assert_eq!(
-            store.records().next().unwrap().field("status"),
+            store.records().next().unwrap().field(&["status".into()]),
             Value::Str("in-progress".into()),
             "refresh must pick up the edit even when cached_dirs_from_slices \
              (not an on-disk cache) supplies the starting point"
@@ -697,7 +697,7 @@ mod tests {
         let prd = store
             .records()
             .find(|r| r.field_names().any(|name| name == "prd"))
-            .map(|r| r.field("prd"));
+            .map(|r| r.field(&["prd".into()]));
         assert_eq!(
             prd,
             Some(Value::Str("011".into())),
@@ -767,7 +767,7 @@ mod tests {
         );
         // The rebuild still produces correct records via the live scan.
         assert_eq!(
-            store.records().next().unwrap().field("status"),
+            store.records().next().unwrap().field(&["status".into()]),
             Value::Str("draft".into())
         );
 

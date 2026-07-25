@@ -503,11 +503,13 @@ fn arg_list<'a>(
     }
 }
 
-/// Lowers a column reference: a bare identifier (a frontmatter field) or a
-/// `file.<attr>` compound identifier (a pseudo-column).
+/// Lowers a column reference: a bare identifier (a single-segment
+/// frontmatter field) or a compound identifier — either a `file.<attr>`
+/// pseudo-column or a dotted frontmatter field path (a multi-segment
+/// [`ColRef::Field`] indexing into a nested `Value::Map`).
 fn lower_col_ref(expr: &sql::Expr) -> Result<ColRef, ParseError> {
     match expr {
-        sql::Expr::Identifier(ident) => Ok(ColRef::Field(ident.value.clone())),
+        sql::Expr::Identifier(ident) => Ok(ColRef::Field(vec![ident.value.clone()])),
         sql::Expr::CompoundIdentifier(parts) => lower_compound(parts),
         other => Err(ParseError::BadColumn(format!(
             "expected a column reference, found unsupported expression `{other}`"
@@ -515,21 +517,29 @@ fn lower_col_ref(expr: &sql::Expr) -> Result<ColRef, ParseError> {
     }
 }
 
-/// Lowers a compound identifier; only the `file.<attr>` form is supported.
+/// Lowers a compound identifier. A `file`-prefixed one must be exactly
+/// `file.<attr>` — `file.*` has no nesting, so any other length under that
+/// prefix is rejected. Everything else lowers to a dotted
+/// `ColRef::Field` path, letting later segments index into a `Value::Map`.
 fn lower_compound(parts: &[sql::Ident]) -> Result<ColRef, ParseError> {
-    if let [prefix, attr] = parts
-        && prefix.value.eq_ignore_ascii_case("file")
+    if let [first, ..] = parts
+        && first.value.eq_ignore_ascii_case("file")
     {
+        let [_, attr] = parts else {
+            let joined = parts
+                .iter()
+                .map(|p| p.value.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            return Err(ParseError::BadColumn(format!(
+                "`file.*` has no nesting: `{joined}`"
+            )));
+        };
         return Ok(ColRef::File(file_attr_from_str(&attr.value)?));
     }
-    let joined = parts
-        .iter()
-        .map(|p| p.value.as_str())
-        .collect::<Vec<_>>()
-        .join(".");
-    Err(ParseError::BadColumn(format!(
-        "unsupported compound column `{joined}`"
-    )))
+    Ok(ColRef::Field(
+        parts.iter().map(|p| p.value.clone()).collect(),
+    ))
 }
 
 /// Parses a `file.*` attribute name into a [`FileAttr`].
@@ -1021,7 +1031,7 @@ mod tests {
         assert_eq!(
             q.select[0],
             SelectItem {
-                expr: SelectExpr::Expr(Expr::Col(ColRef::Field("status".into()))),
+                expr: SelectExpr::Expr(Expr::Col(ColRef::Field(vec!["status".into()]))),
                 alias: None
             }
         );
@@ -1032,7 +1042,7 @@ mod tests {
                 alias: Some("Count".into())
             }
         );
-        assert_eq!(q.group_by, vec![ColRef::Field("status".into())]);
+        assert_eq!(q.group_by, vec![ColRef::Field(vec!["status".into()])]);
         assert_eq!(q.from_glob, None);
     }
     #[test]
@@ -1071,7 +1081,7 @@ mod tests {
                 .unwrap()
                 .filter,
             Some(Predicate::In(
-                ColRef::Field("status".into()),
+                ColRef::Field(vec!["status".into()]),
                 vec![Literal::Str("a".into()), Literal::Str("b".into())],
                 false
             ))
@@ -1081,7 +1091,7 @@ mod tests {
                 .unwrap()
                 .filter,
             Some(Predicate::In(
-                ColRef::Field("status".into()),
+                ColRef::Field(vec!["status".into()]),
                 vec![Literal::Str("a".into()), Literal::Str("b".into())],
                 true
             ))
@@ -1093,7 +1103,7 @@ mod tests {
                 .unwrap()
                 .filter,
             Some(Predicate::Like(
-                ColRef::Field("slice".into()),
+                ColRef::Field(vec!["slice".into()]),
                 "mobile%".into(),
                 false
             ))
@@ -1103,7 +1113,7 @@ mod tests {
                 .unwrap()
                 .filter,
             Some(Predicate::Like(
-                ColRef::Field("slice".into()),
+                ColRef::Field(vec!["slice".into()]),
                 "mobile%".into(),
                 true
             ))
@@ -1112,11 +1122,11 @@ mod tests {
         // IS NULL / IS NOT NULL carry the negation flag.
         assert_eq!(
             parse("SELECT jira WHERE epic IS NULL").unwrap().filter,
-            Some(Predicate::IsNull(ColRef::Field("epic".into()), false))
+            Some(Predicate::IsNull(ColRef::Field(vec!["epic".into()]), false))
         );
         assert_eq!(
             parse("SELECT jira WHERE epic IS NOT NULL").unwrap().filter,
-            Some(Predicate::IsNull(ColRef::Field("epic".into()), true))
+            Some(Predicate::IsNull(ColRef::Field(vec!["epic".into()]), true))
         );
     }
     #[test]
@@ -1133,7 +1143,7 @@ mod tests {
                 .filter,
             Some(Predicate::MemberOf(
                 Literal::Str("mobile".into()),
-                ColRef::Field("tags".into()),
+                ColRef::Field(vec!["tags".into()]),
                 false
             ))
         );
@@ -1143,7 +1153,7 @@ mod tests {
                 .filter,
             Some(Predicate::MemberOf(
                 Literal::Str("mobile".into()),
-                ColRef::Field("tags".into()),
+                ColRef::Field(vec!["tags".into()]),
                 true
             ))
         );
@@ -1215,14 +1225,14 @@ mod tests {
         // GROUP BY s resolves through the `status AS s` alias, exactly as
         // `GROUP BY status` would.
         let q = parse("SELECT status AS s, count(*) AS n GROUP BY s ORDER BY s").unwrap();
-        assert_eq!(q.group_by, vec![ColRef::Field("status".into())]);
+        assert_eq!(q.group_by, vec![ColRef::Field(vec!["status".into()])]);
     }
     #[test]
     fn group_by_alias_precedence_over_same_named_field() {
         // A name that is both a real field and a SELECT alias resolves to
         // the alias, matching how ORDER BY resolves the same ambiguity.
         let q = parse("SELECT jira AS status, count(*) AS n GROUP BY status").unwrap();
-        assert_eq!(q.group_by, vec![ColRef::Field("jira".into())]);
+        assert_eq!(q.group_by, vec![ColRef::Field(vec!["jira".into()])]);
     }
     #[test]
     fn group_by_alias_on_aggregate_or_expr_is_rejected() {
@@ -1254,7 +1264,7 @@ mod tests {
             "SELECT min(prd), max(prd), sum(prd), avg(prd), group_concat(jira), count(distinct status) GROUP BY epic",
         )
         .unwrap();
-        let prd = ColRef::Field("prd".into());
+        let prd = ColRef::Field(vec!["prd".into()]);
         assert_eq!(
             q.select[0].expr,
             SelectExpr::Agg(Aggregate::Min(prd.clone()))
@@ -1270,13 +1280,13 @@ mod tests {
         assert_eq!(q.select[3].expr, SelectExpr::Agg(Aggregate::Avg(prd)));
         assert_eq!(
             q.select[4].expr,
-            SelectExpr::Agg(Aggregate::GroupConcat(ColRef::Field("jira".into())))
+            SelectExpr::Agg(Aggregate::GroupConcat(ColRef::Field(vec!["jira".into()])))
         );
         assert_eq!(
             q.select[5].expr,
-            SelectExpr::Agg(Aggregate::Count(ColRef::Field("status".into()), true))
+            SelectExpr::Agg(Aggregate::Count(ColRef::Field(vec!["status".into()]), true))
         );
-        assert_eq!(q.group_by, vec![ColRef::Field("epic".into())]);
+        assert_eq!(q.group_by, vec![ColRef::Field(vec!["epic".into()])]);
     }
     #[test]
     fn unsupported_join_errors() {
@@ -1322,15 +1332,15 @@ mod tests {
             q.select[0].expr,
             SelectExpr::Expr(Expr::Scalar(
                 ScalarFn::Lower,
-                vec![Expr::Col(ColRef::Field("status".into()))]
+                vec![Expr::Col(ColRef::Field(vec!["status".into()]))]
             ))
         );
         assert_eq!(
             q.select[1].expr,
             SelectExpr::Expr(Expr::Binary(
                 BinOp::Add,
-                Box::new(Expr::Col(ColRef::Field("a".into()))),
-                Box::new(Expr::Col(ColRef::Field("b".into())))
+                Box::new(Expr::Col(ColRef::Field(vec!["a".into()]))),
+                Box::new(Expr::Col(ColRef::Field(vec!["b".into()])))
             ))
         );
         assert_eq!(
@@ -1339,10 +1349,10 @@ mod tests {
                 BinOp::Concat,
                 Box::new(Expr::Binary(
                     BinOp::Concat,
-                    Box::new(Expr::Col(ColRef::Field("a".into()))),
+                    Box::new(Expr::Col(ColRef::Field(vec!["a".into()]))),
                     Box::new(Expr::Lit(Literal::Str("-".into())))
                 )),
-                Box::new(Expr::Col(ColRef::Field("status".into())))
+                Box::new(Expr::Col(ColRef::Field(vec!["status".into()])))
             ))
         );
     }
@@ -1353,7 +1363,7 @@ mod tests {
         // sqlparser AST shape (a plain `Function`, or the dedicated
         // `Trim`/`Substring` nodes) — pin that all four land on the right
         // `ScalarFn`.
-        let col = || Expr::Col(ColRef::Field("status".into()));
+        let col = || Expr::Col(ColRef::Field(vec!["status".into()]));
         assert_eq!(
             parse("SELECT trim(status)").unwrap().select[0].expr,
             SelectExpr::Expr(Expr::Scalar(ScalarFn::Trim, vec![col()]))
@@ -1466,7 +1476,7 @@ mod tests {
         assert_eq!(
             q.filter,
             Some(Predicate::Compare(
-                Expr::Col(ColRef::Field("title".into())),
+                Expr::Col(ColRef::Field(vec!["title".into()])),
                 CmpOp::Eq,
                 Expr::Lit(Literal::Str("imported from \"archive\"".into()))
             ))
@@ -1491,7 +1501,7 @@ mod tests {
         assert_eq!(
             q.having,
             Some(Having::Compare(
-                HavingLeaf::Group(ColRef::Field("status".into())),
+                HavingLeaf::Group(ColRef::Field(vec!["status".into()])),
                 CmpOp::Eq,
                 Literal::Str("draft".into())
             ))
@@ -1638,5 +1648,20 @@ mod tests {
                 "message should say what isn't supported for {sql:?}: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn dotted_identifier_lowers_to_path() {
+        let q = parse("SELECT estimate.low WHERE estimate.high > 10").unwrap();
+        assert!(q.referenced_fields().contains("estimate"));
+        // referenced_fields returns the TOP-LEVEL segment only
+        assert!(!q.referenced_fields().contains("high"));
+        assert!(!q.referenced_fields().contains("low"));
+    }
+
+    #[test]
+    fn file_attr_still_special_and_no_nesting() {
+        assert!(parse("SELECT file.name").is_ok());
+        assert!(parse("SELECT file.name.x").is_err()); // file.* has no nesting
     }
 }

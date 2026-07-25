@@ -80,9 +80,8 @@ impl Value {
 }
 
 /// Compact, deterministic string for a `Value` used when a `Map` (or a map
-/// nested in one) is rendered flat (table/CSV). Mirrors
-/// `frontmatter::compact_pod` exactly: lists render WITH brackets, maps with
-/// braces, map keys sorted. This is intentionally different from
+/// nested in one) is rendered flat (table/CSV): lists render WITH brackets,
+/// maps with braces, map keys sorted. This is intentionally different from
 /// `Value::display(List)` (bracket-less) — see spec §9.
 fn compact_value(v: &Value) -> String {
     match v {
@@ -174,9 +173,21 @@ impl Record {
         }
     }
 
-    /// The value of frontmatter field `name`, or `Value::Null` if absent.
-    pub fn field(&self, name: &str) -> Value {
-        self.fields.get(name).cloned().unwrap_or(Value::Null)
+    /// The value at `path` (segment 0 = frontmatter field, each next segment
+    /// indexes into a `Value::Map`). Missing key or non-map intermediate →
+    /// `Null`. A single-segment path is a plain top-level field lookup.
+    pub fn field(&self, path: &[String]) -> Value {
+        let Some((head, rest)) = path.split_first() else {
+            return Value::Null;
+        };
+        let mut cur = self.fields.get(head).cloned().unwrap_or(Value::Null);
+        for seg in rest {
+            cur = match cur {
+                Value::Map(m) => m.get(seg).cloned().unwrap_or(Value::Null),
+                _ => return Value::Null,
+            };
+        }
+        cur
     }
 
     /// Resolves a `file.*` pseudo-column to its string value.
@@ -272,9 +283,9 @@ mod tests {
         assert_eq!(compare_values(&Value::Int(1), &Value::Null), None);
     }
     #[test]
-    fn map_display_matches_compact_pod_form() {
-        // keys sorted; a nested LIST inside a map renders WITH brackets,
-        // matching the old compact_pod output (NOT Value::display's bracket-less list).
+    fn map_display_uses_compact_value_form() {
+        // keys sorted; a nested LIST inside a map renders WITH brackets, per
+        // `compact_value` (NOT `Value::display`'s bracket-less list).
         let mut inner = IndexMap::new();
         inner.insert("low".to_string(), Value::Int(5));
         inner.insert("high".to_string(), Value::Int(10));
@@ -330,8 +341,26 @@ mod record_tests {
     #[test]
     fn field_present_and_missing() {
         let r = rec();
-        assert_eq!(r.field("status"), Value::Str("draft".into()));
-        assert_eq!(r.field("nope"), Value::Null);
+        assert_eq!(r.field(&["status".into()]), Value::Str("draft".into()));
+        assert_eq!(r.field(&["nope".into()]), Value::Null);
+    }
+    #[test]
+    fn field_walks_dotted_path_into_map() {
+        let mut inner = IndexMap::new();
+        inner.insert("low".to_string(), Value::Int(5));
+        let mut f = IndexMap::new();
+        f.insert("estimate".to_string(), Value::Map(inner));
+        let r = Record::new(Path::new("v"), Path::new("v/a.md"), f);
+        assert_eq!(r.field(&["estimate".into(), "low".into()]), Value::Int(5));
+        // missing sub-key -> Null
+        assert_eq!(r.field(&["estimate".into(), "nope".into()]), Value::Null);
+        // non-map intermediate -> Null
+        assert_eq!(
+            r.field(&["estimate".into(), "low".into(), "x".into()]),
+            Value::Null
+        );
+        // single segment == today's behavior
+        assert_eq!(r.field(&["estimate".into()]).variant_name(), "Map");
     }
     #[test]
     fn field_names_lists_keys() {

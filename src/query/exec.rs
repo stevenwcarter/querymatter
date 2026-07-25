@@ -735,7 +735,7 @@ fn expand_select(q: &Query, filtered: &[&Record]) -> Vec<(String, Expr)> {
         match &item.expr {
             SelectExpr::Star => {
                 for name in sorted_field_union(filtered) {
-                    columns.push((name.clone(), Expr::Col(ColRef::Field(name))));
+                    columns.push((name.clone(), Expr::Col(ColRef::Field(vec![name]))));
                 }
             }
             SelectExpr::Expr(expr) => columns.push((item.header(), expr.clone())),
@@ -756,7 +756,7 @@ fn sorted_field_union(records: &[&Record]) -> Vec<String> {
 /// Looks up a column reference's value on `record`.
 fn resolve_col(record: &Record, col: &ColRef) -> Value {
     match col {
-        ColRef::Field(name) => record.field(name),
+        ColRef::Field(path) => record.field(path),
         ColRef::File(attr) => record.file_attr(*attr),
     }
 }
@@ -1896,6 +1896,23 @@ mod tests {
             execute(&having, recs().iter(), false),
             Err(ExecError::UnknownColumn { .. })
         ));
+    }
+
+    #[test]
+    fn dotted_path_select_and_filter_reads_nested_map() {
+        // End-to-end wiring check: parse's `ColRef::Field(path)` lowering,
+        // schema validation's top-level-only check, `resolve_col`, and
+        // `Record::field`'s map walk each have their own unit test, but only
+        // this pins that a real query actually threads a dotted path through
+        // all of them together.
+        let mut estimate = IndexMap::new();
+        estimate.insert("low".to_string(), Value::Int(5));
+        estimate.insert("high".to_string(), Value::Int(20));
+        let rows = [rec("s", "s/a.md", &[("estimate", Value::Map(estimate))])];
+        let q = parse("SELECT estimate.low WHERE estimate.high > 10").unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
+        assert_eq!(t.headers, vec!["estimate.low"]);
+        assert_eq!(t.rows, vec![vec![Value::Int(5)]]);
     }
 }
 
