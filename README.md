@@ -256,7 +256,7 @@ forces strict validation for one invocation, overriding a configured `lenient
 | `--no-lenient` | Force strict unknown-column validation, overriding a config `lenient = true`. |
 | `--header` | Force the header row on in table/csv/tsv/md output, overriding a config `header = false`. On by default. |
 | `--no-header` | Suppress the header row in table/csv/tsv/md output. |
-| `-q, --quiet` | Suppress non-error stderr chatter (skipped-file warnings, scan summaries); errors are always shown. |
+| `-q, --quiet` | Suppress the non-error stderr chatter a query run emits (skipped/unparsable-file warnings); errors are always shown. |
 | `--no-quiet` | Force chatter on, overriding a config `quiet = true`. |
 | `--ext <LIST>` | Comma-separated extensions to include. Default `md,markdown`. |
 | `--respect-gitignore` | Honor `.gitignore`/`.ignore` while walking. **Off by default** — see below. |
