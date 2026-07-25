@@ -16,16 +16,22 @@ pub enum Value {
     Int(i64),
     Float(f64),
     Str(String),
+    List(Vec<Value>),
+    Map(IndexMap<String, Value>),
     /// A calendar date with no time component (e.g. from a `YYYY-MM-DD`
     /// frontmatter field once ingest auto-detects it — not yet produced by
     /// any code path as of this variant's introduction).
+    ///
+    /// Declared after `List`/`Map` (not alongside the other scalars) so this
+    /// serde-derive enum's variant indices — which `bincode` uses as the
+    /// on-disk tag for the `.querymatter` cache — don't shift `List`/`Map`'s
+    /// existing discriminants; see `bincode_tags_are_stable_for_list_and_map`.
     Date(NaiveDate),
     /// A UTC instant (e.g. from an RFC3339 frontmatter field once ingest
     /// auto-detects it — not yet produced by any code path as of this
-    /// variant's introduction).
+    /// variant's introduction). Kept after `Date` for the same
+    /// discriminant-stability reason.
     DateTime(DateTime<Utc>),
-    List(Vec<Value>),
-    Map(IndexMap<String, Value>),
 }
 
 impl Value {
@@ -129,10 +135,11 @@ fn compact_value(v: &Value) -> String {
 /// Total-ish ordering used by `ORDER BY`/`MIN`/`MAX`.
 ///
 /// Values that both coerce to a number compare numerically; a `Date`/
-/// `DateTime` on either side compares chronologically (see
-/// [`compare_dates`]); otherwise they compare lexicographically on
-/// `to_cmp_string()`. Comparing `Null` against anything (including another
-/// `Null`) returns `None` — callers are responsible for placing NULLs last.
+/// `DateTime` on either side is handled first by [`compare_dates`] (see its
+/// doc for exactly which pairings compare natively vs. via ISO text);
+/// otherwise they compare lexicographically on `to_cmp_string()`. Comparing
+/// `Null` against anything (including another `Null`) returns `None` —
+/// callers are responsible for placing NULLs last.
 pub fn compare_values(a: &Value, b: &Value) -> Option<Ordering> {
     if a.is_null() || b.is_null() {
         return None;
@@ -148,21 +155,29 @@ pub fn compare_values(a: &Value, b: &Value) -> Option<Ordering> {
 
 /// Chronological comparison for a `Date`/`DateTime` on either side.
 ///
-/// `Date` vs `Date` and `DateTime` vs `DateTime` compare directly; a mixed
-/// `Date`/`DateTime` pair compares via the `DateTime`'s date part (so a date
-/// and a datetime that falls on it are equal); a `Date`/`DateTime` against a
-/// `Str` compares `to_cmp_string()` of both — ISO text, which sorts
-/// identically to a chronological compare for well-formed ISO strings, and
-/// stays defined (never panics) for anything else. Returns `None` when
-/// neither side is a `Date`/`DateTime`, so the caller falls through to the
-/// existing numeric/string rules unchanged.
+/// Same-type pairs (`Date` vs `Date`, `DateTime` vs `DateTime`) compare
+/// directly via chrono's own `Ord`. Every other pairing that involves a
+/// `Date`/`DateTime` — a mixed `Date`/`DateTime` pair, or either against a
+/// `Str` — compares `to_cmp_string()` of both (ISO text) instead. This is
+/// required, not just convenient: comparing a mixed pair via the `DateTime`'s
+/// date part (`.date_naive()`) is not a strict-weak ordering — a `Date` could
+/// compare `Equal` to two different `DateTime`s (same day, different times)
+/// that are themselves unequal, violating transitivity, which is undefined
+/// behavior for the `sort_by` that backs `ORDER BY`. ISO text stays a total
+/// order: a same-day `Date`'s string (`"2026-07-24"`) is a strict prefix of
+/// the `DateTime`'s (`"2026-07-24T…"`), so it always sorts before it. This
+/// also sorts identically to a chronological compare for well-formed ISO
+/// strings, and stays defined (never panics) for anything else (e.g.
+/// `"draft"`). Returns `None` when neither side is a `Date`/`DateTime`, so the
+/// caller falls through to the existing numeric/string rules unchanged.
 fn compare_dates(a: &Value, b: &Value) -> Option<Ordering> {
     match (a, b) {
         (Value::Date(x), Value::Date(y)) => Some(x.cmp(y)),
         (Value::DateTime(x), Value::DateTime(y)) => Some(x.cmp(y)),
-        (Value::Date(x), Value::DateTime(y)) => Some(x.cmp(&y.date_naive())),
-        (Value::DateTime(x), Value::Date(y)) => Some(x.date_naive().cmp(y)),
-        (Value::Date(_) | Value::DateTime(_), Value::Str(_))
+        (
+            Value::Date(_) | Value::DateTime(_),
+            Value::Str(_) | Value::Date(_) | Value::DateTime(_),
+        )
         | (Value::Str(_), Value::Date(_) | Value::DateTime(_)) => {
             Some(a.to_cmp_string().cmp(&b.to_cmp_string()))
         }
@@ -395,6 +410,34 @@ mod tests {
         let t = SystemTime::UNIX_EPOCH - Duration::from_secs(60);
         let _ = system_time_to_iso(t); // must not panic
     }
+    /// Pins the `Value` enum's bincode wire format: `.querymatter` caches
+    /// serialize `Value` via serde derive + bincode, which tags each variant
+    /// by its DECLARATION-ORDER index. `List`/`Map` must keep the
+    /// discriminants (5/6) an existing on-disk cache blob was written with —
+    /// inserting a new variant earlier in the enum (as `Date`/`DateTime` once
+    /// were, between `Str` and `List`) silently shifts every later variant's
+    /// tag, so an old cache blob holding a `List`/`Map` value would decode as
+    /// the WRONG variant with no error. `Date`/`DateTime` are declared last
+    /// specifically so they land on brand-new tags (7/8) instead of
+    /// disturbing `List`/`Map`. This test fails loudly if a future edit
+    /// reorders the enum: the leading tag byte is the first thing bincode's
+    /// serde bridge writes for a serde-derived enum (one byte here since
+    /// bincode's standard config varint-encodes small indices verbatim).
+    #[test]
+    fn bincode_tags_are_stable_for_list_and_map() {
+        let list = Value::List(vec![Value::Int(1), Value::Str("a".into())]);
+        let mut map = IndexMap::new();
+        map.insert("k".to_string(), Value::Int(1));
+        let map = Value::Map(map);
+
+        let list_bytes = crate::cache::encode(&list);
+        let map_bytes = crate::cache::encode(&map);
+        assert_eq!(list_bytes[0], 5, "Value::List must keep bincode tag 5");
+        assert_eq!(map_bytes[0], 6, "Value::Map must keep bincode tag 6");
+
+        assert_eq!(crate::cache::decode::<Value>(&list_bytes), Some(list));
+        assert_eq!(crate::cache::decode::<Value>(&map_bytes), Some(map));
+    }
     #[test]
     fn dates_compare_by_instant_and_render_iso() {
         use chrono::NaiveDate;
@@ -411,6 +454,70 @@ mod tests {
         assert!(compare_values(&b, &Value::Str("draft".into())).is_some());
         // NULL still unordered
         assert_eq!(compare_values(&a, &Value::Null), None);
+    }
+    #[test]
+    fn datetime_renders_as_rfc3339() {
+        use chrono::TimeZone;
+        let dt = Value::DateTime(Utc.with_ymd_and_hms(2026, 7, 24, 9, 30, 0).unwrap());
+        // `display()` is what both the REPL's table/CSV output and
+        // `render::to_json` (which calls `value.display()` for this variant)
+        // render, so this pins the ISO text both paths depend on.
+        assert_eq!(dt.display(), "2026-07-24T09:30:00Z");
+    }
+    #[test]
+    fn datetimes_compare_chronologically() {
+        use chrono::TimeZone;
+        let earlier = Value::DateTime(Utc.with_ymd_and_hms(2026, 7, 24, 9, 0, 0).unwrap());
+        let later = Value::DateTime(Utc.with_ymd_and_hms(2026, 7, 24, 17, 0, 0).unwrap());
+        assert_eq!(compare_values(&earlier, &later), Some(Ordering::Less));
+        assert_eq!(compare_values(&later, &earlier), Some(Ordering::Greater));
+        assert_eq!(compare_values(&earlier, &earlier), Some(Ordering::Equal));
+    }
+    /// Fix 2 (W57 review): a mixed `Date`/`DateTime` pair must compare via
+    /// ISO text, not the `DateTime`'s date part — the date-part compare was
+    /// non-transitive (a `Date` could be `Equal` to two different same-day
+    /// `DateTime`s that are themselves unequal), which is undefined behavior
+    /// for the `sort_by` backing `ORDER BY`. This pins the resulting total
+    /// order: a same-day `Date` sorts before its `DateTime` (ISO-text
+    /// prefix), and cross-day pairs sort by calendar day as expected.
+    #[test]
+    fn mixed_date_and_datetime_compare_via_iso_text() {
+        use chrono::{NaiveDate, TimeZone};
+        let date = Value::Date(NaiveDate::from_ymd_opt(2026, 7, 24).unwrap());
+        let same_day_morning = Value::DateTime(Utc.with_ymd_and_hms(2026, 7, 24, 0, 0, 1).unwrap());
+        let same_day_evening =
+            Value::DateTime(Utc.with_ymd_and_hms(2026, 7, 24, 23, 59, 0).unwrap());
+
+        // "2026-07-24" is a strict text prefix of "2026-07-24T...", so the
+        // bare date sorts before any same-day datetime — a total order, not
+        // an `Equal` that would break transitivity.
+        assert_eq!(
+            compare_values(&date, &same_day_morning),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            compare_values(&date, &same_day_evening),
+            Some(Ordering::Less)
+        );
+        // Transitivity check: the two same-day datetimes are themselves
+        // ordered relative to each other, proving `date` isn't `Equal` to
+        // both (which is exactly the bug the ISO-text fix rules out).
+        assert_eq!(
+            compare_values(&same_day_morning, &same_day_evening),
+            Some(Ordering::Less)
+        );
+
+        // Different-day pair: still sorts by calendar day.
+        let earlier_date = Value::Date(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap());
+        let later_datetime = Value::DateTime(Utc.with_ymd_and_hms(2026, 7, 24, 0, 0, 0).unwrap());
+        assert_eq!(
+            compare_values(&earlier_date, &later_datetime),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            compare_values(&later_datetime, &earlier_date),
+            Some(Ordering::Greater)
+        );
     }
 }
 
