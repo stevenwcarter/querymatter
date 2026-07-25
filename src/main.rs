@@ -184,21 +184,54 @@ fn run_completions(args: &CompletionsArgs) {
     clap_complete::generate(args.shell, &mut command, name, &mut io::stdout());
 }
 
+/// Discovers and loads the vault-level `.querymatter.toml` a team can commit
+/// at the vault root (design W54): walks up from `start` via
+/// [`cache::find_vault_config`], independent of whether a `.querymatter/`
+/// cache directory exists anywhere in that ancestry.
+///
+/// No such file found is not an error — it's simply absent, so
+/// [`Settings::resolve`]/[`Settings::resolve_walk`] fall straight through to
+/// the per-user config/default layers, exactly as if this feature didn't
+/// exist. A file that IS found but fails to parse is a hard error naming its
+/// path, via the same [`config::load_from`] the per-user config file goes
+/// through — reusing its schema and its "reject loudly" behavior rather than
+/// a second, easily-drifting parser.
+fn load_vault_config(start: &Path) -> anyhow::Result<Config> {
+    match cache::find_vault_config(start) {
+        Some(path) => config::load_from(&path),
+        None => Ok(Config::default()),
+    }
+}
+
+/// Like [`load_vault_config`], discovering from the current directory — for
+/// callers with no other scan root to prefer, e.g. `querymatter config
+/// list`/`get`, which aren't tied to a directory the way a query or `init` is.
+fn load_vault_config_from_cwd() -> anyhow::Result<Config> {
+    let cwd = env::current_dir().context("failed to determine the current directory")?;
+    load_vault_config(&cwd)
+}
+
 /// Builds a `.querymatter` cache under the requested directory (or the cwd),
 /// honoring the shared walk flags, and prints a one-line summary to stderr.
 ///
 /// All summary output goes to stderr; `init` produces no stdout so it composes
 /// cleanly in scripts.
 fn run_init(args: &InitArgs, config: &Config, matches: &ArgMatches) -> anyhow::Result<()> {
-    let settings = Settings::resolve_walk(&args.walk, config, matches);
-    // Validated on the RESOLVED exclude list (flag, config, or default —
-    // whichever won), not `args.walk.exclude` alone, so a bad glob from a
-    // hand-edited config file is caught too, not just one typed on the
+    let cwd = env::current_dir().context("failed to determine the current directory")?;
+    let target = args.dir.clone().unwrap_or(cwd);
+    // Discovered from `target` — the directory `init` is about to make the
+    // vault root of — rather than `cwd`, so `querymatter init --dir
+    // ../other-vault` finds `../other-vault`'s own `.querymatter.toml`
+    // ancestry, not the invoking shell's.
+    let vault_config = load_vault_config(&target)?;
+
+    let settings = Settings::resolve_walk(&args.walk, &vault_config, config, matches);
+    // Validated on the RESOLVED exclude list (flag, vault, config, or
+    // default — whichever won), not `args.walk.exclude` alone, so a bad glob
+    // from a hand-edited config file is caught too, not just one typed on the
     // command line (IMPORTANT 1).
     discover::validate_excludes(&settings.exclude.value)?;
 
-    let cwd = env::current_dir().context("failed to determine the current directory")?;
-    let target = args.dir.clone().unwrap_or(cwd);
     let base = fs::canonicalize(&target)
         .with_context(|| format!("cannot access directory {}", target.display()))?;
 
@@ -287,18 +320,23 @@ fn prompt_add_gitignore(root: &Path) -> anyhow::Result<()> {
 /// or resolves outside it, is a clean error rather than a silently wrong
 /// verdict.
 fn run_explain(args: &ExplainArgs, config: &Config, matches: &ArgMatches) -> anyhow::Result<()> {
-    let settings = Settings::resolve_walk(&args.walk, config, matches);
-    discover::validate_excludes(&settings.exclude.value)?;
-
-    let mut opts = settings.walk_opts();
-    opts.ignore_files = args.walk.ignore_files()?;
-
     let cwd = env::current_dir().context("failed to determine the current directory")?;
     let root = match cache::find_vault(&cwd) {
         Some(vault) => vault,
         None => fs::canonicalize(&cwd)
             .with_context(|| format!("cannot access directory {}", cwd.display()))?,
     };
+    // Discovered from `root` — the same vault-or-cwd `explain` scans against
+    // below — rather than `cwd`, so a vault-rooted `.querymatter.toml` is
+    // found even when `explain` is invoked from a subdirectory of the vault.
+    let vault_config = load_vault_config(&root)?;
+
+    let settings = Settings::resolve_walk(&args.walk, &vault_config, config, matches);
+    discover::validate_excludes(&settings.exclude.value)?;
+
+    let mut opts = settings.walk_opts();
+    opts.ignore_files = args.walk.ignore_files()?;
+
     let target = fs::canonicalize(&args.path)
         .with_context(|| format!("cannot access path {}", args.path.display()))?;
     anyhow::ensure!(
@@ -329,10 +367,15 @@ fn run_config(
 ) -> anyhow::Result<()> {
     match action {
         ConfigAction::List => {
-            println!("{}", Settings::resolve(cli, config, matches).rows());
+            let vault_config = load_vault_config_from_cwd()?;
+            println!(
+                "{}",
+                Settings::resolve(cli, &vault_config, config, matches).rows()
+            );
         }
         ConfigAction::Get { key } => {
-            let settings = Settings::resolve(cli, config, matches);
+            let vault_config = load_vault_config_from_cwd()?;
+            let settings = Settings::resolve(cli, &vault_config, config, matches);
             println!("{}", settings.value_of(*key));
             println!("values: {}", key.allowed());
         }
@@ -712,19 +755,21 @@ fn build_session(
     let wants_refresh = cli.refresh_all || !cli.refresh.is_empty();
     let wanted = if wants_refresh { None } else { wanted };
 
-    let settings = Settings::resolve(cli, config, matches);
-    // Validated on the RESOLVED exclude list (flag, config, or default —
-    // whichever won), not `cli.walk.exclude` alone: a hand-edited config
-    // file's `exclude` must be rejected here too. `config::set` already
-    // rejects a bad glob up front for the normal `config set exclude` path,
-    // but a hand-edited file bypasses that, and `discover`'s own glob
-    // compiler has no error channel and would otherwise silently drop it
-    // (IMPORTANT 1).
+    let cwd = env::current_dir().context("failed to determine the current directory")?;
+    let vault_config = load_vault_config(&cwd)?;
+
+    let settings = Settings::resolve(cli, &vault_config, config, matches);
+    // Validated on the RESOLVED exclude list (flag, vault, config, or
+    // default — whichever won), not `cli.walk.exclude` alone: a hand-edited
+    // config file's `exclude` must be rejected here too. `config::set`
+    // already rejects a bad glob up front for the normal `config set
+    // exclude` path, but a hand-edited file bypasses that, and `discover`'s
+    // own glob compiler has no error channel and would otherwise silently
+    // drop it (IMPORTANT 1).
     discover::validate_excludes(&settings.exclude.value)?;
     let mut opts = settings.walk_opts();
     opts.ignore_files = cli.walk.ignore_files()?;
 
-    let cwd = env::current_dir().context("failed to determine the current directory")?;
     let vault = if cli.no_cache {
         None
     } else {
@@ -803,7 +848,10 @@ fn build_session(
             eprintln!("querymatter: {warning}");
         }
     }
-    let fallback = Settings::resolve(cli, &Config::default(), matches);
+    // The user config layer removed, NOT the vault layer: `.unset` only ever
+    // touches the per-user config file, so reverting a key must still honor
+    // a vault-supplied value for it.
+    let fallback = Settings::resolve(cli, &vault_config, &Config::default(), matches);
     Ok(Session::new(
         Box::new(store),
         settings,

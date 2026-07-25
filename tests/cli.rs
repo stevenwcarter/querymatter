@@ -58,6 +58,13 @@ fn write_config(dir: &Path, body: &str) {
     fs::write(path.join("config.toml"), body).unwrap();
 }
 
+/// Writes a vault-level `.querymatter.toml` directly into `dir` (the vault
+/// root) — distinct from [`write_config`]'s per-user
+/// `<home>/querymatter/config.toml` (W54).
+fn write_vault_config(dir: &Path, body: &str) {
+    fs::write(dir.join(".querymatter.toml"), body).unwrap();
+}
+
 /// Finds the `config list`/`.settings` row for `key` (the line whose first
 /// word is its name), so a test can assert a value and source are on the
 /// SAME row rather than merely present somewhere in the output.
@@ -1361,6 +1368,149 @@ fn config_list_reports_env_as_table_styles_source() {
     assert!(
         table_style_row.contains("unicode") && table_style_row.contains("(env)"),
         "table_style row must show the env value and (env) source, got: {table_style_row:?}"
+    );
+}
+
+// -- Vault-level `.querymatter.toml` (W54): flag > env > vault > config > default
+
+#[test]
+fn vault_config_beats_user_config() {
+    let td = tree();
+    write_vault_config(td.path(), "table_style = \"unicode\"\n");
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "table_style = \"compact\"\n");
+    qm(home.path())
+        .current_dir(td.path())
+        .args(["-e", "SELECT status WHERE prd = '010'"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("╭"));
+}
+
+#[test]
+fn flag_beats_vault_config() {
+    let td = tree();
+    write_vault_config(td.path(), "table_style = \"unicode\"\n");
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .current_dir(td.path())
+        .args([
+            "-e",
+            "SELECT status WHERE prd = '010'",
+            "--table-style",
+            "ascii",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("+--"))
+        .stdout(predicates::str::contains("╭").not());
+}
+
+#[test]
+fn env_beats_vault_config() {
+    let td = tree();
+    write_vault_config(td.path(), "table_style = \"ascii\"\n");
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .current_dir(td.path())
+        .env("QUERYMATTER_TABLE_STYLE", "unicode")
+        .args(["-e", "SELECT status WHERE prd = '010'"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("╭"));
+}
+
+#[test]
+fn config_list_reports_vault_as_table_styles_source() {
+    let td = tree();
+    write_vault_config(td.path(), "table_style = \"unicode\"\n");
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "table_style = \"compact\"\n");
+    let out = qm(home.path())
+        .current_dir(td.path())
+        .args(["config", "list"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(out).unwrap();
+    let table_style_row = row_for(&text, "table_style");
+    assert!(
+        table_style_row.contains("unicode") && table_style_row.contains("(vault)"),
+        "table_style row must show the vault value and (vault) source, got: {table_style_row:?}"
+    );
+}
+
+/// No `.querymatter.toml` anywhere in `td`'s ancestry: vault discovery must
+/// be a pure no-op, falling straight through to the per-user config exactly
+/// as it did before this feature existed.
+#[test]
+fn absent_vault_file_falls_through_to_user_config() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "table_style = \"unicode\"\n");
+    qm(home.path())
+        .current_dir(td.path())
+        .args(["-e", "SELECT status WHERE prd = '010'"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("╭"));
+}
+
+/// A broken vault config blocks every command, just like a broken per-user
+/// config does (`malformed_config_exits_non_zero_naming_the_path` above); its
+/// message must name the vault file specifically, not the user's config.toml.
+#[test]
+fn malformed_vault_config_exits_nonzero_naming_the_path() {
+    let td = tree();
+    write_vault_config(td.path(), "table_style = = broken\n");
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .current_dir(td.path())
+        .args(["-e", "SELECT status"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(".querymatter.toml"));
+}
+
+/// A vault-configured `hidden = true` (no `--hidden` flag, no per-user
+/// config) must reach `init`'s walk exactly like a per-user configured one
+/// does (`config_hidden_true_reaches_init_without_a_flag` above), proving
+/// `run_init` discovers/loads it from the target directory (`args.dir`).
+#[test]
+fn vault_config_hidden_true_reaches_init_without_a_flag() {
+    let td = TempDir::new().unwrap();
+    fs::create_dir_all(td.path().join(".hidden")).unwrap();
+    fs::write(td.path().join(".hidden/a.md"), "---\nstatus: draft\n---\n").unwrap();
+    fs::write(td.path().join("visible.md"), "---\nstatus: draft\n---\n").unwrap();
+    write_vault_config(td.path(), "hidden = true\n");
+
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg("init")
+        .arg(td.path())
+        .assert()
+        .success();
+
+    let out = qm(home.path())
+        .current_dir(td.path())
+        .args([
+            "-e",
+            "SELECT count(*) AS n",
+            "--format",
+            "csv",
+            "--force-cache",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(
+        String::from_utf8(out).unwrap().trim(),
+        "n\n2",
+        "a vault-configured hidden = true must reach init's walk"
     );
 }
 

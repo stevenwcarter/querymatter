@@ -1,11 +1,15 @@
 //! Resolving each setting from the layers that can supply it, and recording
 //! which layer won.
 //!
-//! The precedence is `flag > env > config > default`, applied per key
-//! independently. [`Settings::default`] is the single home of the built-in
-//! defaults: clap no longer carries `default_value` for the valued flags,
-//! because a clap-supplied default is indistinguishable from a user-typed one
-//! and would outrank the config file.
+//! The precedence is `flag > env > vault > config > default`, applied per key
+//! independently. `vault` is the vault-level `.querymatter.toml` a team can
+//! commit at the vault root (discovered via [`crate::cache::find_vault_config`]),
+//! spliced in between the environment and the per-user config file so shared
+//! team defaults outrank one person's `~/.config/querymatter/config.toml` but
+//! never a flag or env var typed for one invocation. [`Settings::default`] is
+//! the single home of the built-in defaults: clap no longer carries
+//! `default_value` for the valued flags, because a clap-supplied default is
+//! indistinguishable from a user-typed one and would outrank the config file.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -27,6 +31,8 @@ pub enum Source {
     Flag,
     /// An environment variable.
     Env,
+    /// The vault-level `.querymatter.toml`, committed at the vault root.
+    Vault,
     /// The config file.
     Config,
     /// The built-in default.
@@ -39,6 +45,7 @@ impl fmt::Display for Source {
             Source::Session => "session",
             Source::Flag => "flag",
             Source::Env => "env",
+            Source::Vault => "vault",
             Source::Config => "config",
             Source::Default => "default",
         };
@@ -97,17 +104,23 @@ impl Default for Settings {
 
 impl Settings {
     /// Resolves every setting for query mode.
-    pub fn resolve(cli: &Cli, config: &Config, matches: &ArgMatches) -> Self {
+    ///
+    /// `vault` is the vault-level `.querymatter.toml` (see the module doc
+    /// comment): a key it sets wins over `config` (the per-user config file)
+    /// but loses to a flag or environment variable.
+    pub fn resolve(cli: &Cli, vault: &Config, config: &Config, matches: &ArgMatches) -> Self {
         let defaults = Settings::default();
         Settings {
             format: resolve_value(
                 cli.format,
+                vault.format,
                 config.format,
                 defaults.format.value,
                 source_of(matches, "format"),
             ),
             table_style: resolve_value(
                 cli.table_style,
+                vault.table_style,
                 config.table_style,
                 defaults.table_style.value,
                 source_of(matches, "table_style"),
@@ -116,6 +129,7 @@ impl Settings {
                 matches,
                 "lenient",
                 "no_lenient",
+                vault.lenient,
                 config.lenient,
                 defaults.lenient.value,
             ),
@@ -123,6 +137,7 @@ impl Settings {
                 matches,
                 "header",
                 "no_header",
+                vault.header,
                 config.header,
                 defaults.header.value,
             ),
@@ -130,25 +145,35 @@ impl Settings {
                 matches,
                 "quiet",
                 "no_quiet",
+                vault.quiet,
                 config.quiet,
                 defaults.quiet.value,
             ),
-            timer: match config.timer {
-                Some(v) => Resolved::new(v, Source::Config),
-                None => Resolved::new(defaults.timer.value, Source::Default),
+            timer: match (vault.timer, config.timer) {
+                (Some(v), _) => Resolved::new(v, Source::Vault),
+                (None, Some(v)) => Resolved::new(v, Source::Config),
+                (None, None) => Resolved::new(defaults.timer.value, Source::Default),
             },
-            ..Settings::resolve_walk(&cli.walk, config, matches)
+            ..Settings::resolve_walk(&cli.walk, vault, config, matches)
         }
     }
 
     /// Resolves the scan settings only — everything `querymatter init` needs.
     /// The rendering settings are left at their defaults, since `init`
     /// renders nothing.
-    pub fn resolve_walk(walk: &WalkFlags, config: &Config, matches: &ArgMatches) -> Self {
+    ///
+    /// `vault` is the vault-level `.querymatter.toml`; see [`Settings::resolve`].
+    pub fn resolve_walk(
+        walk: &WalkFlags,
+        vault: &Config,
+        config: &Config,
+        matches: &ArgMatches,
+    ) -> Self {
         let defaults = Settings::default();
         Settings {
             ext: resolve_value(
                 walk.ext.clone(),
+                vault.ext.clone(),
                 config.ext.clone(),
                 // `.clone()`, not a move: `..defaults` below needs `defaults`
                 // whole, and a partial move out of a non-`Copy` field would
@@ -160,6 +185,7 @@ impl Settings {
                 matches,
                 "respect_gitignore",
                 "no_respect_gitignore",
+                vault.respect_gitignore,
                 config.respect_gitignore,
                 defaults.respect_gitignore.value,
             ),
@@ -167,11 +193,13 @@ impl Settings {
                 matches,
                 "hidden",
                 "no_hidden",
+                vault.hidden,
                 config.hidden,
                 defaults.hidden.value,
             ),
             exclude: resolve_value(
                 non_empty(walk.exclude.clone()),
+                vault.exclude.clone(),
                 config.exclude.clone(),
                 defaults.exclude.value.clone(),
                 source_of(matches, "exclude"),
@@ -273,28 +301,34 @@ impl Settings {
     }
 }
 
-/// Picks the winning layer for one setting.
+/// Picks the winning layer for one setting: `cli` (flag/env), then `vault`
+/// (the vault-level `.querymatter.toml`), then `config` (the per-user config
+/// file), then `default`.
 ///
 /// `cli` already carries the flag-over-environment decision (clap fills it
 /// from either), so `cli_source` says which of the two it actually was.
 fn resolve_value<T>(
     cli: Option<T>,
+    vault: Option<T>,
     config: Option<T>,
     default: T,
     cli_source: Option<Source>,
 ) -> Resolved<T> {
-    match (cli, config) {
-        (Some(value), _) => Resolved::new(value, cli_source.unwrap_or(Source::Flag)),
-        (None, Some(value)) => Resolved::new(value, Source::Config),
-        (None, None) => Resolved::new(default, Source::Default),
+    match (cli, vault, config) {
+        (Some(value), _, _) => Resolved::new(value, cli_source.unwrap_or(Source::Flag)),
+        (None, Some(value), _) => Resolved::new(value, Source::Vault),
+        (None, None, Some(value)) => Resolved::new(value, Source::Config),
+        (None, None, None) => Resolved::new(default, Source::Default),
     }
 }
 
-/// Picks the winning layer for a boolean expressed as a flag/negation pair.
+/// Picks the winning layer for a boolean expressed as a flag/negation pair:
+/// the flag/negation, then `vault`, then `config`, then `default`.
 fn resolve_bool(
     matches: &ArgMatches,
     on: &str,
     off: &str,
+    vault: Option<bool>,
     config: Option<bool>,
     default: bool,
 ) -> Resolved<bool> {
@@ -302,6 +336,8 @@ fn resolve_bool(
         Resolved::new(true, Source::Flag)
     } else if source_of(matches, off) == Some(Source::Flag) {
         Resolved::new(false, Source::Flag)
+    } else if let Some(value) = vault {
+        Resolved::new(value, Source::Vault)
     } else if let Some(value) = config {
         Resolved::new(value, Source::Config)
     } else {
@@ -351,15 +387,23 @@ mod tests {
     use crate::render::{Format, TableStyle};
     use clap::{CommandFactory, FromArgMatches};
 
-    /// Parses `args` and resolves them against `config`, the way `main` does.
+    /// Parses `args` and resolves them against `config`, with no vault layer
+    /// (`Config::default()`) — the way `main` does when no `.querymatter.toml`
+    /// is found.
     fn resolve(args: &[&str], config: &Config) -> Settings {
+        resolve_with_vault(args, &Config::default(), config)
+    }
+
+    /// Like [`resolve`], but with an explicit vault-level layer — the way
+    /// `main` does when a `.querymatter.toml` is found.
+    fn resolve_with_vault(args: &[&str], vault: &Config, config: &Config) -> Settings {
         // `table_style`'s clap `env` reads the real process environment, so
         // neutralize it: a developer with QUERYMATTER_TABLE_STYLE exported
         // must not change these results.
         let mut command = Cli::command().mut_arg("table_style", |a| a.env(None::<&str>));
         let matches = command.try_get_matches_from_mut(args).unwrap();
         let cli = Cli::from_arg_matches(&matches).unwrap();
-        Settings::resolve(&cli, config, &matches)
+        Settings::resolve(&cli, vault, config, &matches)
     }
 
     fn config_with(f: impl FnOnce(&mut Config)) -> Config {
@@ -422,6 +466,80 @@ mod tests {
         let s = resolve(&["querymatter", "--format", "csv"], &config);
         assert_eq!(s.format.value, Format::Csv);
         assert_eq!(s.format.source, Source::Flag);
+    }
+
+    // -- Vault layer (W54): flag > env > vault > config > default --------
+
+    #[test]
+    fn vault_config_beats_user_config() {
+        let vault = config_with(|c| c.table_style = Some(TableStyle::Unicode));
+        let config = config_with(|c| c.table_style = Some(TableStyle::Compact));
+        let s = resolve_with_vault(&["querymatter"], &vault, &config);
+        assert_eq!(s.table_style.value, TableStyle::Unicode);
+        assert_eq!(s.table_style.source, Source::Vault);
+    }
+
+    #[test]
+    fn flag_beats_vault_config() {
+        let vault = config_with(|c| c.table_style = Some(TableStyle::Unicode));
+        let s = resolve_with_vault(
+            &["querymatter", "--table-style", "compact"],
+            &vault,
+            &Config::default(),
+        );
+        assert_eq!(s.table_style.value, TableStyle::Compact);
+        assert_eq!(s.table_style.source, Source::Flag);
+    }
+
+    /// Pins the same "cli wins regardless of which of flag/env it was"
+    /// branch `flag_beats_vault_config` exercises above, but for a
+    /// `cli_source` of `Env` specifically. A real `QUERYMATTER_TABLE_STYLE`
+    /// can't be exercised at this level without mutating the whole test
+    /// process's environment (unsafe under `cargo test`'s parallelism —
+    /// see `env_beats_vault_config` in `tests/cli.rs`, which spawns a real
+    /// child process instead), so this calls the private precedence helper
+    /// directly with a synthetic `cli_source`.
+    #[test]
+    fn env_source_beats_vault_in_resolve_value() {
+        let resolved = resolve_value(
+            Some(TableStyle::Ascii),
+            Some(TableStyle::Unicode),
+            None,
+            TableStyle::Ascii,
+            Some(Source::Env),
+        );
+        assert_eq!(resolved.value, TableStyle::Ascii);
+        assert_eq!(resolved.source, Source::Env);
+    }
+
+    #[test]
+    fn vault_config_beats_default_when_user_config_absent() {
+        let vault = config_with(|c| c.lenient = Some(true));
+        let s = resolve_with_vault(&["querymatter"], &vault, &Config::default());
+        assert!(s.lenient.value);
+        assert_eq!(s.lenient.source, Source::Vault);
+    }
+
+    #[test]
+    fn no_lenient_flag_beats_a_vault_configured_true() {
+        let vault = config_with(|c| c.lenient = Some(true));
+        let s = resolve_with_vault(&["querymatter", "--no-lenient"], &vault, &Config::default());
+        assert!(!s.lenient.value);
+        assert_eq!(s.lenient.source, Source::Flag);
+    }
+
+    /// `main::load_vault_config` hands `Settings::resolve` a bare
+    /// `Config::default()` when no `.querymatter.toml` is found (see
+    /// `absent_vault_file_falls_through_to_user_config` in `tests/cli.rs` for
+    /// the full-stack proof of that discovery step); this pins that an empty
+    /// vault layer is a pure no-op at the resolution level, falling straight
+    /// through to the user config exactly as it did before this layer existed.
+    #[test]
+    fn absent_vault_falls_through_to_user_config() {
+        let config = config_with(|c| c.table_style = Some(TableStyle::Unicode));
+        let s = resolve_with_vault(&["querymatter"], &Config::default(), &config);
+        assert_eq!(s.table_style.value, TableStyle::Unicode);
+        assert_eq!(s.table_style.source, Source::Config);
     }
 
     #[test]
@@ -560,12 +678,40 @@ mod tests {
             .expect("Command::Init parsed implies the init subcommand matched");
         let config = config_with(|c| c.hidden = Some(true));
 
-        let settings = Settings::resolve_walk(&init_args.walk, &config, sub_matches);
+        let settings =
+            Settings::resolve_walk(&init_args.walk, &Config::default(), &config, sub_matches);
         assert!(
             settings.hidden.value,
             "config hidden = true must reach init's walk"
         );
         assert_eq!(settings.hidden.source, Source::Config);
+    }
+
+    /// The vault layer must reach `init`'s walk exactly like the user config
+    /// does above, and must outrank it: `Settings::resolve_walk` is the same
+    /// function `main::run_init` calls with the discovered vault config.
+    #[test]
+    fn resolve_walk_vault_hidden_beats_config() {
+        let mut command = Cli::command().mut_arg("table_style", |a| a.env(None::<&str>));
+        let matches = command
+            .try_get_matches_from_mut(["querymatter", "init"])
+            .unwrap();
+        let cli = Cli::from_arg_matches(&matches).unwrap();
+        let Some(Command::Init(init_args)) = &cli.command else {
+            panic!("expected an Init subcommand");
+        };
+        let sub_matches = matches
+            .subcommand_matches("init")
+            .expect("Command::Init parsed implies the init subcommand matched");
+        let vault = config_with(|c| c.hidden = Some(true));
+        let config = config_with(|c| c.hidden = Some(false));
+
+        let settings = Settings::resolve_walk(&init_args.walk, &vault, &config, sub_matches);
+        assert!(
+            settings.hidden.value,
+            "vault hidden = true must reach init's walk, beating a configured false"
+        );
+        assert_eq!(settings.hidden.source, Source::Vault);
     }
 
     #[test]
@@ -607,6 +753,15 @@ mod tests {
     }
 
     #[test]
+    fn timer_vault_beats_config() {
+        let vault = config_with(|c| c.timer = Some(true));
+        let config = config_with(|c| c.timer = Some(false));
+        let s = resolve_with_vault(&["querymatter"], &vault, &config);
+        assert!(s.timer.value);
+        assert_eq!(s.timer.source, Source::Vault);
+    }
+
+    #[test]
     fn rows_name_every_key_and_its_source() {
         let config = config_with(|c| c.table_style = Some(TableStyle::Unicode));
         let rows = resolve(&["querymatter"], &config).rows();
@@ -620,5 +775,22 @@ mod tests {
         assert!(rows.contains("unicode"), "got:\n{rows}");
         assert!(rows.contains("config"), "got:\n{rows}");
         assert!(rows.contains("default"), "got:\n{rows}");
+    }
+
+    /// `config list`/`.settings` must report `(vault)` when the vault layer
+    /// supplied the value, on the same row as its value — matching
+    /// `rows_name_every_key_and_its_source`'s shape for `(config)` above.
+    #[test]
+    fn rows_report_the_vault_source() {
+        let vault = config_with(|c| c.table_style = Some(TableStyle::Unicode));
+        let rows = resolve_with_vault(&["querymatter"], &vault, &Config::default()).rows();
+        let table_style_row = rows
+            .lines()
+            .find(|line| line.split_whitespace().next() == Some("table_style"))
+            .unwrap_or_else(|| panic!("no table_style row in:\n{rows}"));
+        assert!(
+            table_style_row.contains("unicode") && table_style_row.contains("(vault)"),
+            "got: {table_style_row:?}"
+        );
     }
 }

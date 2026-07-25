@@ -318,6 +318,35 @@ pub fn find_vault(start: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Filename of the vault-level shared config a team can commit at the vault
+/// root, spliced into [`crate::settings`] resolution between the environment
+/// and the per-user config file (`Source::Vault`).
+const VAULT_CONFIG_FILE_NAME: &str = ".querymatter.toml";
+
+/// Walks `start` upward through its ancestors, returning the path of the
+/// first `.querymatter.toml` file found — the vault-level config a team can
+/// commit at the vault root.
+///
+/// Deliberately independent of [`find_vault`]/[`manifest_exists`]: a
+/// `.querymatter.toml` need not sit alongside a `.querymatter/` cache
+/// directory (a team can commit shared defaults before anyone has ever run
+/// `init`), and a `.querymatter/` cache directory implies nothing about
+/// whether a `.querymatter.toml` exists anywhere above it. The two walks are
+/// independent for the same reason `find_vault` and this function don't
+/// share a loop: they're keyed off different files entirely.
+pub fn find_vault_config(start: &Path) -> Option<PathBuf> {
+    let mut dir = start.canonicalize().ok()?;
+    loop {
+        let candidate = dir.join(VAULT_CONFIG_FILE_NAME);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
 /// Resolves a `--refresh`/`.refresh <PATH>` argument to an absolute path
 /// under `vault`.
 ///
@@ -1122,6 +1151,50 @@ mod tests {
 
         let other = TempDir::new().unwrap();
         assert_eq!(find_vault(other.path()), None);
+    }
+
+    #[test]
+    fn find_vault_config_finds_ancestor_file() {
+        let td = TempDir::new().unwrap();
+        fs::write(td.path().join(".querymatter.toml"), "table_style = \"unicode\"\n").unwrap();
+        let deep = td.path().join("a/b/c");
+        fs::create_dir_all(&deep).unwrap();
+        assert_eq!(
+            find_vault_config(&deep),
+            Some(fs::canonicalize(td.path()).unwrap().join(".querymatter.toml"))
+        );
+    }
+
+    #[test]
+    fn find_vault_config_returns_none_when_absent() {
+        let td = TempDir::new().unwrap();
+        assert_eq!(find_vault_config(td.path()), None);
+    }
+
+    /// W54: a `.querymatter.toml` is found regardless of whether a
+    /// `.querymatter/` cache directory exists anywhere in the same ancestry,
+    /// and vice versa — the two discoveries must never gate one another.
+    #[test]
+    fn find_vault_config_is_independent_of_the_cache_dir() {
+        let td = TempDir::new().unwrap();
+        save_cache(td.path(), &[], 300).unwrap();
+        assert!(manifest_exists(td.path()), "sanity: a cache dir exists");
+        assert_eq!(
+            find_vault_config(td.path()),
+            None,
+            "a cache dir with no .querymatter.toml must not be mistaken for one"
+        );
+
+        let other = TempDir::new().unwrap();
+        fs::write(other.path().join(".querymatter.toml"), "hidden = true\n").unwrap();
+        assert!(
+            !manifest_exists(other.path()),
+            "sanity: no cache dir here"
+        );
+        assert_eq!(
+            find_vault_config(other.path()),
+            Some(fs::canonicalize(other.path()).unwrap().join(".querymatter.toml"))
+        );
     }
 
     fn write_file(dir: &Path, rel: &str, body: &str) {

@@ -21,8 +21,10 @@ pub struct Session {
     /// Every setting as resolved for this session; `.style`/`.format` mutate
     /// the rendering ones in place.
     settings: Settings,
-    /// The same resolution with the config layer removed, so `.unset` can
-    /// revert a setting to whatever would apply without the config file.
+    /// The same resolution with the per-user config layer removed (but the
+    /// vault layer kept — `.unset` only ever touches the per-user config
+    /// file), so `.unset` can revert a setting to whatever would apply
+    /// without that file.
     fallback: Settings,
     /// The `.querymatter` vault this session's store is backed by, when it
     /// is cache-backed. `None` for a live (no-cache) session, in which case
@@ -32,7 +34,8 @@ pub struct Session {
 
 impl Session {
     /// Builds a session over `store` with `settings`, keeping `fallback` —
-    /// the config-free resolution — for `.unset`.
+    /// the resolution with the per-user config file removed but the vault
+    /// layer kept — for `.unset`.
     pub fn new(
         store: Box<dyn RecordStore>,
         settings: Settings,
