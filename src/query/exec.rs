@@ -13,7 +13,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::time::SystemTime;
 
-use chrono::{DateTime, Duration, Months, SecondsFormat, Utc};
+use chrono::{DateTime, Duration, Months, NaiveDate, SecondsFormat, Utc};
 use globset::Glob;
 use indexmap::IndexMap;
 use regex::Regex;
@@ -1327,6 +1327,11 @@ fn literal_value(lit: &Literal) -> Value {
 /// (`parse::check_scalar_arity`), so a mismatch reaching here can only come
 /// from an in-crate caller building a bad-arity `Expr::Scalar` directly —
 /// that falls back to `Null` rather than panicking.
+///
+/// `ScalarFn::Date` is the one exception to the stringify-first rule (see
+/// [`cast_date`]): a non-string, non-`Date`/`DateTime` first argument yields
+/// `Null` instead of stringifying, since there's no sensible date to parse
+/// out of e.g. an `Int`.
 pub(crate) fn apply_scalar(f: ScalarFn, args: &[Value]) -> Value {
     if args.iter().any(Value::is_null) {
         return Value::Null;
@@ -1343,6 +1348,8 @@ pub(crate) fn apply_scalar(f: ScalarFn, args: &[Value]) -> Value {
         (ScalarFn::Replace, [s, from, to]) => {
             Value::Str(s.display().replace(&from.display(), &to.display()))
         }
+        (ScalarFn::Date, [s]) => cast_date(s, None),
+        (ScalarFn::Date, [s, fmt]) => cast_date(s, Some(fmt)),
         // Wrong arity can't come from the parser (see doc comment above);
         // return `Null` rather than panicking on a hand-built bad call.
         _ => Value::Null,
@@ -1378,6 +1385,35 @@ fn substr(s: &str, start: &Value, len: Option<&Value>) -> Value {
         },
     };
     Value::Str(chars[from..to.max(from)].iter().collect())
+}
+
+/// `date(s[, fmt])`: casts `s` to a [`Value::Date`]/[`Value::DateTime`]. A
+/// `s` that's already a `Date`/`DateTime` passes through unchanged. A `fmt`
+/// argument parses `s` as a [`NaiveDate`] with that chrono format string;
+/// without one, `s` tries strict `%Y-%m-%d` then RFC3339 — the same
+/// detection frontmatter ingest applies to auto-classify a string field.
+/// Anything else — a non-string `s`, or a string chrono can't parse —
+/// yields `Value::Null`.
+fn cast_date(s: &Value, fmt: Option<&Value>) -> Value {
+    if matches!(s, Value::Date(_) | Value::DateTime(_)) {
+        return s.clone();
+    }
+    let Value::Str(s) = s else {
+        return Value::Null;
+    };
+    if let Some(fmt) = fmt {
+        return match NaiveDate::parse_from_str(s, &fmt.display()) {
+            Ok(d) => Value::Date(d),
+            Err(_) => Value::Null,
+        };
+    }
+    if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return Value::Date(d);
+    }
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Value::DateTime(dt.with_timezone(&Utc));
+    }
+    Value::Null
 }
 
 /// Applies an arithmetic or concatenation operator to two already-evaluated
@@ -1795,6 +1831,34 @@ mod tests {
     }
 
     #[test]
+    fn date_cast_passes_through_date_and_datetime_and_defaults_to_rfc3339() {
+        use chrono::TimeZone;
+        use std::slice;
+
+        let s = |t: &str| Value::Str(t.into());
+        let d = Value::Date(NaiveDate::from_ymd_opt(2026, 7, 24).unwrap());
+        let dt = Value::DateTime(Utc.with_ymd_and_hms(2026, 7, 24, 9, 30, 0).unwrap());
+
+        // Already a Date/DateTime: passes through unchanged, no re-parse.
+        assert_eq!(apply_scalar(ScalarFn::Date, slice::from_ref(&d)), d);
+        assert_eq!(apply_scalar(ScalarFn::Date, slice::from_ref(&dt)), dt);
+
+        // No fmt arg: tries `%Y-%m-%d`, then falls back to RFC3339.
+        assert_eq!(
+            apply_scalar(ScalarFn::Date, &[s("2026-07-24T09:30:00Z")]),
+            dt
+        );
+
+        // A value that isn't a string, `Date`, or `DateTime` has no sensible
+        // date to parse out of it — `Null`, not a stringify-then-parse
+        // attempt (see the `apply_scalar` doc comment).
+        assert_eq!(
+            apply_scalar(ScalarFn::Date, &[Value::Int(20260724)]),
+            Value::Null
+        );
+    }
+
+    #[test]
     fn substr_select_survives_extreme_literals_without_panicking() {
         // Same regression as `substr_overflow_safe_for_extreme_start_and_len`,
         // pinned at the actual seam the bug was reported against: a real SQL
@@ -1917,6 +1981,30 @@ mod tests {
         assert_eq!(
             execute(&concat, rows.iter(), false).unwrap().rows,
             vec![vec![Value::Str("3-Draft".into())]]
+        );
+    }
+
+    #[test]
+    fn date_cast_parses_iso_and_custom_format() {
+        let rows = [rec("s", "s/a.md", &[])];
+        let expected = NaiveDate::from_ymd_opt(2026, 7, 24).unwrap();
+
+        let iso = parse("SELECT date('2026-07-24')").unwrap();
+        assert_eq!(
+            execute(&iso, rows.iter(), false).unwrap().rows,
+            vec![vec![Value::Date(expected)]]
+        );
+
+        let custom = parse("SELECT date('07/24/2026', '%m/%d/%Y')").unwrap();
+        assert_eq!(
+            execute(&custom, rows.iter(), false).unwrap().rows,
+            vec![vec![Value::Date(expected)]]
+        );
+
+        let unparseable = parse("SELECT date('nonsense')").unwrap();
+        assert_eq!(
+            execute(&unparseable, rows.iter(), false).unwrap().rows,
+            vec![vec![Value::Null]]
         );
     }
 

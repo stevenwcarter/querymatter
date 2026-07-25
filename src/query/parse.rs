@@ -427,6 +427,7 @@ fn scalar_fn_from_name(name: &str) -> Option<ScalarFn> {
         "ltrim" => Some(ScalarFn::Ltrim),
         "rtrim" => Some(ScalarFn::Rtrim),
         "replace" => Some(ScalarFn::Replace),
+        "date" => Some(ScalarFn::Date),
         _ => None,
     }
 }
@@ -444,6 +445,7 @@ fn check_scalar_arity(f: &ScalarFn, name: &str, argc: usize) -> Result<(), Parse
         | ScalarFn::Rtrim => (argc == 1, "1 argument"),
         ScalarFn::Substr => ((2..=3).contains(&argc), "2 or 3 arguments"),
         ScalarFn::Replace => (argc == 3, "3 arguments"),
+        ScalarFn::Date => ((1..=2).contains(&argc), "1 or 2 arguments"),
     };
     if arity_ok {
         Ok(())

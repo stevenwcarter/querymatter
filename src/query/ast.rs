@@ -142,6 +142,11 @@ pub enum ScalarFn {
     Substr,
     /// `replace(s, from, to)` — all non-overlapping occurrences.
     Replace,
+    /// `date(s)` / `date(s, fmt)` — casts `s` to `Value::Date`/`DateTime`:
+    /// ISO (`%Y-%m-%d` then RFC3339) by default, or a custom chrono `fmt`.
+    /// An already-`Date`/`DateTime` argument passes through; unparseable
+    /// input yields `Value::Null`.
+    Date,
 }
 
 /// A binary operator in a `SELECT` expression: arithmetic or string concat.
@@ -765,6 +770,7 @@ fn scalar_fn_name(f: &ScalarFn) -> &'static str {
         ScalarFn::Rtrim => "rtrim",
         ScalarFn::Substr => "substr",
         ScalarFn::Replace => "replace",
+        ScalarFn::Date => "date",
     }
 }
 
