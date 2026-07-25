@@ -2155,6 +2155,165 @@ mod tests {
             "2025-07-24"
         );
     }
+
+    /// The fixed instant shared by every relative-date behavioral test
+    /// below: 2026-07-24T00:00:00Z, so `'-7d'` always resolves to
+    /// `"2026-07-17"` (matching `relative_date_resolves_against_injected_now`
+    /// above).
+    fn fixed_now() -> SystemTime {
+        use std::time::{Duration, UNIX_EPOCH};
+        UNIX_EPOCH + Duration::from_secs(1_784_851_200)
+    }
+
+    #[test]
+    fn relative_date_resolves_in_in_list() {
+        // `IN (...)` carries a `Vec<Literal>`, a distinct AST position from
+        // a `Compare`'s single literal — this must be walked too.
+        let now = fixed_now();
+        let q = parse("SELECT file.name WHERE created IN ('-7d', 'draft')").unwrap();
+
+        let matching = rec(
+            "s",
+            "s/a.md",
+            &[("created", Value::Str("2026-07-17".into()))],
+        );
+        let t = execute_with_schema_at(
+            &q,
+            std::iter::once(&matching),
+            &["created".to_string()],
+            false,
+            now,
+        )
+        .unwrap();
+        assert_eq!(t.rows, vec![vec![Value::Str("a.md".into())]]);
+
+        let non_matching = rec(
+            "s",
+            "s/b.md",
+            &[("created", Value::Str("2026-07-16".into()))],
+        );
+        let t = execute_with_schema_at(
+            &q,
+            std::iter::once(&non_matching),
+            &["created".to_string()],
+            false,
+            now,
+        )
+        .unwrap();
+        assert!(t.rows.is_empty());
+    }
+
+    #[test]
+    fn relative_date_resolves_in_member_of() {
+        // `MEMBER OF`'s left-hand literal is its own AST position, separate
+        // from both `Compare` and `In`.
+        let now = fixed_now();
+        let q = parse("SELECT file.name WHERE '-7d' MEMBER OF(dates)").unwrap();
+
+        let has_date = rec(
+            "s",
+            "s/a.md",
+            &[("dates", Value::List(vec![Value::Str("2026-07-17".into())]))],
+        );
+        let t = execute_with_schema_at(
+            &q,
+            std::iter::once(&has_date),
+            &["dates".to_string()],
+            false,
+            now,
+        )
+        .unwrap();
+        assert_eq!(t.rows, vec![vec![Value::Str("a.md".into())]]);
+
+        let missing_date = rec(
+            "s",
+            "s/b.md",
+            &[("dates", Value::List(vec![Value::Str("2026-07-16".into())]))],
+        );
+        let t = execute_with_schema_at(
+            &q,
+            std::iter::once(&missing_date),
+            &["dates".to_string()],
+            false,
+            now,
+        )
+        .unwrap();
+        assert!(t.rows.is_empty());
+    }
+
+    #[test]
+    fn relative_date_resolves_in_having() {
+        // `HAVING`'s literal is resolved before `eval_having` runs, exactly
+        // like `WHERE`'s — a group whose aggregate clears the resolved
+        // date survives, one that doesn't gets dropped.
+        let now = fixed_now();
+        let rows = [
+            rec(
+                "s",
+                "s/a1.md",
+                &[
+                    ("status", Value::Str("a".into())),
+                    ("created", Value::Str("2026-07-20".into())),
+                ],
+            ),
+            rec(
+                "s",
+                "s/b1.md",
+                &[
+                    ("status", Value::Str("b".into())),
+                    ("created", Value::Str("2026-07-10".into())),
+                ],
+            ),
+        ];
+        let q = parse("SELECT status GROUP BY status HAVING min(created) >= '-7d'").unwrap();
+        let t = execute_with_schema_at(
+            &q,
+            rows.iter(),
+            &["status".to_string(), "created".to_string()],
+            false,
+            now,
+        )
+        .unwrap();
+        assert_eq!(t.rows, vec![vec![Value::Str("a".into())]]);
+    }
+
+    #[test]
+    fn relative_date_resolves_in_executed_select_projection() {
+        // Executed end-to-end (not just parsed): the projected cell must be
+        // the resolved ISO date, not the literal source text `-7d`.
+        let now = fixed_now();
+        let row = rec("s", "s/a.md", &[]);
+        let q = parse("SELECT '-7d' AS d").unwrap();
+        let t = execute_with_schema_at(&q, std::iter::once(&row), &[], false, now).unwrap();
+        assert_eq!(t.rows, vec![vec![Value::Str("2026-07-17".into())]]);
+    }
+
+    #[test]
+    fn extreme_offset_magnitude_falls_back_to_str_and_does_not_panic() {
+        // A 15-digit offset is well within `i64` (so `digits.parse()`
+        // succeeds) but far beyond `RelDate::parse`'s max offset magnitude;
+        // `RelDate::parse` rejects it, so it stays a plain `Literal::Str`
+        // rather than reaching `resolve_reldate` and overflowing/panicking
+        // `chrono::Duration::days`.
+        let q = parse("SELECT file.name WHERE created = '-999999999999999d'").unwrap();
+        assert_eq!(
+            q.filter,
+            Some(Predicate::Compare(
+                Expr::Col(ColRef::Field(vec!["created".into()])),
+                CmpOp::Eq,
+                Expr::Lit(Literal::Str("-999999999999999d".into()))
+            ))
+        );
+
+        let row = rec(
+            "s",
+            "s/a.md",
+            &[("created", Value::Str("2026-07-17".into()))],
+        );
+        // Must not panic; the literal text never matches a real date.
+        let t = execute(&q, std::iter::once(&row), false).unwrap();
+        assert!(t.rows.is_empty());
+    }
 }
 
 #[cfg(test)]

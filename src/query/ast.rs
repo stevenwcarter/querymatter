@@ -282,13 +282,26 @@ pub enum DateUnit {
     Year,
 }
 
+/// The largest offset magnitude [`RelDate::parse`] accepts, in the offset's
+/// own unit — so up to 100,000 days, weeks, months, or years (the last of
+/// which is already 100,000 years, far beyond any plausible query). Bounds
+/// how large a value `exec::resolve_reldate` ever hands to
+/// `chrono::Duration::days`/`weeks` or `chrono::Months::new`: an unbounded
+/// offset (e.g. a 15-digit number, still well within `i64`) can overflow
+/// `Duration`'s internal range or silently truncate through the `as u32`
+/// cast feeding `Months::new`. An offset beyond this bound isn't treated as
+/// a relative date at all — it falls back to a plain string literal, the
+/// same as any other out-of-grammar input.
+const MAX_OFFSET_MAGNITUDE: i64 = 100_000;
+
 impl RelDate {
     /// Parses a relative-date token under a strict, anchored grammar:
     /// `today | now | [+-]<int>(d|w|mo|y)`, case-insensitive for the bare
     /// `today`/`now` keywords. Anything else — including a sign-less offset
-    /// (`7d`), an unrecognized unit (`-7m`, `-7x`), or a bare number
-    /// (`-7`) — is not a relative date and returns `None`, leaving the
-    /// caller free to treat the string as a plain string literal.
+    /// (`7d`), an unrecognized unit (`-7m`, `-7x`), a bare number (`-7`), or
+    /// an offset magnitude beyond [`MAX_OFFSET_MAGNITUDE`] — is not a
+    /// relative date and returns `None`, leaving the caller free to treat
+    /// the string as a plain string literal.
     pub fn parse(s: &str) -> Option<RelDate> {
         let s = s.trim();
         match s.to_ascii_lowercase().as_str() {
@@ -310,6 +323,9 @@ impl RelDate {
             (rest.strip_suffix('y')?, DateUnit::Year)
         };
         let n: i64 = digits.parse().ok()?;
+        if n > MAX_OFFSET_MAGNITUDE {
+            return None;
+        }
         Some(RelDate::Offset { n: sign * n, unit })
     }
 }
@@ -692,7 +708,33 @@ mod tests {
             })
         );
         // rejects
-        for bad in ["7d", "-7m", "-7x", "tomorrow", "draft", "-7", ""] {
+        for bad in [
+            "7d",
+            "-7m",
+            "-7x",
+            "tomorrow",
+            "draft",
+            "-7",
+            "",
+            "-999999999999999d",
+        ] {
+            assert_eq!(RelDate::parse(bad), None, "should reject {bad}");
+        }
+    }
+
+    #[test]
+    fn reldate_parse_rejects_offset_beyond_max_magnitude() {
+        use super::{DateUnit, RelDate};
+        // Just at the bound still parses...
+        assert_eq!(
+            RelDate::parse("-100000d"),
+            Some(RelDate::Offset {
+                n: -100_000,
+                unit: DateUnit::Day
+            })
+        );
+        // ...one past it does not, regardless of unit.
+        for bad in ["-100001d", "+100001w", "-100001mo", "+100001y"] {
             assert_eq!(RelDate::parse(bad), None, "should reject {bad}");
         }
     }
