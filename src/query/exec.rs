@@ -2333,6 +2333,25 @@ mod tests {
     }
 
     #[test]
+    fn relative_date_resolves_inside_coalesce_argument() {
+        // Regression: `rewrite_expr_literals` must recurse into
+        // `Expr::Coalesce`'s arguments, not just `Scalar`/`Binary` — a
+        // relative-date literal nested inside `COALESCE(...)` must reach
+        // evaluation already resolved to its ISO date, never the literal
+        // source text `-7d`. `epic` is absent on the row, so `COALESCE`
+        // falls through to the `'-7d'` argument, which must be the
+        // *resolved* value here (if the `Coalesce` arm were dropped from
+        // `rewrite_expr_literals`, this literal would survive the rewrite
+        // as a `Literal::RelativeDate` and panic in `literal_value`, not
+        // silently return the wrong string).
+        let now = fixed_now();
+        let row = rec("s", "s/a.md", &[]);
+        let q = parse("SELECT COALESCE(epic, '-7d') AS d").unwrap();
+        let t = execute_with_schema_at(&q, std::iter::once(&row), &[], false, now).unwrap();
+        assert_eq!(t.rows, vec![vec![Value::Str("2026-07-17".into())]]);
+    }
+
+    #[test]
     fn extreme_offset_magnitude_falls_back_to_str_and_does_not_panic() {
         // Each of these is malformed/out-of-bound enough that
         // `RelDate::parse` must reject it, so it stays a plain
