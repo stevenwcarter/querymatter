@@ -388,6 +388,38 @@ fn init_creates_manifest() {
     );
 }
 
+#[test]
+fn cache_status_reports_root_and_file_count() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg("init")
+        .arg(td.path())
+        .assert()
+        .success();
+
+    let canonical = fs::canonicalize(td.path()).unwrap();
+    qm(home.path())
+        .args(["cache", "status"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(canonical.display().to_string()))
+        .stdout(predicates::str::contains("files:       3"));
+}
+
+#[test]
+fn cache_status_without_a_vault_exits_nonzero_and_mentions_init() {
+    let td = tree(); // no `init`, so no vault exists anywhere above `td`.
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["cache", "status"])
+        .arg(td.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("init"));
+}
+
 /// `init`'s walk flags parse into the "init" subcommand's own nested
 /// `ArgMatches`, not the top-level one `main` builds `Cli` from —
 /// `Settings::resolve_walk` must be handed that nested `ArgMatches`, or every

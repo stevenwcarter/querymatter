@@ -31,13 +31,16 @@ use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::SystemTime;
 
 use anyhow::Context;
+use chrono::{DateTime, Utc};
 use clap::{ArgMatches, CommandFactory, FromArgMatches};
 
+use crate::cache::CacheSummary;
 use crate::cli::{
-    Cli, Command, CompletionsArgs, ConfigAction, ConfigArgs, ExplainArgs, InitArgs, QueryAction,
-    QueryArgs,
+    CacheAction, CacheArgs, Cli, Command, CompletionsArgs, ConfigAction, ConfigArgs, ExplainArgs,
+    InitArgs, QueryAction, QueryArgs,
 };
 use crate::config::Config;
 use crate::output::OutputSink;
@@ -146,6 +149,10 @@ fn dispatch(cli: &Cli, matches: &ArgMatches) -> anyhow::Result<ExitCode> {
         }
         Some(Command::Config(args)) => {
             run_config(&args.action, cli, &config, matches)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(Command::Cache(args)) => {
+            run_cache(args)?;
             Ok(ExitCode::SUCCESS)
         }
         Some(Command::Query(QueryArgs {
@@ -378,6 +385,98 @@ fn run_config_path() -> anyhow::Result<()> {
         config::config_path().context("cannot determine a config directory for this user")?;
     println!("{}", path.display());
     Ok(())
+}
+
+/// Runs a `querymatter cache` action; only `status` exists today.
+fn run_cache(args: &CacheArgs) -> anyhow::Result<()> {
+    match &args.action {
+        CacheAction::Status { dir } => run_cache_status(dir.as_deref()),
+    }
+}
+
+/// Reports the `.querymatter` cache's health for the vault enclosing `dir`
+/// (or the cwd when `dir` is absent): its location, size, counts, TTL, and
+/// each cached directory's last scan time. Printed to stdout — inspection
+/// data, matching `config list`'s convention. Errors, naming `querymatter
+/// init`, when no vault is found at or above the resolved directory.
+fn run_cache_status(dir: Option<&Path>) -> anyhow::Result<()> {
+    let start = match dir {
+        Some(dir) => fs::canonicalize(dir)
+            .with_context(|| format!("cannot access directory {}", dir.display()))?,
+        None => env::current_dir().context("failed to determine the current directory")?,
+    };
+    let vault = cache::find_vault(&start).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no .querymatter cache found at or above {} (run `querymatter init` first)",
+            start.display()
+        )
+    })?;
+    let summary = cache::cache_summary(&vault)?;
+    println!("{}", render_cache_summary(&summary));
+    Ok(())
+}
+
+/// Renders a [`CacheSummary`] exactly as `querymatter cache status` prints
+/// it: aligned key/value fields (location, counts, size, TTL, crate
+/// version), followed by each cached directory's last scan time in the
+/// order [`CacheSummary::dirs`] already carries (`manifest.bin`'s own
+/// order).
+fn render_cache_summary(summary: &CacheSummary) -> String {
+    let cache_dir = cache::cache_dir(&summary.root);
+    let mut lines = vec![
+        format!("root:        {}", summary.root.display()),
+        format!("cache dir:   {}", cache_dir.display()),
+        format!("directories: {}", summary.dir_count),
+        format!("files:       {}", summary.file_count),
+        format!("size:        {}", human_bytes(summary.bytes)),
+        format!("ttl:         {}s", summary.ttl_secs),
+        format!("built with:  querymatter {}", summary.crate_version),
+    ];
+
+    if !summary.dirs.is_empty() {
+        lines.push(String::new());
+        lines.push("directories scanned:".to_string());
+        let width = summary
+            .dirs
+            .iter()
+            .map(|(dir, _)| dir.display().to_string().len())
+            .max()
+            .unwrap_or(0);
+        for (dir, scanned_at) in &summary.dirs {
+            lines.push(format!(
+                "  {:width$}  {}",
+                dir.display(),
+                format_scan_time(*scanned_at)
+            ));
+        }
+    }
+
+    lines.join("\n")
+}
+
+/// Renders `bytes` human-readably: whole bytes below 1 KiB, one decimal
+/// place for KiB, and one decimal place for MiB and above — a `.querymatter`
+/// cache is not expected to reach GiB scale, so there's no step past MiB.
+fn human_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    let bytes_f = bytes as f64;
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes_f < MIB {
+        format!("{:.1} KiB", bytes_f / KIB)
+    } else {
+        format!("{:.1} MiB", bytes_f / MIB)
+    }
+}
+
+/// Renders a cached directory's scan time as `YYYY-MM-DD HH:MM` UTC, matching
+/// [`crate::model::system_time_to_iso`]'s UTC convention for on-disk
+/// timestamps.
+fn format_scan_time(t: SystemTime) -> String {
+    DateTime::<Utc>::from(t)
+        .format("%Y-%m-%d %H:%M")
+        .to_string()
 }
 
 /// Runs a config-free `querymatter query` action: `save`/`list`/`get`/

@@ -764,6 +764,55 @@ pub fn build_vault(base: &Path, opts: &WalkOpts, ttl_secs: u64) -> anyhow::Resul
     Ok(report)
 }
 
+/// A snapshot of a vault's `.querymatter` cache for `querymatter cache
+/// status`: how many directories/files it covers, its on-disk size, its
+/// TTL, the crate version it was built with, and each cached directory's
+/// last scan time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CacheSummary {
+    pub root: PathBuf,
+    pub dir_count: usize,
+    pub file_count: usize,
+    pub bytes: u64,
+    pub ttl_secs: u64,
+    pub crate_version: String,
+    pub dirs: Vec<(PathBuf, SystemTime)>,
+}
+
+/// Builds a [`CacheSummary`] for the vault at `vault_dir`: counts and sizes
+/// come from [`load_cache`] plus a listing of [`cache_dir`]'s on-disk blob
+/// and manifest files, so `bytes` reflects what's actually persisted rather
+/// than a value recomputed from the decoded records. Errors — naming
+/// `querymatter init` (the CLI dispatch adds that, see `main`) — when
+/// `vault_dir` has no readable cache.
+pub fn cache_summary(vault_dir: &Path) -> anyhow::Result<CacheSummary> {
+    let (body, dirs) = load_cache(vault_dir).context("no readable .querymatter cache found")?;
+    let file_count = dirs.iter().map(|d| d.files.len()).sum();
+
+    let cache = cache_dir(vault_dir);
+    let mut bytes = 0u64;
+    for entry in fs::read_dir(&cache).with_context(|| format!("reading {}", cache.display()))? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            bytes += entry.metadata()?.len();
+        }
+    }
+
+    Ok(CacheSummary {
+        root: vault_dir.to_path_buf(),
+        dir_count: body.dirs.len(),
+        file_count,
+        bytes,
+        ttl_secs: body.ttl_secs,
+        crate_version: body.crate_version,
+        dirs: body
+            .dirs
+            .iter()
+            .map(|e| (e.dir.clone(), e.scanned_at))
+            .collect(),
+    })
+}
+
 /// Forces a full re-scan (read + parse every matched file, ignoring every
 /// freshness shortcut) of the directories at or under `subtree`, replacing
 /// those entries of `cached` in place: a directory whose files have all
@@ -1311,6 +1360,29 @@ mod tests {
         );
         assert_eq!(cached_status(&loaded, "a.md"), Value::Str("draft".into()));
         assert_eq!(cached_status(&loaded, "b.md"), Value::Str("shipped".into()));
+    }
+
+    #[test]
+    fn cache_summary_reports_counts_size_and_ttl() {
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "plans/a.md", "---\nstatus: draft\n---\n");
+        write_file(td.path(), "plans/b.md", "---\nstatus: final\n---\n");
+        write_file(td.path(), "product/c.md", "---\nstatus: shipped\n---\n");
+
+        build_vault(td.path(), &WalkOpts::default(), 300).unwrap();
+
+        let s = cache_summary(td.path()).unwrap();
+        assert_eq!(s.file_count, 3);
+        assert!(s.dir_count >= 1);
+        assert!(s.bytes > 0);
+        assert_eq!(s.ttl_secs, 300);
+        assert_eq!(s.dirs.len(), s.dir_count);
+    }
+
+    #[test]
+    fn cache_summary_errors_without_a_vault() {
+        let td = TempDir::new().unwrap();
+        assert!(cache_summary(td.path()).is_err());
     }
 
     #[test]
