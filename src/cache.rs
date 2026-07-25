@@ -39,7 +39,7 @@ pub const MAGIC: [u8; 4] = *b"QMDB";
 /// Bumped whenever any cached struct's shape changes. Together with `MAGIC`
 /// this is the only safe "format changed → discard the cache" mechanism,
 /// since bincode itself has no schema versioning.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// One cached Markdown file: its frontmatter fields plus enough metadata
 /// (`mtime`, `size`) to detect that it has changed on disk.

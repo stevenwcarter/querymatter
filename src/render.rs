@@ -432,6 +432,18 @@ mod tests {
     }
 
     #[test]
+    fn json_export_emits_nested_object_for_map() {
+        use crate::model::Value;
+        use indexmap::IndexMap;
+        let mut inner = IndexMap::new();
+        inner.insert("low".to_string(), Value::Int(5));
+        let v = Value::Map(inner);
+        // to_json is module-private; assert via the JsonValue it builds.
+        let j = super::to_json(&v);
+        assert_eq!(j, serde_json::json!({ "low": 5 }));
+    }
+
+    #[test]
     fn json_renders_null_bool_float_list() {
         let s = render(
             &variant_table(),
