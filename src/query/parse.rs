@@ -631,6 +631,7 @@ fn file_attr_from_str(name: &str) -> Result<FileAttr, ParseError> {
         "ext" => Ok(FileAttr::Ext),
         "mtime" => Ok(FileAttr::Mtime),
         "size" => Ok(FileAttr::Size),
+        "word_count" => Ok(FileAttr::WordCount),
         other => Err(ParseError::BadColumn(format!(
             "unknown file attribute `file.{other}`"
         ))),
@@ -1277,6 +1278,16 @@ mod tests {
             }
             p => panic!("unexpected {p:?}"),
         }
+    }
+    // Task 6 (W56): `file.word_count` recognized the same way as the other
+    // `file.*` pseudo-columns.
+    #[test]
+    fn file_word_count_pseudo_column() {
+        let q = parse("SELECT file.word_count").unwrap();
+        assert_eq!(
+            q.select[0].expr,
+            SelectExpr::Expr(Expr::Col(ColRef::File(FileAttr::WordCount)))
+        );
     }
     #[test]
     fn where_ops_and_boolean() {

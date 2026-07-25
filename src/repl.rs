@@ -35,13 +35,14 @@ const PROMPT: &str = "querymatter> ";
 const CONTINUATION_PROMPT: &str = "   ...> ";
 /// The `file.*` pseudo-columns every record exposes, independent of
 /// frontmatter (kept in sync with [`crate::model::FileAttr`]'s labels).
-const FILE_COLUMNS: [&str; 6] = [
+const FILE_COLUMNS: [&str; 7] = [
     "file.name",
     "file.path",
     "file.folder",
     "file.ext",
     "file.mtime",
     "file.size",
+    "file.word_count",
 ];
 /// The history file's name under the REPL's state/data directory.
 const HISTORY_FILE: &str = "history.txt";
@@ -1015,10 +1016,11 @@ fn print_schema(session: &Session) {
 /// (`.describe file.name`) gets a trivial one-line note rather than the
 /// frontmatter-field detail block — and, per design, their distinct-value
 /// counts are never computed (`file.path` is unbounded). Their type is fixed
-/// per column rather than uniformly `Str`: `file.size` is `Int`, every other
-/// `file.*` column (including `file.mtime`, an ISO-8601 UTC string) is
-/// `Str` — see [`describe_file_column_line`]. A name that is neither a
-/// frontmatter field nor a `file.*` column is an error, printed to stderr.
+/// per column rather than uniformly `Str`: `file.size`/`file.word_count` are
+/// `Int`, every other `file.*` column (including `file.mtime`, an ISO-8601
+/// UTC string) is `Str` — see [`describe_file_column_line`]. A name that is
+/// neither a frontmatter field nor a `file.*` column is an error, printed to
+/// stderr.
 fn print_describe(session: &Session, field: Option<&str>) {
     match field {
         Some(name) if FILE_COLUMNS.contains(&name) => print_describe_file_column(name),
@@ -1061,10 +1063,10 @@ fn print_describe_field(session: &Session, name: &str) {
 }
 
 /// The trivial `.describe file.*` block: these pseudo-columns are always
-/// present with a fixed, per-column type — `file.size` is `Int`, every other
-/// `file.*` column is `Str` — so there's no coverage or value tally worth
-/// computing — least of all for `file.path`, whose distinct values are
-/// effectively unbounded.
+/// present with a fixed, per-column type — `file.size`/`file.word_count` are
+/// `Int`, every other `file.*` column is `Str` — so there's no coverage or
+/// value tally worth computing — least of all for `file.path`, whose
+/// distinct values are effectively unbounded.
 fn print_describe_file_column(name: &str) {
     println!("{}", describe_file_column_line(name));
 }
@@ -1072,7 +1074,11 @@ fn print_describe_file_column(name: &str) {
 /// Builds [`print_describe_file_column`]'s one-line text; split out so the
 /// per-column type note is unit-testable without capturing stdout.
 fn describe_file_column_line(name: &str) -> String {
-    let ty = if name == "file.size" { "Int" } else { "Str" };
+    let ty = if matches!(name, "file.size" | "file.word_count") {
+        "Int"
+    } else {
+        "Str"
+    };
     format!("{name}: (file.*) always present, type {ty}, 100% coverage")
 }
 
@@ -2184,10 +2190,11 @@ mod tests {
     /// itself is a faithful proxy for that printed output — and, since
     /// `print_describe`'s `Some(name) if FILE_COLUMNS.contains(&name) => ...`
     /// guard reads the same const, this also pins that `.describe
-    /// file.mtime`/`.describe file.size` route to the pseudo-column path
-    /// rather than falling through to "unknown field" (Task 4 follow-up).
+    /// file.mtime`/`.describe file.size`/`.describe file.word_count` route to
+    /// the pseudo-column path rather than falling through to "unknown field"
+    /// (Task 4 follow-up; `file.word_count` added Task 6/W56).
     #[test]
-    fn file_columns_include_mtime_and_size() {
+    fn file_columns_include_mtime_size_and_word_count() {
         assert_eq!(
             FILE_COLUMNS,
             [
@@ -2197,17 +2204,19 @@ mod tests {
                 "file.ext",
                 "file.mtime",
                 "file.size",
+                "file.word_count",
             ]
         );
     }
 
-    /// `.describe file.size` must not falsely claim `Str` (Task 4
-    /// follow-up): `file.size` is the one `Int`-typed pseudo-column, and
-    /// every other `file.*` column — including the new `file.mtime`, an
-    /// ISO-8601 UTC string — stays `Str`.
+    /// `.describe file.size`/`.describe file.word_count` must not falsely
+    /// claim `Str` (Task 4 follow-up; extended Task 6/W56): both are
+    /// `Int`-typed pseudo-columns, and every other `file.*` column —
+    /// including `file.mtime`, an ISO-8601 UTC string — stays `Str`.
     #[test]
     fn describe_file_column_reports_accurate_types() {
         assert!(describe_file_column_line("file.size").contains("type Int"));
+        assert!(describe_file_column_line("file.word_count").contains("type Int"));
         assert!(describe_file_column_line("file.mtime").contains("type Str"));
         assert!(describe_file_column_line("file.name").contains("type Str"));
     }

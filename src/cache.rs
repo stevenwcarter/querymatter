@@ -39,16 +39,23 @@ pub const MAGIC: [u8; 4] = *b"QMDB";
 /// Bumped whenever any cached struct's shape changes. Together with `MAGIC`
 /// this is the only safe "format changed → discard the cache" mechanism,
 /// since bincode itself has no schema versioning.
-pub const SCHEMA_VERSION: u32 = 2;
+///
+/// 2 -> 3 (W56): [`CachedFile`] gained `word_count`, changing bincode's
+/// positional layout — a v2 blob must be rejected outright, not mis-decoded
+/// into a shifted `CachedFile`.
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// One cached Markdown file: its frontmatter fields plus enough metadata
-/// (`mtime`, `size`) to detect that it has changed on disk.
+/// (`mtime`, `size`, `word_count`) to detect that it has changed on disk and
+/// to answer `file.*` pseudo-columns without re-reading the file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CachedFile {
     pub rel_path: String,
     pub mtime: SystemTime,
     pub size: u64,
     pub fields: IndexMap<String, Value>,
+    /// The Markdown body's word count (see [`frontmatter::extract`]).
+    pub word_count: usize,
 }
 
 /// One cached filesystem directory: every matched file directly under it,
@@ -435,7 +442,7 @@ pub fn scan_file(dir: &Path, path: &Path) -> ScanResult {
         Err(err) => return ScanResult::Warning(format!("{}: {err}", path.display())),
     };
     match frontmatter::extract(&content) {
-        Extract::Fields(fields) => ScanResult::Cached(CachedFile {
+        Extract::Fields { fields, word_count } => ScanResult::Cached(CachedFile {
             rel_path: path
                 .strip_prefix(dir)
                 .unwrap_or(path)
@@ -444,6 +451,7 @@ pub fn scan_file(dir: &Path, path: &Path) -> ScanResult {
             mtime,
             size,
             fields,
+            word_count,
         }),
         Extract::None => ScanResult::NoFrontmatter,
         Extract::Invalid(msg) => ScanResult::Warning(format!("{}: {msg}", path.display())),
@@ -773,7 +781,7 @@ pub fn records_from(
                             .map(|(name, value)| (name.clone(), value.clone()))
                             .collect(),
                     };
-                    Record::new(root, &path, fields, file.mtime, file.size)
+                    Record::new(root, &path, fields, file.mtime, file.size, file.word_count)
                 })
                 .collect();
             (cached_dir.dir.clone(), records, field_names)
@@ -937,6 +945,7 @@ mod tests {
                 mtime: UNIX_EPOCH + Duration::from_secs(800),
                 size: 42,
                 fields: f,
+                word_count: 7,
             }],
         }
     }
@@ -985,6 +994,30 @@ mod tests {
         };
         let mut bytes = write_manifest_bytes(&body);
         bytes[4..8].copy_from_slice(&(SCHEMA_VERSION + 1).to_le_bytes());
+        assert_eq!(read_manifest_bytes(&bytes), None);
+    }
+    /// Task 6 (W56): pins the exact bump this task makes. If this ever
+    /// fails, `SCHEMA_VERSION` moved without updating this test's
+    /// expectation alongside it.
+    #[test]
+    fn schema_version_is_3() {
+        assert_eq!(SCHEMA_VERSION, 3);
+    }
+    /// A manifest written by the pre-`word_count` v2 schema must be
+    /// rejected outright rather than mis-decoded into a `CachedFile` whose
+    /// bincode layout has since shifted (see the `SCHEMA_VERSION` doc
+    /// comment). Simulates a real v2 cache by hard-coding `2` (not
+    /// `SCHEMA_VERSION - 1`), so this test keeps meaning what it says even
+    /// if `SCHEMA_VERSION` moves again later.
+    #[test]
+    fn stale_v2_cache_is_rejected_after_schema_bump() {
+        let body = ManifestBody {
+            crate_version: "x".into(),
+            ttl_secs: 1,
+            dirs: vec![],
+        };
+        let mut bytes = write_manifest_bytes(&body);
+        bytes[4..8].copy_from_slice(&2u32.to_le_bytes());
         assert_eq!(read_manifest_bytes(&bytes), None);
     }
     #[test]

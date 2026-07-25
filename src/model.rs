@@ -195,6 +195,8 @@ pub enum FileAttr {
     Ext,
     Mtime,
     Size,
+    /// The Markdown body's word count (see [`crate::frontmatter::extract`]).
+    WordCount,
 }
 
 /// One queryable row: a Markdown file's YAML frontmatter fields, plus its
@@ -208,6 +210,7 @@ pub struct Record {
     ext: String,
     mtime: SystemTime,
     size: u64,
+    word_count: usize,
 }
 
 impl Record {
@@ -220,13 +223,16 @@ impl Record {
     /// Path separators are normalized to `/` so output is stable across
     /// platforms. `mtime`/`size` are the file's on-disk stat, already read
     /// by the caller for cache-freshness purposes — this is zero extra I/O,
-    /// not a fresh stat.
+    /// not a fresh stat. `word_count` is the body's word count (see
+    /// [`crate::frontmatter::extract`]), likewise already computed by the
+    /// caller.
     pub fn new(
         root: &Path,
         path: &Path,
         fields: IndexMap<String, Value>,
         mtime: SystemTime,
         size: u64,
+        word_count: usize,
     ) -> Self {
         let relative = path.strip_prefix(root).unwrap_or(path);
         let name = path
@@ -247,6 +253,7 @@ impl Record {
             ext,
             mtime,
             size,
+            word_count,
         }
     }
 
@@ -268,8 +275,8 @@ impl Record {
     }
 
     /// Resolves a `file.*` pseudo-column to its value: `Name`/`Path`/`Folder`/
-    /// `Ext` are strings, `Mtime` is an RFC3339 UTC string, and `Size` is an
-    /// integer byte count.
+    /// `Ext` are strings, `Mtime` is an RFC3339 UTC string, and `Size`/
+    /// `WordCount` are integer counts.
     pub fn file_attr(&self, attr: FileAttr) -> Value {
         match attr {
             FileAttr::Name => Value::Str(self.name.clone()),
@@ -278,7 +285,16 @@ impl Record {
             FileAttr::Ext => Value::Str(self.ext.clone()),
             FileAttr::Mtime => Value::Str(system_time_to_iso(self.mtime)),
             FileAttr::Size => Value::Int(self.size as i64),
+            FileAttr::WordCount => Value::Int(self.word_count as i64),
         }
+    }
+
+    /// The cached Markdown body word count, as a raw `usize` rather than a
+    /// `Value` — used by callers reconstructing a [`crate::cache::CachedFile`]
+    /// from an in-memory `Record` (e.g. [`crate::store`]'s no-on-disk-cache
+    /// fallback), which need the count itself, not its query-facing form.
+    pub fn word_count(&self) -> usize {
+        self.word_count
     }
 
     /// The frontmatter field names for this record.
@@ -536,6 +552,7 @@ mod record_tests {
             f,
             SystemTime::UNIX_EPOCH,
             0,
+            0,
         )
     }
     #[test]
@@ -553,12 +570,32 @@ mod record_tests {
     fn file_attr_mtime_and_size() {
         use std::time::Duration;
         let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_609_459_200);
-        let r = Record::new(Path::new("v"), Path::new("v/a.md"), IndexMap::new(), t, 42);
+        let r = Record::new(
+            Path::new("v"),
+            Path::new("v/a.md"),
+            IndexMap::new(),
+            t,
+            42,
+            0,
+        );
         assert_eq!(r.file_attr(FileAttr::Size), Value::Int(42));
         assert_eq!(
             r.file_attr(FileAttr::Mtime),
             Value::Str("2021-01-01T00:00:00Z".into())
         );
+    }
+    #[test]
+    fn file_attr_word_count() {
+        let r = Record::new(
+            Path::new("v"),
+            Path::new("v/a.md"),
+            IndexMap::new(),
+            SystemTime::UNIX_EPOCH,
+            0,
+            5,
+        );
+        assert_eq!(r.file_attr(FileAttr::WordCount), Value::Int(5));
+        assert_eq!(r.word_count(), 5);
     }
     #[test]
     fn field_present_and_missing() {
@@ -577,6 +614,7 @@ mod record_tests {
             Path::new("v/a.md"),
             f,
             SystemTime::UNIX_EPOCH,
+            0,
             0,
         );
         assert_eq!(r.field(&["estimate".into(), "low".into()]), Value::Int(5));

@@ -16,16 +16,22 @@ pub enum Extract {
     /// the YAML failed to parse, or it parsed to something other than a
     /// top-level mapping. The message is human-readable.
     Invalid(String),
-    /// A fence was found and parsed into field name/value pairs.
-    ///
-    /// Order is whatever gray_matter's YAML engine hands back: its
-    /// `Pod::Hash` is a plain `HashMap`, so this is *not* guaranteed to
-    /// match the order fields appeared in the source document.
-    Fields(IndexMap<String, Value>),
+    /// A fence was found and parsed into field name/value pairs, plus the
+    /// word count of the body that follows the fence.
+    Fields {
+        /// Order is whatever gray_matter's YAML engine hands back: its
+        /// `Pod::Hash` is a plain `HashMap`, so this is *not* guaranteed to
+        /// match the order fields appeared in the source document.
+        fields: IndexMap<String, Value>,
+        /// The number of whitespace-separated words in the document's body
+        /// (everything after the closing `---` fence), per
+        /// `str::split_whitespace`.
+        word_count: usize,
+    },
 }
 
 /// Pulls the leading `---`-fenced YAML block out of `content` and converts
-/// it into a field map.
+/// it into a field map, alongside the body's word count.
 ///
 /// Returns [`Extract::None`] when there is no fence, [`Extract::Invalid`]
 /// when a fence exists but its contents aren't a valid YAML mapping, and
@@ -46,7 +52,8 @@ pub fn extract(content: &str) -> Extract {
         .into_iter()
         .map(|(key, value)| (key, pod_to_value(value)))
         .collect();
-    Extract::Fields(fields)
+    let word_count = parsed.content.split_whitespace().count();
+    Extract::Fields { fields, word_count }
 }
 
 /// Converts gray_matter's dynamic `Pod` into our `Value`.
@@ -96,7 +103,7 @@ mod tests {
     fn scalars_parse_to_fields() {
         let c = "---\njira: DCP-459\nstatus: draft\n---\n# body\n";
         match extract(c) {
-            Extract::Fields(m) => {
+            Extract::Fields { fields: m, .. } => {
                 assert_eq!(m.get("jira"), Some(&Value::Str("DCP-459".into())));
                 assert_eq!(m.get("status"), Some(&Value::Str("draft".into())));
             }
@@ -120,7 +127,7 @@ mod tests {
     fn list_value_becomes_list() {
         let c = "---\ntags:\n  - a\n  - b\n---\n";
         match extract(c) {
-            Extract::Fields(m) => assert_eq!(
+            Extract::Fields { fields: m, .. } => assert_eq!(
                 m.get("tags"),
                 Some(&Value::List(vec![
                     Value::Str("a".into()),
@@ -137,7 +144,7 @@ mod tests {
     #[test]
     fn leading_zero_characterization() {
         let c = "---\nprd: 010\n---\n";
-        let Extract::Fields(m) = extract(c) else {
+        let Extract::Fields { fields: m, .. } = extract(c) else {
             panic!("expected Fields")
         };
         let got = m.get("prd").cloned().unwrap();
@@ -148,7 +155,7 @@ mod tests {
     #[test]
     fn quoted_leading_zero_is_string() {
         let c = "---\nprd: \"010\"\n---\n";
-        let Extract::Fields(m) = extract(c) else {
+        let Extract::Fields { fields: m, .. } = extract(c) else {
             panic!("expected Fields")
         };
         assert_eq!(m.get("prd"), Some(&Value::Str("010".into())));
@@ -195,10 +202,30 @@ mod tests {
         );
     }
 
+    // Task 6 (W56): the body's word count, split on whitespace, is returned
+    // alongside the fields rather than silently discarded.
+    #[test]
+    fn word_count_counts_the_body_after_the_fence() {
+        let c = "---\nstatus: draft\n---\none two three four five\n";
+        let Extract::Fields { word_count, .. } = extract(c) else {
+            panic!("expected Fields")
+        };
+        assert_eq!(word_count, 5);
+    }
+
+    #[test]
+    fn word_count_is_zero_for_an_empty_body() {
+        let c = "---\nstatus: draft\n---\n";
+        let Extract::Fields { word_count, .. } = extract(c) else {
+            panic!("expected Fields")
+        };
+        assert_eq!(word_count, 0);
+    }
+
     #[test]
     fn nested_mapping_becomes_value_map() {
         let c = "---\nestimate:\n  low: 5\n  high: 10\n---\n";
-        let Extract::Fields(m) = extract(c) else {
+        let Extract::Fields { fields: m, .. } = extract(c) else {
             panic!("expected Fields")
         };
         let mut expected = IndexMap::new();

@@ -860,6 +860,7 @@ fn empty_record() -> Record {
         IndexMap::new(),
         SystemTime::UNIX_EPOCH,
         0,
+        0,
     )
 }
 
@@ -1717,6 +1718,7 @@ mod tests {
             Path::new(path),
             m,
             SystemTime::UNIX_EPOCH,
+            0,
             0,
         )
     }
@@ -3255,6 +3257,7 @@ mod agg_tests {
             m,
             SystemTime::UNIX_EPOCH,
             0,
+            0,
         )
     }
     fn recs() -> Vec<Record> {
@@ -3275,6 +3278,7 @@ mod agg_tests {
             Path::new(path),
             m,
             SystemTime::UNIX_EPOCH,
+            0,
             0,
         )
     }
