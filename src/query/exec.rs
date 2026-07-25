@@ -614,6 +614,19 @@ fn group_rows<'a>(records: &[&'a Record], group_by: &[ColRef]) -> Vec<Group<'a>>
 /// concatenation collision-free regardless of what characters an element's
 /// own key contains: decoding never needs to guess where one element's key
 /// ends and the next begins.
+///
+/// `Map(entries)` recurses the same way, for the same reason — its compact
+/// `{k: v}` `to_cmp_string()` form is just as lossy as `List`'s `", "` join
+/// (`{a: "x", b: "y"}` and a single-key `{a: "x, b: y"}` both render `{a: x,
+/// b: y}`). Both the field name and its recursively-keyed value are
+/// length-prefixed before being appended, so concatenation stays unambiguous
+/// regardless of what characters a name or nested key contains. Unlike
+/// `List`, the entries are sorted by key first: `IndexMap`'s `PartialEq` (and
+/// so `Value`'s derived one) is order-insensitive — `{a: 1, b: 2}` and `{b:
+/// 2, a: 1}` are structurally equal — so without sorting, two insertion
+/// orders of the same map would hash to different keys and wrongly split one
+/// group into two. `List`/`Vec` equality is order-sensitive, which is why
+/// its arm above does not sort.
 fn hashable_cell_key(value: &Value) -> String {
     match value {
         Value::List(items) => {
@@ -630,6 +643,21 @@ fn hashable_cell_key(value: &Value) -> String {
         Value::Float(f) => {
             let normalized = if *f == 0.0 { 0.0 } else { *f };
             format!("Float\u{1}{normalized}")
+        }
+        Value::Map(entries) => {
+            let mut pairs: Vec<(&String, &Value)> = entries.iter().collect();
+            pairs.sort_by(|a, b| a.0.cmp(b.0)); // order-insensitive map equality -> sort
+            let mut key = String::from("Map");
+            for (name, v) in pairs {
+                let element = hashable_cell_key(v);
+                for part in [name.as_str(), element.as_str()] {
+                    key.push('\u{1}');
+                    key.push_str(&part.len().to_string());
+                    key.push('\u{1}');
+                    key.push_str(part);
+                }
+            }
+            key
         }
         _ => format!("{}\u{1}{}", value.variant_name(), value.to_cmp_string()),
     }
@@ -2840,6 +2868,70 @@ mod agg_tests {
             1,
             "0.0 and -0.0 must land in the SAME group, matching main's \
              structural Value PartialEq; got: {:?}",
+            t.rows
+        );
+        assert_eq!(t.rows[0][1], Value::Int(2));
+    }
+
+    /// M1 characterization: a `Value::Map` cell used to fall through the
+    /// wildcard arm and key on its compact `{k: v}` `to_cmp_string()` form,
+    /// which is lossy the same way `List`'s `", "` join was — `{a: "x", b:
+    /// "y"}` and the single-key `{a: "x, b: y"}` both compact-render `{a: x,
+    /// b: y}`. The structural `Map` arm recurses per-entry instead, so these
+    /// two structurally-different maps must land in different groups.
+    #[test]
+    fn group_by_map_column_distinguishes_structurally_different_maps() {
+        let mut two_entries = IndexMap::new();
+        two_entries.insert("a".to_string(), Value::Str("x".into()));
+        two_entries.insert("b".to_string(), Value::Str("y".into()));
+
+        let mut one_entry = IndexMap::new();
+        one_entry.insert("a".to_string(), Value::Str("x, b: y".into()));
+
+        let rows = [
+            rec_n("s/a.md", "x", Value::Map(two_entries)),
+            rec_n("s/b.md", "x", Value::Map(one_entry)),
+        ];
+
+        let q = parse("SELECT n, count(*) AS n_count GROUP BY n").unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
+        assert_eq!(
+            t.rows.len(),
+            2,
+            "{{a: x, b: y}} and {{a: \"x, b: y\"}} must land in different \
+             groups, matching main's structural Value PartialEq; got: {:?}",
+            t.rows
+        );
+        assert!(t.rows.iter().all(|row| row[1] == Value::Int(1)));
+    }
+
+    /// M1 characterization: `IndexMap`'s `PartialEq` (and so `Value`'s
+    /// derived one) is order-insensitive, so two maps with the same entries
+    /// in different insertion order are structurally equal and must land in
+    /// the SAME group — which `hashable_cell_key`'s `Map` arm achieves by
+    /// sorting entries by key before building the key string.
+    #[test]
+    fn group_by_map_column_is_order_insensitive() {
+        let mut ab = IndexMap::new();
+        ab.insert("a".to_string(), Value::Int(1));
+        ab.insert("b".to_string(), Value::Int(2));
+
+        let mut ba = IndexMap::new();
+        ba.insert("b".to_string(), Value::Int(2));
+        ba.insert("a".to_string(), Value::Int(1));
+
+        let rows = [
+            rec_n("s/a.md", "x", Value::Map(ab)),
+            rec_n("s/b.md", "x", Value::Map(ba)),
+        ];
+
+        let q = parse("SELECT n, count(*) AS n_count GROUP BY n").unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
+        assert_eq!(
+            t.rows.len(),
+            1,
+            "{{a: 1, b: 2}} and {{b: 2, a: 1}} must land in the SAME group, \
+             matching main's structural Value PartialEq; got: {:?}",
             t.rows
         );
         assert_eq!(t.rows[0][1], Value::Int(2));
