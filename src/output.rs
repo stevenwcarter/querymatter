@@ -54,23 +54,44 @@ impl OutputSink {
         Ok(OutputSink::Command(child))
     }
 
-    /// Writes `block` followed by a trailing newline — mirroring the
-    /// `println!` this sink replaces — to stdout, the redirected file, or a
-    /// piped command's stdin.
-    pub fn write_block(&mut self, block: &str) -> io::Result<()> {
+    /// Runs `f` with a writer aimed at this sink's destination — a locked
+    /// stdout handle, the redirected file, or a piped command's stdin — then
+    /// flushes. The streaming counterpart of [`write_block`](Self::write_block):
+    /// the caller writes the fully-formatted, newline-terminated block itself
+    /// (see `render::render_to`), so no intermediate `String` is built.
+    pub fn write_result(
+        &mut self,
+        f: impl FnOnce(&mut dyn Write) -> io::Result<()>,
+    ) -> io::Result<()> {
         match self {
             OutputSink::Stdout => {
-                println!("{block}");
-                Ok(())
+                let stdout = io::stdout();
+                let mut lock = stdout.lock();
+                f(&mut lock)?;
+                lock.flush()
             }
-            OutputSink::File(file) => writeln!(file, "{block}"),
+            OutputSink::File(file) => {
+                f(file)?;
+                file.flush()
+            }
             OutputSink::Command(child) => {
                 let stdin = child.stdin.as_mut().ok_or_else(|| {
                     io::Error::new(io::ErrorKind::BrokenPipe, "child stdin closed")
                 })?;
-                writeln!(stdin, "{block}")
+                f(stdin)?;
+                stdin.flush()
             }
         }
+    }
+
+    /// Writes `block` followed by a trailing newline — mirroring the
+    /// `println!` this sink replaces — to stdout, the redirected file, or a
+    /// piped command's stdin.
+    pub fn write_block(&mut self, block: &str) -> io::Result<()> {
+        self.write_result(|w| {
+            w.write_all(block.as_bytes())?;
+            w.write_all(b"\n")
+        })
     }
 
     /// Closes a piped child's stdin (signaling EOF) and waits for it to
@@ -117,6 +138,21 @@ mod tests {
         drop(sink);
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "fresh\n");
+    }
+
+    #[test]
+    fn write_result_streams_into_the_same_sink() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("out.txt");
+        let mut sink = OutputSink::open_file(&path).unwrap();
+        sink.write_result(|w| {
+            w.write_all(b"a,b\n")?;
+            w.write_all(b"1,2\n")
+        })
+        .unwrap();
+        sink.write_result(|w| w.write_all(b"tail\n")).unwrap();
+        drop(sink);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "a,b\n1,2\ntail\n");
     }
 
     #[test]
