@@ -391,12 +391,7 @@ fn run_config_path() -> anyhow::Result<()> {
 fn run_query_action(action: &QueryAction) -> anyhow::Result<ExitCode> {
     match action {
         QueryAction::Save { name, sql } => {
-            // Rejected up front, naming the parse error, so a saved query can
-            // never be a broken one that only fails later at `query run`.
-            query::parse(sql).with_context(|| format!("failed to parse query: {sql}"))?;
-            let mut saved = queries::load()?;
-            queries::set(&mut saved, name, sql)?;
-            let path = queries::save(&saved)?;
+            let path = save_named_query(name, sql)?;
             eprintln!("querymatter: saved query '{name}' in {}", path.display());
             Ok(ExitCode::SUCCESS)
         }
@@ -438,6 +433,23 @@ fn run_query_action(action: &QueryAction) -> anyhow::Result<ExitCode> {
             unreachable!("Run is dispatched separately, after config::load — see run_query_run")
         }
     }
+}
+
+/// Validates and persists `sql` under `name` in the user's saved-queries
+/// file: rejects `sql` up front (naming the parse error), so a saved query
+/// can never be a broken one that only fails later at `query run`, then
+/// rejects `name` per [`queries::set`]'s allowed-character rule, then loads
+/// the current file, inserts (overwriting any existing SQL already saved
+/// under the same name), and saves it back.
+///
+/// Shared by the CLI's `query save` ([`run_query_action`]'s `Save` arm) and
+/// the REPL's `.query save` ([`repl`]'s dispatch), so the two surfaces can
+/// never validate or persist differently.
+pub(crate) fn save_named_query(name: &str, sql: &str) -> anyhow::Result<PathBuf> {
+    query::parse(sql).with_context(|| format!("failed to parse query: {sql}"))?;
+    let mut saved = queries::load()?;
+    queries::set(&mut saved, name, sql)?;
+    queries::save(&saved)
 }
 
 /// Runs `query run <name> [DIR]`: resolves `name` to its saved SQL — a clean

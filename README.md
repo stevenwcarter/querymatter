@@ -373,10 +373,15 @@ draft
 
 Inside the REPL, `.query run <name>` runs a saved query in-session (splitting
 a multi-statement saved query and running each statement in turn, exactly
-like typing them one after another) and `.query list` lists every saved name
-and its SQL — see the dot-commands table below. `query save`/`get`/`delete`
-are CLI-only. Tab-completion offers saved-query names right after
-`.query run `.
+like typing them one after another), `.query list` lists every saved name and
+its SQL, and `.query save <name> [sql]` saves `sql` — or, with `sql` omitted,
+the last successfully-run statement of this session — under `name`, using the
+exact same validation as `querymatter query save` (a bad name or unparseable
+SQL is rejected the same way; nothing is written). `.query save` with
+neither an inline `sql` nor a prior statement this session is a clean error;
+nothing is saved. See the dot-commands table below. `query get`/`delete`
+remain CLI-only. Tab-completion offers saved-query names right after
+`.query run ` (not yet after `.query save`).
 
 ## Diagnosing exclusions (`querymatter explain <path>`)
 
@@ -650,6 +655,7 @@ rather than SQL:
 | `.refresh-all` | Force a re-scan of the whole vault; alias for `.refresh` with no path. |
 | `.query run <name>` | Run a saved query in-session, honoring the current `.format`/`.style`/`.output`. See [Saved queries](#saved-queries-querymatter-query). |
 | `.query list` | List every saved query's name and SQL. |
+| `.query save <name> [sql]` | Save `sql` under `name`, or, when `sql` is omitted, the last successfully-run statement of this session. Same validation as `querymatter query save`. |
 | `.quit` / `.exit` | Leave the REPL (Ctrl-D also exits; Ctrl-C cancels the current line). |
 
 SQL statements may span multiple lines; a trailing `;` ends the statement and
