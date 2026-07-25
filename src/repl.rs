@@ -113,9 +113,11 @@ pub enum DotCommand {
     /// `.timer [on|off]` — set (`Some`) or report (`None`) whether the
     /// `-- N rows` line includes the query's elapsed time.
     Timer(Option<bool>),
-    /// `.output [path]` — redirect subsequent statement results to `path`
-    /// (`Some`), or reset to stdout (`None`, from a bare `.output` or an
-    /// explicit `.output stdout`).
+    /// `.output [path]` or `.output |cmd` — redirect subsequent statement
+    /// results to `path`, or pipe them through a shell command when the
+    /// argument starts with `|` (the sqlite3 convention, e.g.
+    /// `.output |less`); both cases carried as `Some`. Reset to stdout
+    /// (`None`) from a bare `.output` or an explicit `.output stdout`.
     Output(Option<String>),
     /// `.reload` — rescan every tracked directory (in-memory only; never
     /// touches a `.querymatter` cache).
@@ -287,10 +289,14 @@ pub fn parse_dot(line: &str) -> DotCommand {
             Some(value) => DotCommand::Timer(value),
             None => DotCommand::Unknown(line.to_string()),
         },
-        "output" => match words.next() {
+        // Verbatim (not `words.next()`) so `.output |column -t -s,` or
+        // `.output |grep x | wc -l` survive with their internal spaces intact
+        // — a whitespace split would truncate the piped command at its first
+        // argument.
+        "output" => match rest_after_key(rest, 1) {
             None => DotCommand::Output(None),
             Some(arg) if arg.eq_ignore_ascii_case("stdout") => DotCommand::Output(None),
-            Some(arg) => DotCommand::Output(Some(arg.to_string())),
+            Some(arg) => DotCommand::Output(Some(arg)),
         },
         "settings" => DotCommand::Settings,
         "set" => match (words.next(), rest_after_key(rest, 2)) {
@@ -344,8 +350,9 @@ fn parse_key(name: &str) -> Option<ConfigKey> {
 }
 
 /// Everything after the first `skip` whitespace-separated words of `rest`,
-/// trimmed — the value of a `.set`, taken verbatim so globs and commas
-/// survive. `None` when there are fewer than `skip + 1` words.
+/// trimmed — the value of a `.set` (or a `.output` target), taken verbatim so
+/// globs, commas, and piped-command arguments survive. `None` when there are
+/// fewer than `skip + 1` words.
 fn rest_after_key(rest: &str, skip: usize) -> Option<String> {
     let mut remainder = rest.trim_start();
     for _ in 0..skip {
@@ -430,6 +437,11 @@ pub fn run(mut session: Session) -> anyhow::Result<()> {
             "querymatter: could not save history to {}: {err}",
             path.display()
         );
+    }
+    // Reap a piped command still running when the session ends (`.quit`/EOF)
+    // so its process doesn't outlive the REPL with a dangling stdin.
+    if let Err(err) = sink.finish() {
+        eprintln!("querymatter: error finishing output: {err}");
     }
     Ok(())
 }
@@ -638,24 +650,39 @@ fn saved_query_names() -> Vec<String> {
 }
 
 /// Applies a `.output` dot-command to `sink`: `Some(path)` truncates and
-/// opens `path`, redirecting every later statement's result to it for the
-/// rest of the session; `None` (a bare `.output` or `.output stdout`) resets
-/// to stdout. Either way a one-line confirmation goes to stderr. A `path`
-/// that can't be opened for writing is reported on stderr instead, and
-/// `sink` is left exactly as it was — the session keeps running on whatever
-/// it was already writing to.
+/// opens `path`, `Some("|cmd")` (the sqlite3 convention) pipes every later
+/// statement's result through `cmd` via the shell, and `None` (a bare
+/// `.output` or `.output stdout`) resets to stdout. Either way a one-line
+/// confirmation goes to stderr. Before any switch, [`OutputSink::finish`] is
+/// called on the *old* sink — closing and reaping a prior piped command so
+/// it isn't left running after its output has moved elsewhere. A path that
+/// can't be opened, or a command that can't be spawned, is reported on
+/// stderr instead, and `sink` is left exactly as it was — the session keeps
+/// running on whatever it was already writing to.
 fn apply_output(sink: &mut OutputSink, target: Option<String>) {
+    if let Err(err) = sink.finish() {
+        eprintln!("querymatter: error finishing previous output: {err}");
+    }
     match target {
         None => {
             *sink = OutputSink::Stdout;
             eprintln!("querymatter: results on stdout");
         }
-        Some(path) => match OutputSink::open_file(Path::new(&path)) {
-            Ok(opened) => {
-                *sink = opened;
-                eprintln!("querymatter: writing results to {path}");
-            }
-            Err(err) => eprintln!("querymatter: cannot write to {path}: {err}"),
+        Some(arg) => match arg.strip_prefix('|') {
+            Some(cmd) => match OutputSink::open_command(cmd.trim()) {
+                Ok(opened) => {
+                    *sink = opened;
+                    eprintln!("querymatter: piping results through {}", cmd.trim());
+                }
+                Err(err) => eprintln!("querymatter: cannot start pipe: {err}"),
+            },
+            None => match OutputSink::open_file(Path::new(&arg)) {
+                Ok(opened) => {
+                    *sink = opened;
+                    eprintln!("querymatter: writing results to {arg}");
+                }
+                Err(err) => eprintln!("querymatter: cannot write to {arg}: {err}"),
+            },
         },
     }
 }
@@ -745,7 +772,7 @@ fn help_text() -> String {
     );
     let _ = writeln!(
         text,
-        "  .output [path]     redirect results to path, or 'stdout'/no argument to reset"
+        "  .output [path]     redirect results to path, '|cmd' to pipe through a shell command, or 'stdout'/no argument to reset"
     );
     let _ = writeln!(
         text,
@@ -1520,6 +1547,21 @@ mod tests {
         assert_eq!(parse_dot(".output STDOUT"), DotCommand::Output(None));
     }
 
+    /// A `|cmd` target is captured verbatim, spaces and all — a
+    /// `words.next()`-style split would truncate at the first argument and
+    /// silently drop `-s,`/the rest of the pipeline.
+    #[test]
+    fn output_command_captures_a_piped_command_verbatim() {
+        assert_eq!(
+            parse_dot(".output |column -t -s,"),
+            DotCommand::Output(Some("|column -t -s,".to_string()))
+        );
+        assert_eq!(
+            parse_dot(".output |grep x | wc -l"),
+            DotCommand::Output(Some("|grep x | wc -l".to_string()))
+        );
+    }
+
     #[test]
     fn apply_output_redirects_to_a_file_then_resets_to_stdout() {
         let dir = tempfile::tempdir().unwrap();
@@ -1548,6 +1590,27 @@ mod tests {
 
         apply_output(&mut sink, Some(bad.to_str().unwrap().to_string()));
         assert!(matches!(sink, OutputSink::Stdout));
+    }
+
+    /// `.output |cmd` pipes blocks through a real shell command, and
+    /// resetting back to stdout finishes (closes stdin, reaps) the old pipe
+    /// first — so the file `cat` was redirected to is complete by the time
+    /// this test reads it back.
+    #[test]
+    fn apply_output_pipes_through_a_shell_command_then_finishes_on_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("piped.txt");
+        let mut sink = OutputSink::Stdout;
+
+        apply_output(&mut sink, Some(format!("|cat > {}", path.display())));
+        assert!(matches!(sink, OutputSink::Command(_)));
+        sink.write_block("alpha").unwrap();
+        sink.write_block("beta").unwrap();
+
+        apply_output(&mut sink, None);
+        assert!(matches!(sink, OutputSink::Stdout));
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "alpha\nbeta\n");
     }
 
     #[test]

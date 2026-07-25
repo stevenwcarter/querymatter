@@ -8,6 +8,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
+use std::process::{Child, Command, Stdio};
 
 /// Where a statement's rendered result block is written.
 pub enum OutputSink {
@@ -17,6 +18,10 @@ pub enum OutputSink {
     /// Redirected to an already-open file handle, positioned to append after
     /// whatever has already been written this run/session.
     File(File),
+    /// A shell command (REPL's `.output |cmd`, the sqlite3 convention)
+    /// receiving each block on its stdin. Stdout/stderr are inherited so an
+    /// interactive pager or filter draws straight to the terminal.
+    Command(Child),
 }
 
 impl OutputSink {
@@ -35,8 +40,23 @@ impl OutputSink {
         Ok(OutputSink::File(file))
     }
 
+    /// Spawns `sh -c "<cmd>"` with a piped stdin, so pipelines, arguments,
+    /// and redirects all work exactly as they would if `cmd` were typed at a
+    /// shell prompt (the sqlite3 `.output |cmd` convention). Stdout/stderr
+    /// are inherited, not captured, so an interactive pager or filter still
+    /// draws to the terminal.
+    pub fn open_command(cmd: &str) -> io::Result<Self> {
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .stdin(Stdio::piped())
+            .spawn()?;
+        Ok(OutputSink::Command(child))
+    }
+
     /// Writes `block` followed by a trailing newline — mirroring the
-    /// `println!` this sink replaces — to stdout or the redirected file.
+    /// `println!` this sink replaces — to stdout, the redirected file, or a
+    /// piped command's stdin.
     pub fn write_block(&mut self, block: &str) -> io::Result<()> {
         match self {
             OutputSink::Stdout => {
@@ -44,7 +64,25 @@ impl OutputSink {
                 Ok(())
             }
             OutputSink::File(file) => writeln!(file, "{block}"),
+            OutputSink::Command(child) => {
+                let stdin = child.stdin.as_mut().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "child stdin closed")
+                })?;
+                writeln!(stdin, "{block}")
+            }
         }
+    }
+
+    /// Closes a piped child's stdin (signaling EOF) and waits for it to
+    /// exit, so a pager or filter has flushed and finished before the sink
+    /// is dropped or replaced. No-op for [`Stdout`](Self::Stdout) and
+    /// [`File`](Self::File).
+    pub fn finish(&mut self) -> io::Result<()> {
+        if let OutputSink::Command(child) = self {
+            drop(child.stdin.take()); // EOF to the child
+            child.wait()?;
+        }
+        Ok(())
     }
 }
 
@@ -86,5 +124,17 @@ mod tests {
         let dir = tempdir().unwrap();
         let missing_parent = dir.path().join("no-such-dir").join("out.txt");
         assert!(OutputSink::open_file(&missing_parent).is_err());
+    }
+
+    #[test]
+    fn command_sink_pipes_blocks_through_the_shell() {
+        let dir = tempdir().unwrap();
+        let out = dir.path().join("piped.txt");
+        // `cat > file` via sh -c: blocks written to the child's stdin land in the file.
+        let mut sink = OutputSink::open_command(&format!("cat > {}", out.display())).unwrap();
+        sink.write_block("alpha").unwrap();
+        sink.write_block("beta").unwrap();
+        sink.finish().unwrap(); // closes stdin, waits for the child
+        assert_eq!(fs::read_to_string(&out).unwrap(), "alpha\nbeta\n");
     }
 }
