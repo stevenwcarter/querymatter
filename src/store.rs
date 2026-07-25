@@ -154,13 +154,30 @@ impl InMemoryStore {
     /// on the returned store's [`Record`]s; the on-disk cache written by
     /// [`cache::save_cache`] above is built from `fresh` (every field,
     /// straight from [`cache::refresh_against_cache`]) and is never pruned.
+    ///
+    /// `scope` is subtree scoping (design W26 / spec §7): `None` loads the
+    /// whole vault (today's behavior, byte-identical). `Some(dirs)` loads
+    /// ONLY the cache directories at/under one of `dirs` — the blob decode is
+    /// scoped ([`cache::load_cache_under`]) *and* the freshness re-walk is
+    /// scoped ([`cache::refresh_against_cache_scoped`]), so the query pays
+    /// O(subtree), not O(vault). The store's `schema()` then derives from the
+    /// (scoped) loaded records, becoming the subtree's schema — an accepted,
+    /// documented narrowing of the W12 validation surface (spec §7.3).
+    ///
+    /// A scoped load is **not** persisted: [`cache::save_cache`] rewrites the
+    /// manifest wholesale from what it is handed, and a scoped `fresh` holds
+    /// only the subtree, so saving it would drop every out-of-subtree
+    /// directory from the manifest. A scoped query is a read — it refreshes in
+    /// memory for a correct result and leaves cache maintenance to the
+    /// whole-vault path. Hence the save below stays gated on `scope.is_none()`.
     pub fn from_cache(
         vault: &Path,
         opts: WalkOpts,
         mode: Freshness,
         wanted: Option<&BTreeSet<String>>,
+        scope: Option<&[PathBuf]>,
     ) -> (Self, LoadReport) {
-        let (cached, ttl_secs, incompatible) = match cache::load_cache(vault) {
+        let (cached, ttl_secs, incompatible) = match cache::load_cache_under(vault, scope) {
             Some((body, dirs)) => (dirs, body.ttl_secs, false),
             // A `None` with a manifest present means it's unreadable; without
             // one it's simply a fresh/absent cache (stay silent).
@@ -168,7 +185,7 @@ impl InMemoryStore {
         };
 
         let (fresh, mut report, changed) =
-            cache::refresh_against_cache(vault, &cached, &opts, mode, ttl_secs);
+            cache::refresh_against_cache_scoped(vault, &cached, &opts, mode, ttl_secs, scope);
 
         if incompatible {
             report.warnings.insert(
@@ -180,7 +197,8 @@ impl InMemoryStore {
             );
         }
 
-        if changed
+        if scope.is_none()
+            && changed
             && mode != Freshness::ForceCache
             && let Err(err) = cache::save_cache(vault, &fresh, ttl_secs)
         {
@@ -517,8 +535,13 @@ mod tests {
         write(td.path(), "a.md", "---\nstatus: draft\n---\n");
         cache::build_vault(td.path(), &WalkOpts::default(), 300).unwrap();
 
-        let (store, _report) =
-            InMemoryStore::from_cache(td.path(), WalkOpts::default(), Freshness::PerFile, None);
+        let (store, _report) = InMemoryStore::from_cache(
+            td.path(),
+            WalkOpts::default(),
+            Freshness::PerFile,
+            None,
+            None,
+        );
 
         assert_file_size_and_mtime_row(&store);
     }
@@ -530,8 +553,13 @@ mod tests {
         write(td.path(), "product/b.md", "---\nstatus: shipped\n---\n");
         cache::build_vault(td.path(), &WalkOpts::default(), 300).unwrap();
 
-        let (cached_store, report) =
-            InMemoryStore::from_cache(td.path(), WalkOpts::default(), Freshness::PerFile, None);
+        let (cached_store, report) = InMemoryStore::from_cache(
+            td.path(),
+            WalkOpts::default(),
+            Freshness::PerFile,
+            None,
+            None,
+        );
         assert_eq!(report.skipped, 0);
 
         let (live_store, _report) =
@@ -548,14 +576,128 @@ mod tests {
         );
     }
 
+    /// W26 load-bearing equality (spec §9): for an in-subtree query, building
+    /// the store with `scope = Some([plans])` must yield the SAME records as
+    /// the old path — load the whole vault, then `retain_under([plans])`. The
+    /// scoped path replaces the second for scoped queries, so their results
+    /// must be identical.
+    #[test]
+    fn scoped_load_matches_whole_vault_then_retain() {
+        let td = TempDir::new().unwrap();
+        let vault = fs::canonicalize(td.path()).unwrap();
+        write(&vault, "plans/a.md", "---\nstatus: draft\n---\n");
+        write(&vault, "plans/nested/b.md", "---\nstatus: synced\n---\n");
+        write(&vault, "product/c.md", "---\nstatus: shipped\n---\n");
+        cache::build_vault(&vault, &WalkOpts::default(), 300).unwrap();
+
+        let scope = [vault.join("plans")];
+
+        let (scoped_store, _r) = InMemoryStore::from_cache(
+            &vault,
+            WalkOpts::default(),
+            Freshness::PerFile,
+            None,
+            Some(&scope),
+        );
+        let (mut whole_store, _r) =
+            InMemoryStore::from_cache(&vault, WalkOpts::default(), Freshness::PerFile, None, None);
+        whole_store.retain_under(&scope);
+
+        let mut scoped: Vec<&Record> = scoped_store.records().collect();
+        let mut whole: Vec<&Record> = whole_store.records().collect();
+        scoped.sort_by_key(|r| r.file_attr(FileAttr::Path).display());
+        whole.sort_by_key(|r| r.file_attr(FileAttr::Path).display());
+
+        assert_eq!(
+            scoped, whole,
+            "a scoped in-subtree load must match whole-vault-then-retain_under"
+        );
+        // And it really is scoped: only the two plans/ records, never product/.
+        assert_eq!(scoped.len(), 2);
+        assert!(
+            scoped.iter().all(|r| !matches!(
+                r.file_attr(FileAttr::Path),
+                Value::Str(ref p) if p.contains("product")
+            )),
+            "a plans-scoped load must never surface a product/ record"
+        );
+    }
+
+    /// W26 accepted behavior change (spec §7.3): because the scoped load never
+    /// decodes out-of-subtree files, `schema()` becomes the SUBTREE's schema.
+    /// A column present only under `product/` is absent from a `plans`-scoped
+    /// `schema()`, so a default-mode query for it errors as an unknown column,
+    /// while `--lenient` still bypasses validation.
+    #[test]
+    fn scoped_schema_is_subtree_only() {
+        let td = TempDir::new().unwrap();
+        let vault = fs::canonicalize(td.path()).unwrap();
+        write(&vault, "plans/a.md", "---\nstatus: draft\n---\n");
+        // `roadmap` exists ONLY under product/.
+        write(&vault, "product/b.md", "---\nroadmap: q3\n---\n");
+        cache::build_vault(&vault, &WalkOpts::default(), 300).unwrap();
+
+        let scope = [vault.join("plans")];
+        let (store, _r) = InMemoryStore::from_cache(
+            &vault,
+            WalkOpts::default(),
+            Freshness::PerFile,
+            None,
+            Some(&scope),
+        );
+
+        let schema = store.schema();
+        assert_eq!(
+            schema,
+            vec!["status".to_string()],
+            "a plans-scoped schema must not include the product-only `roadmap`"
+        );
+
+        let parsed = crate::query::parse("SELECT roadmap").unwrap();
+        assert!(
+            crate::query::execute_with_schema(&parsed, store.records(), &schema, false).is_err(),
+            "a product-only column must be unknown under a plans-scoped default-mode query"
+        );
+        assert!(
+            crate::query::execute_with_schema(&parsed, store.records(), &schema, true).is_ok(),
+            "--lenient must bypass the subtree-scoped validation surface"
+        );
+    }
+
+    /// The whole-vault (REPL / no-`[DIRS]`) path is untouched by W26: with
+    /// `scope = None` the entire vault loads, so `schema()` is the FULL field
+    /// union — the exact contrast to `scoped_schema_is_subtree_only`.
+    #[test]
+    fn unscoped_load_keeps_full_vault_schema() {
+        let td = TempDir::new().unwrap();
+        let vault = fs::canonicalize(td.path()).unwrap();
+        write(&vault, "plans/a.md", "---\nstatus: draft\n---\n");
+        write(&vault, "product/b.md", "---\nroadmap: q3\n---\n");
+        cache::build_vault(&vault, &WalkOpts::default(), 300).unwrap();
+
+        let (store, _r) =
+            InMemoryStore::from_cache(&vault, WalkOpts::default(), Freshness::PerFile, None, None);
+        assert_eq!(
+            store.schema(),
+            vec!["roadmap".to_string(), "status".to_string()],
+            "an unscoped load must keep the FULL vault schema"
+        );
+        assert_eq!(store.records().count(), 2);
+    }
+
     #[test]
     fn refresh_picks_up_edits_and_persists() {
         let td = TempDir::new().unwrap();
         write(td.path(), "a.md", "---\nstatus: draft\n---\n");
         cache::build_vault(td.path(), &WalkOpts::default(), 300).unwrap();
 
-        let (mut store, _report) =
-            InMemoryStore::from_cache(td.path(), WalkOpts::default(), Freshness::PerFile, None);
+        let (mut store, _report) = InMemoryStore::from_cache(
+            td.path(),
+            WalkOpts::default(),
+            Freshness::PerFile,
+            None,
+            None,
+        );
         assert_eq!(
             store.records().next().unwrap().field(&["status".into()]),
             Value::Str("draft".into())
@@ -609,8 +751,13 @@ mod tests {
         let original_mtime = fs::metadata(&a_path).unwrap().modified().unwrap();
         cache::build_vault(td.path(), &WalkOpts::default(), 300).unwrap();
 
-        let (mut store, _report) =
-            InMemoryStore::from_cache(td.path(), WalkOpts::default(), Freshness::PerFile, None);
+        let (mut store, _report) = InMemoryStore::from_cache(
+            td.path(),
+            WalkOpts::default(),
+            Freshness::PerFile,
+            None,
+            None,
+        );
         assert_eq!(
             store.records().next().unwrap().field(&["status".into()]),
             Value::Str("draft".into())
@@ -647,8 +794,13 @@ mod tests {
 
         write(td.path(), "a.md", "---\nstatus: final\n---\n");
 
-        let (store, report) =
-            InMemoryStore::from_cache(td.path(), WalkOpts::default(), Freshness::ForceCache, None);
+        let (store, report) = InMemoryStore::from_cache(
+            td.path(),
+            WalkOpts::default(),
+            Freshness::ForceCache,
+            None,
+            None,
+        );
         assert_eq!(report.skipped, 0);
         assert_eq!(
             store.records().next().unwrap().field(&["status".into()]),
@@ -678,8 +830,13 @@ mod tests {
         // No cache::build_vault call: no .querymatter/manifest.bin exists yet.
         assert!(cache::load_cache(td.path()).is_none());
 
-        let (cached_store, report) =
-            InMemoryStore::from_cache(td.path(), WalkOpts::default(), Freshness::PerFile, None);
+        let (cached_store, report) = InMemoryStore::from_cache(
+            td.path(),
+            WalkOpts::default(),
+            Freshness::PerFile,
+            None,
+            None,
+        );
         assert_eq!(report.skipped, 0);
 
         let (live_store, _report) =
@@ -820,8 +977,13 @@ mod tests {
         .unwrap();
         assert!(cache::load_cache(td.path()).is_none());
 
-        let (store, report) =
-            InMemoryStore::from_cache(td.path(), WalkOpts::default(), Freshness::PerFile, None);
+        let (store, report) = InMemoryStore::from_cache(
+            td.path(),
+            WalkOpts::default(),
+            Freshness::PerFile,
+            None,
+            None,
+        );
         assert!(
             report.warnings.iter().any(|w| w.contains("incompatible")),
             "an incompatible on-disk manifest must warn, got: {:?}",
@@ -838,8 +1000,13 @@ mod tests {
         write(td2.path(), "a.md", "---\nstatus: draft\n---\n");
         assert!(cache::load_cache(td2.path()).is_none());
 
-        let (_store, report2) =
-            InMemoryStore::from_cache(td2.path(), WalkOpts::default(), Freshness::PerFile, None);
+        let (_store, report2) = InMemoryStore::from_cache(
+            td2.path(),
+            WalkOpts::default(),
+            Freshness::PerFile,
+            None,
+            None,
+        );
         assert!(
             !report2.warnings.iter().any(|w| w.contains("incompatible")),
             "a missing cache must rebuild silently, got: {:?}",

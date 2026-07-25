@@ -555,6 +555,54 @@ fn positional_dir_restricts_vault_query_to_that_subtree() {
 }
 
 #[test]
+fn subtree_scoped_load_narrows_column_validation_surface() {
+    // Spec §7.3: a subtree-scoped one-shot query (positional `[DIRS]`) loads
+    // ONLY that subtree from the cache, so a column present ONLY outside the
+    // subtree is unknown under default mode — and `--lenient` still bypasses.
+    // The fixture puts `status` under plans/ and a product-only `roadmap`
+    // under product/; querying `roadmap` scoped to plans/ must fail strict but
+    // succeed lenient.
+    let td = TempDir::new().unwrap();
+    for (p, s) in [
+        ("plans/a.md", "---\nstatus: draft\n---\n"),
+        ("product/b.md", "---\nroadmap: q3\n---\n"),
+    ] {
+        let f = td.path().join(p);
+        fs::create_dir_all(f.parent().unwrap()).unwrap();
+        fs::write(f, s).unwrap();
+    }
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg("init")
+        .arg(td.path())
+        .assert()
+        .success();
+
+    // Default mode: `roadmap` is out-of-subtree, so it is an unknown column.
+    qm(home.path())
+        .current_dir(td.path())
+        .args(["-e", "SELECT roadmap", "plans"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("roadmap"));
+
+    // --lenient bypasses validation: the query runs, treating the absent
+    // column as NULL, and returns the single plans/ row.
+    qm(home.path())
+        .current_dir(td.path())
+        .args([
+            "-e",
+            "SELECT roadmap",
+            "--lenient",
+            "--format",
+            "csv",
+            "plans",
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
 fn no_cache_live_scans_even_inside_a_vault() {
     let td = tree();
     let home = TempDir::new().unwrap();

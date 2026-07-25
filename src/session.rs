@@ -793,8 +793,13 @@ mod tests {
         fs::write(&a_path, "---\nstatus: draft\n---\n").unwrap();
         cache::build_vault(td.path(), &WalkOpts::default(), 300).unwrap();
 
-        let (store, _report) =
-            InMemoryStore::from_cache(td.path(), WalkOpts::default(), Freshness::PerFile, None);
+        let (store, _report) = InMemoryStore::from_cache(
+            td.path(),
+            WalkOpts::default(),
+            Freshness::PerFile,
+            None,
+            None,
+        );
         let mut session = Session::new(
             Box::new(store),
             Settings::default(),
@@ -875,7 +880,7 @@ mod tests {
         cache::build_vault(&vault, &WalkOpts::default(), 300).unwrap();
 
         let (store, _report) =
-            InMemoryStore::from_cache(&vault, WalkOpts::default(), Freshness::PerFile, None);
+            InMemoryStore::from_cache(&vault, WalkOpts::default(), Freshness::PerFile, None, None);
         let mut session = Session::new(
             Box::new(store),
             Settings::default(),
@@ -919,7 +924,7 @@ mod tests {
         cache::build_vault(&vault, &WalkOpts::default(), 300).unwrap();
 
         let (store, _report) =
-            InMemoryStore::from_cache(&vault, WalkOpts::default(), Freshness::PerFile, None);
+            InMemoryStore::from_cache(&vault, WalkOpts::default(), Freshness::PerFile, None, None);
         let mut session = Session::new(
             Box::new(store),
             Settings::default(),
