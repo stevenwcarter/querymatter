@@ -12,8 +12,8 @@ use std::process::{Child, Command, Stdio};
 
 /// Where a statement's rendered result block is written.
 pub enum OutputSink {
-    /// The default: each block prints to stdout via `println!`, exactly as
-    /// before this feature existed.
+    /// The default: each block is written to a locked stdout handle via
+    /// [`write_result`](Self::write_result), then flushed.
     Stdout,
     /// Redirected to an already-open file handle, positioned to append after
     /// whatever has already been written this run/session.
@@ -27,8 +27,8 @@ pub enum OutputSink {
 impl OutputSink {
     /// Opens `path` for writing, creating it if needed and truncating any
     /// existing content — the one point where a redirect target is
-    /// established. Every [`write_block`](Self::write_block) call after this
-    /// appends to the same handle, so callers open once per redirect and
+    /// established. Every [`write_result`](Self::write_result) call after
+    /// this appends to the same handle, so callers open once per redirect and
     /// reuse the returned sink. Callers add path context to a failure via
     /// `anyhow`.
     pub fn open_file(path: &Path) -> io::Result<Self> {
@@ -56,9 +56,9 @@ impl OutputSink {
 
     /// Runs `f` with a writer aimed at this sink's destination — a locked
     /// stdout handle, the redirected file, or a piped command's stdin — then
-    /// flushes. The streaming counterpart of [`write_block`](Self::write_block):
-    /// the caller writes the fully-formatted, newline-terminated block itself
-    /// (see `render::render_to`), so no intermediate `String` is built.
+    /// flushes. The caller writes the fully-formatted, newline-terminated
+    /// block itself (see `render::render_to`), so no intermediate `String` is
+    /// built.
     pub fn write_result(
         &mut self,
         f: impl FnOnce(&mut dyn Write) -> io::Result<()>,
@@ -84,16 +84,6 @@ impl OutputSink {
         }
     }
 
-    /// Writes `block` followed by a trailing newline — mirroring the
-    /// `println!` this sink replaces — to stdout, the redirected file, or a
-    /// piped command's stdin.
-    pub fn write_block(&mut self, block: &str) -> io::Result<()> {
-        self.write_result(|w| {
-            w.write_all(block.as_bytes())?;
-            w.write_all(b"\n")
-        })
-    }
-
     /// Closes a piped child's stdin (signaling EOF) and waits for it to
     /// exit, so a pager or filter has flushed and finished before the sink
     /// is dropped or replaced. No-op for [`Stdout`](Self::Stdout) and
@@ -114,12 +104,12 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn write_block_appends_within_the_same_sink() {
+    fn write_result_appends_within_the_same_sink() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("out.txt");
         let mut sink = OutputSink::open_file(&path).unwrap();
-        sink.write_block("first").unwrap();
-        sink.write_block("second").unwrap();
+        sink.write_result(|w| writeln!(w, "first")).unwrap();
+        sink.write_result(|w| writeln!(w, "second")).unwrap();
         drop(sink);
         assert_eq!(fs::read_to_string(&path).unwrap(), "first\nsecond\n");
     }
@@ -130,11 +120,11 @@ mod tests {
         let path = dir.path().join("out.txt");
 
         let mut sink = OutputSink::open_file(&path).unwrap();
-        sink.write_block("stale").unwrap();
+        sink.write_result(|w| writeln!(w, "stale")).unwrap();
         drop(sink);
 
         let mut sink = OutputSink::open_file(&path).unwrap();
-        sink.write_block("fresh").unwrap();
+        sink.write_result(|w| writeln!(w, "fresh")).unwrap();
         drop(sink);
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "fresh\n");
@@ -168,8 +158,8 @@ mod tests {
         let out = dir.path().join("piped.txt");
         // `cat > file` via sh -c: blocks written to the child's stdin land in the file.
         let mut sink = OutputSink::open_command(&format!("cat > {}", out.display())).unwrap();
-        sink.write_block("alpha").unwrap();
-        sink.write_block("beta").unwrap();
+        sink.write_result(|w| writeln!(w, "alpha")).unwrap();
+        sink.write_result(|w| writeln!(w, "beta")).unwrap();
         sink.finish().unwrap(); // closes stdin, waits for the child
         assert_eq!(fs::read_to_string(&out).unwrap(), "alpha\nbeta\n");
     }

@@ -9,6 +9,7 @@ use anyhow::Context;
 
 use crate::cache;
 use crate::config::{self, Config, ConfigKey};
+use crate::output::OutputSink;
 use crate::query::{self, ResultTable};
 use crate::render::{self, Format, Output, TableStyle};
 use crate::settings::{Resolved, Settings, Source};
@@ -235,21 +236,23 @@ impl Session {
         .with_context(|| format!("failed to execute query: {sql}"))
     }
 
-    /// Runs `statement` once and returns both its rendered string — in the
-    /// session's current format for a `;`/`\g` terminator, or one record per
-    /// block for `\G`, with no trailing newline (see [`render`]); the caller
-    /// adds exactly one when printing — and the row count from that same
-    /// [`ResultTable`]. The REPL prints the count as a `-- N rows` line after
-    /// the result, and one-shot/batch callers sum it for `--exit-code`,
-    /// without either needing a second query run.
-    pub fn render_statement_counted(
+    /// Runs `statement` once and writes its rendered result — in the session's
+    /// current format for `;`/`\g`, or one record per block for `\G` —
+    /// directly into `sink` (stdout/file/piped command), returning the row
+    /// count from that same [`ResultTable`]. Streaming replaces the old
+    /// build-a-`String`-then-`write_block` two-step (design W47). The REPL
+    /// prints the count as a `-- N rows` line; one-shot/batch callers sum it
+    /// for `--exit-code`.
+    pub fn render_statement_to(
         &self,
         statement: &Statement,
-    ) -> anyhow::Result<(String, usize)> {
+        sink: &mut OutputSink,
+    ) -> anyhow::Result<usize> {
         let table = self.run(&statement.sql)?;
         let output = statement.terminator.output(self.format());
-        let rendered = render::render(&table, output, self.style(), self.header());
-        Ok((rendered, table.rows.len()))
+        sink.write_result(|w| render::render_to(w, &table, output, self.style(), self.header()))
+            .context("failed to write query results")?;
+        Ok(table.rows.len())
     }
 
     /// Switches the output format for the rest of this session only.
@@ -627,11 +630,10 @@ mod tests {
         );
     }
 
-    /// `render_statement_counted` must run the query exactly once and return
-    /// both the rendered string and the row count read off that same
-    /// `ResultTable` — not re-run the query separately to count rows.
+    /// `render_statement_to` runs the query exactly once and returns its row
+    /// count, writing the rendered block into the sink (design W47).
     #[test]
-    fn render_statement_counted_returns_row_count() {
+    fn render_statement_to_returns_row_count() {
         let td = TempDir::new().unwrap();
         for (name, body) in [
             ("a.md", "---\nstatus: draft\n---\n"),
@@ -649,21 +651,26 @@ mod tests {
             None,
         );
 
-        let (rendered, count) = session
-            .render_statement_counted(&semi("SELECT status"))
-            .unwrap();
-        assert_eq!(count, 3);
-        assert!(!rendered.is_empty());
-
-        let (_, count) = session
-            .render_statement_counted(&semi("SELECT status WHERE status = 'draft'"))
-            .unwrap();
-        assert_eq!(count, 1);
-
-        let (_, count) = session
-            .render_statement_counted(&semi("SELECT status WHERE status = 'missing'"))
-            .unwrap();
-        assert_eq!(count, 0);
+        let out = TempDir::new().unwrap();
+        let mut sink = OutputSink::open_file(&out.path().join("o.txt")).unwrap();
+        assert_eq!(
+            session
+                .render_statement_to(&semi("SELECT status"), &mut sink)
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            session
+                .render_statement_to(&semi("SELECT status WHERE status = 'draft'"), &mut sink)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            session
+                .render_statement_to(&semi("SELECT status WHERE status = 'missing'"), &mut sink)
+                .unwrap(),
+            0
+        );
     }
 
     /// `.describe`'s core computation: per-field `Value` variant set,

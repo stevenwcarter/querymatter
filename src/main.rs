@@ -1055,15 +1055,12 @@ fn run_statements(session: &Session, input: &str, output: Option<&Path>) -> anyh
     let total = statements.len();
     let mut total_rows = 0;
     for (i, statement) in statements.iter().enumerate() {
-        let (rendered, rows) =
-            session
-                .render_statement_counted(statement)
-                .map_err(|e| match total {
-                    1 => e,
-                    _ => e.context(format!("statement {} of {total} failed", i + 1)),
-                })?;
-        sink.write_block(&rendered)
-            .context("failed to write query results")?;
+        let rows = session
+            .render_statement_to(statement, &mut sink)
+            .map_err(|e| match total {
+                1 => e,
+                _ => e.context(format!("statement {} of {total} failed", i + 1)),
+            })?;
         total_rows += rows;
     }
     Ok(total_rows)

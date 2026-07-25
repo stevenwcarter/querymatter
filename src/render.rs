@@ -149,7 +149,7 @@ pub fn render(table: &ResultTable, output: Output, style: TableStyle, header: bo
 /// interactive-scale). The single trailing newline is owned here (not the
 /// sink), which is what lets csv/tsv stream without buffering the last record.
 pub fn render_to(
-    w: &mut impl Write,
+    w: &mut (impl Write + ?Sized),
     table: &ResultTable,
     output: Output,
     style: TableStyle,
@@ -169,7 +169,7 @@ pub fn render_to(
 }
 
 /// Writes a pre-built block followed by exactly one newline.
-fn writeln_block(w: &mut impl Write, block: &str) -> io::Result<()> {
+fn writeln_block(w: &mut (impl Write + ?Sized), block: &str) -> io::Result<()> {
     w.write_all(block.as_bytes())?;
     w.write_all(b"\n")
 }
@@ -205,7 +205,7 @@ impl serde::Serialize for JsonRows<'_> {
 /// strip-then-append. When nothing is written (`!header && no rows`), emit one
 /// bare newline to match the old `println!("")`.
 fn stream_delimited(
-    w: &mut impl Write,
+    w: &mut (impl Write + ?Sized),
     table: &ResultTable,
     delimiter: u8,
     header: bool,
