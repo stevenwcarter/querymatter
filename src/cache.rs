@@ -1156,12 +1156,20 @@ mod tests {
     #[test]
     fn find_vault_config_finds_ancestor_file() {
         let td = TempDir::new().unwrap();
-        fs::write(td.path().join(".querymatter.toml"), "table_style = \"unicode\"\n").unwrap();
+        fs::write(
+            td.path().join(".querymatter.toml"),
+            "table_style = \"unicode\"\n",
+        )
+        .unwrap();
         let deep = td.path().join("a/b/c");
         fs::create_dir_all(&deep).unwrap();
         assert_eq!(
             find_vault_config(&deep),
-            Some(fs::canonicalize(td.path()).unwrap().join(".querymatter.toml"))
+            Some(
+                fs::canonicalize(td.path())
+                    .unwrap()
+                    .join(".querymatter.toml")
+            )
         );
     }
 
@@ -1187,13 +1195,14 @@ mod tests {
 
         let other = TempDir::new().unwrap();
         fs::write(other.path().join(".querymatter.toml"), "hidden = true\n").unwrap();
-        assert!(
-            !manifest_exists(other.path()),
-            "sanity: no cache dir here"
-        );
+        assert!(!manifest_exists(other.path()), "sanity: no cache dir here");
         assert_eq!(
             find_vault_config(other.path()),
-            Some(fs::canonicalize(other.path()).unwrap().join(".querymatter.toml"))
+            Some(
+                fs::canonicalize(other.path())
+                    .unwrap()
+                    .join(".querymatter.toml")
+            )
         );
     }
 
