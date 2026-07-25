@@ -1,4 +1,4 @@
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use indexmap::IndexMap;
 use std::cmp::Ordering;
 use std::path::Path;
@@ -16,6 +16,14 @@ pub enum Value {
     Int(i64),
     Float(f64),
     Str(String),
+    /// A calendar date with no time component (e.g. from a `YYYY-MM-DD`
+    /// frontmatter field once ingest auto-detects it — not yet produced by
+    /// any code path as of this variant's introduction).
+    Date(NaiveDate),
+    /// A UTC instant (e.g. from an RFC3339 frontmatter field once ingest
+    /// auto-detects it — not yet produced by any code path as of this
+    /// variant's introduction).
+    DateTime(DateTime<Utc>),
     List(Vec<Value>),
     Map(IndexMap<String, Value>),
 }
@@ -37,6 +45,8 @@ impl Value {
             Value::Int(i) => i.to_string(),
             Value::Float(f) => f.to_string(),
             Value::Str(s) => s.clone(),
+            Value::Date(d) => d.format("%Y-%m-%d").to_string(),
+            Value::DateTime(dt) => dt.to_rfc3339_opts(SecondsFormat::Secs, true),
             Value::List(items) => items
                 .iter()
                 .map(Value::display)
@@ -56,6 +66,8 @@ impl Value {
             Value::Int(_) => "Int",
             Value::Float(_) => "Float",
             Value::Str(_) => "Str",
+            Value::Date(_) => "Date",
+            Value::DateTime(_) => "DateTime",
             Value::List(_) => "List",
             Value::Map(_) => "Map",
         }
@@ -71,7 +83,12 @@ impl Value {
             Value::Int(i) => Some(*i as f64),
             Value::Float(f) => Some(*f),
             Value::Str(s) => s.trim().parse::<f64>().ok(),
-            Value::Bool(_) | Value::Null | Value::List(_) | Value::Map(_) => None,
+            Value::Bool(_)
+            | Value::Null
+            | Value::Date(_)
+            | Value::DateTime(_)
+            | Value::List(_)
+            | Value::Map(_) => None,
         }
     }
 
@@ -92,6 +109,7 @@ fn compact_value(v: &Value) -> String {
         Value::Int(i) => i.to_string(),
         Value::Float(f) => f.to_string(),
         Value::Str(s) => s.clone(),
+        Value::Date(_) | Value::DateTime(_) => v.display(),
         Value::List(items) => {
             let rendered: Vec<_> = items.iter().map(compact_value).collect();
             format!("[{}]", rendered.join(", "))
@@ -110,17 +128,45 @@ fn compact_value(v: &Value) -> String {
 
 /// Total-ish ordering used by `ORDER BY`/`MIN`/`MAX`.
 ///
-/// Values that both coerce to a number compare numerically; otherwise they
-/// compare lexicographically on `to_cmp_string()`. Comparing `Null` against
-/// anything (including another `Null`) returns `None` — callers are
-/// responsible for placing NULLs last.
+/// Values that both coerce to a number compare numerically; a `Date`/
+/// `DateTime` on either side compares chronologically (see
+/// [`compare_dates`]); otherwise they compare lexicographically on
+/// `to_cmp_string()`. Comparing `Null` against anything (including another
+/// `Null`) returns `None` — callers are responsible for placing NULLs last.
 pub fn compare_values(a: &Value, b: &Value) -> Option<Ordering> {
     if a.is_null() || b.is_null() {
         return None;
     }
+    if let Some(ord) = compare_dates(a, b) {
+        return Some(ord);
+    }
     match (a.as_number(), b.as_number()) {
         (Some(x), Some(y)) => x.partial_cmp(&y),
         _ => Some(a.to_cmp_string().cmp(&b.to_cmp_string())),
+    }
+}
+
+/// Chronological comparison for a `Date`/`DateTime` on either side.
+///
+/// `Date` vs `Date` and `DateTime` vs `DateTime` compare directly; a mixed
+/// `Date`/`DateTime` pair compares via the `DateTime`'s date part (so a date
+/// and a datetime that falls on it are equal); a `Date`/`DateTime` against a
+/// `Str` compares `to_cmp_string()` of both — ISO text, which sorts
+/// identically to a chronological compare for well-formed ISO strings, and
+/// stays defined (never panics) for anything else. Returns `None` when
+/// neither side is a `Date`/`DateTime`, so the caller falls through to the
+/// existing numeric/string rules unchanged.
+fn compare_dates(a: &Value, b: &Value) -> Option<Ordering> {
+    match (a, b) {
+        (Value::Date(x), Value::Date(y)) => Some(x.cmp(y)),
+        (Value::DateTime(x), Value::DateTime(y)) => Some(x.cmp(y)),
+        (Value::Date(x), Value::DateTime(y)) => Some(x.cmp(&y.date_naive())),
+        (Value::DateTime(x), Value::Date(y)) => Some(x.date_naive().cmp(y)),
+        (Value::Date(_) | Value::DateTime(_), Value::Str(_))
+        | (Value::Str(_), Value::Date(_) | Value::DateTime(_)) => {
+            Some(a.to_cmp_string().cmp(&b.to_cmp_string()))
+        }
+        _ => None,
     }
 }
 
@@ -348,6 +394,23 @@ mod tests {
         use std::time::Duration;
         let t = SystemTime::UNIX_EPOCH - Duration::from_secs(60);
         let _ = system_time_to_iso(t); // must not panic
+    }
+    #[test]
+    fn dates_compare_by_instant_and_render_iso() {
+        use chrono::NaiveDate;
+        let a = Value::Date(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap());
+        let b = Value::Date(NaiveDate::from_ymd_opt(2026, 7, 24).unwrap());
+        assert_eq!(compare_values(&a, &b), Some(Ordering::Less));
+        assert_eq!(a.display(), "2026-01-01");
+        // date vs ISO string coerces (relative-date literals compare correctly)
+        assert_eq!(
+            compare_values(&b, &Value::Str("2026-01-01".into())),
+            Some(Ordering::Greater)
+        );
+        // date vs a non-date string: defined, panic-free (fallback to text compare)
+        assert!(compare_values(&b, &Value::Str("draft".into())).is_some());
+        // NULL still unordered
+        assert_eq!(compare_values(&a, &Value::Null), None);
     }
 }
 
