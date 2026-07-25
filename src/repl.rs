@@ -384,23 +384,25 @@ fn rest_after_key(rest: &str, skip: usize) -> Option<String> {
 /// directory via [`ProjectDirs`]; a missing or unwritable history file is at
 /// most a warning on stderr, never a fatal error — the REPL keeps working
 /// without it. Tab-completion is wired via [`ReplHelper`], whose schema and
-/// saved-query-name snapshots are taken here, once, at start-up — a saved
-/// query added mid-session (e.g. via `querymatter query save` in another
-/// terminal) won't tab-complete until the REPL restarts, matching `schema`'s
-/// existing snapshot-not-live-refresh behavior. A malformed `queries.toml` is
-/// a warning here, not fatal: completion just offers no saved-query names,
-/// same as an empty file would. Each statement's rendered result goes to an
-/// [`OutputSink`] that starts on stdout and is redirected by `.output` for
-/// the rest of the session; the `-- N rows` line and every error stay on
-/// stderr regardless of where the sink points.
+/// saved-query-name snapshots are taken here at start-up via
+/// [`helper_snapshot`], and refreshed live by [`refresh_helper`] after
+/// `.reload`, `.refresh`, `.refresh-all`, and a successful `.query save`
+/// (W55) — so only a saved query added by ANOTHER process, or `queries.toml`
+/// edited by hand, still needs a restart to tab-complete. A malformed
+/// `queries.toml` is a warning here, not fatal: completion just offers no
+/// saved-query names, same as an empty file would. Each statement's rendered
+/// result goes to an [`OutputSink`] that starts on stdout and is redirected
+/// by `.output` for the rest of the session; the `-- N rows` line and every
+/// error stay on stderr regardless of where the sink points.
 pub fn run(mut session: Session) -> anyhow::Result<()> {
-    let helper = ReplHelper {
-        schema: session.schema(),
-        query_names: saved_query_names(),
-    };
+    let saved = load_saved_queries_or_warn();
+    let (schema, query_names) = helper_snapshot(&session, &saved);
     let mut editor: Editor<ReplHelper, FileHistory> =
         Editor::new().context("failed to initialize the line editor")?;
-    editor.set_helper(Some(helper));
+    editor.set_helper(Some(ReplHelper {
+        schema,
+        query_names,
+    }));
     let history_path = history_path();
     if let Some(path) = &history_path {
         prepare_history_dir(path);
@@ -445,8 +447,10 @@ pub fn run(mut session: Session) -> anyhow::Result<()> {
                 last_sql = Some(statement.sql.clone());
             }
             Line::Dot(cmd, _) => {
-                if dispatch_dot(cmd, &mut session, &mut sink, last_sql.as_deref()) {
-                    break;
+                match dispatch_dot(cmd, &mut session, &mut sink, last_sql.as_deref()) {
+                    DotOutcome::Quit => break,
+                    DotOutcome::Refresh => refresh_helper(&mut editor, &session),
+                    DotOutcome::Continue => {}
                 }
             }
         }
@@ -539,8 +543,25 @@ fn history_entry(line: &Line) -> Option<String> {
     }
 }
 
+/// What [`run`]'s loop should do after dispatching one dot-command: keep
+/// going as usual, exit the REPL (`.quit`/`.exit`), or keep going but first
+/// call [`refresh_helper`] because the dispatch may have changed `schema`
+/// (a successful `.reload`/`.refresh`/`.refresh-all`) or saved-query names (a
+/// successful `.query save`) — see [`dispatch_dot`], [`dispatch_query`], and
+/// [`dispatch_query_save`] (W55).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DotOutcome {
+    /// Nothing that affects tab-completion changed; keep going.
+    Continue,
+    /// `schema` and/or `query_names` may have changed; [`run`] must call
+    /// [`refresh_helper`] before reading the next line.
+    Refresh,
+    /// `.quit`/`.exit`: leave the REPL.
+    Quit,
+}
+
 /// Runs one dot-command against `session`, redirecting `sink` on `.output`,
-/// and returning `true` when the REPL should exit (`.quit`/`.exit`).
+/// and returning what [`run`]'s loop should do next — see [`DotOutcome`].
 ///
 /// stdout/stderr policy: reference/inspection output (`.help`, `.schema`,
 /// `.settings`, `.query list`, and `.format`'s/`.style`'s/`.header`'s/
@@ -561,7 +582,7 @@ fn dispatch_dot(
     session: &mut Session,
     sink: &mut OutputSink,
     last_sql: Option<&str>,
-) -> bool {
+) -> DotOutcome {
     match cmd {
         DotCommand::Help => print_help(),
         DotCommand::Schema => print_schema(session),
@@ -579,11 +600,20 @@ fn dispatch_dot(
             println!("timer: {}", if session.timer() { "on" } else { "off" });
         }
         DotCommand::Output(target) => apply_output(sink, target),
-        DotCommand::Reload => report_reload(session),
-        DotCommand::Refresh(path) => report_refresh(session, path.as_deref().map(Path::new)),
-        DotCommand::RefreshAll => report_refresh(session, None),
-        DotCommand::Query(query_cmd) => dispatch_query(query_cmd, session, sink, last_sql),
-        DotCommand::Quit => return true,
+        DotCommand::Reload => {
+            report_reload(session);
+            return DotOutcome::Refresh;
+        }
+        DotCommand::Refresh(path) => {
+            report_refresh(session, path.as_deref().map(Path::new));
+            return DotOutcome::Refresh;
+        }
+        DotCommand::RefreshAll => {
+            report_refresh(session, None);
+            return DotOutcome::Refresh;
+        }
+        DotCommand::Query(query_cmd) => return dispatch_query(query_cmd, session, sink, last_sql),
+        DotCommand::Quit => return DotOutcome::Quit,
         DotCommand::BadFormat(name) => {
             eprintln!("querymatter: unknown format '{name}' (try: table, json, csv, tsv, md)");
         }
@@ -621,10 +651,13 @@ fn dispatch_dot(
             eprintln!("querymatter: unknown command {raw:?} (try .help)");
         }
     }
-    false
+    DotOutcome::Continue
 }
 
-/// Runs a `.query` dot-command.
+/// Runs a `.query` dot-command, returning [`DotOutcome::Refresh`] only for a
+/// successful `.query save` (see [`dispatch_query_save`]) — `.query list` and
+/// `.query run` never change `schema`/saved-query names, so they always
+/// return [`DotOutcome::Continue`].
 ///
 /// `.query save` is dispatched straight to [`dispatch_query_save`] — it
 /// writes `queries.toml` itself (via [`crate::save_named_query`]) rather than
@@ -633,15 +666,20 @@ fn dispatch_dot(
 /// [`queries::load`] and delegate the resolve-and-run decision to
 /// [`run_query_cmd`]; a malformed `queries.toml` is reported on stderr, not a
 /// panic.
-fn dispatch_query(cmd: QueryCmd, session: &Session, sink: &mut OutputSink, last_sql: Option<&str>) {
+fn dispatch_query(
+    cmd: QueryCmd,
+    session: &Session,
+    sink: &mut OutputSink,
+    last_sql: Option<&str>,
+) -> DotOutcome {
     if let QueryCmd::Save(name, sql) = cmd {
-        dispatch_query_save(&name, sql, last_sql);
-        return;
+        return dispatch_query_save(&name, sql, last_sql);
     }
     match queries::load() {
         Ok(saved) => run_query_cmd(cmd, &saved, session, sink),
         Err(err) => eprintln!("querymatter: {err:#}"),
     }
+    DotOutcome::Continue
 }
 
 /// `.query save <name> [sql]`'s dispatch: resolves the SQL to persist via
@@ -651,15 +689,24 @@ fn dispatch_query(cmd: QueryCmd, session: &Session, sink: &mut OutputSink, last_
 /// `querymatter query save` uses, so the CLI and the REPL can never validate
 /// or persist differently. Neither an inline SQL nor a prior statement is a
 /// clean stderr error, matching `.set`'s confirmation policy; nothing is
-/// written in that case.
-fn dispatch_query_save(name: &str, sql: Option<String>, last_sql: Option<&str>) {
+/// written in that case. Returns [`DotOutcome::Refresh`] only when the save
+/// actually succeeded — saved-query names changed only then — and
+/// [`DotOutcome::Continue`] on either failure (W55).
+fn dispatch_query_save(name: &str, sql: Option<String>, last_sql: Option<&str>) -> DotOutcome {
     match resolve_save_sql(sql, last_sql) {
         None => {
             eprintln!("querymatter: .query save: no SQL given and no statement has run yet");
+            DotOutcome::Continue
         }
         Some(sql) => match crate::save_named_query(name, &sql) {
-            Ok(path) => eprintln!("querymatter: saved query '{name}' in {}", path.display()),
-            Err(err) => eprintln!("querymatter: {err:#}"),
+            Ok(path) => {
+                eprintln!("querymatter: saved query '{name}' in {}", path.display());
+                DotOutcome::Refresh
+            }
+            Err(err) => {
+                eprintln!("querymatter: {err:#}");
+                DotOutcome::Continue
+            }
         },
     }
 }
@@ -717,16 +764,43 @@ fn query_list_lines(saved: &Queries) -> String {
     out
 }
 
-/// Every saved query's name, for [`ReplHelper`]'s tab-completion snapshot. A
-/// malformed `queries.toml` is a warning here, not fatal — the REPL still
-/// starts, just with no saved-query names to offer.
-fn saved_query_names() -> Vec<String> {
-    match queries::load() {
-        Ok(saved) => saved.names().map(String::from).collect(),
-        Err(err) => {
-            eprintln!("querymatter: warning: {err:#}");
-            Vec::new()
-        }
+/// Loads `queries.toml` via [`queries::load`], warning on stderr and falling
+/// back to [`Queries::default`] on a malformed file — never fatal, since a
+/// REPL tab-completion snapshot has no reasonable "hard error" behavior.
+/// Shared by [`run`]'s start-up snapshot and [`refresh_helper`]'s later ones.
+fn load_saved_queries_or_warn() -> Queries {
+    queries::load().unwrap_or_else(|err| {
+        eprintln!("querymatter: warning: {err:#}");
+        Queries::default()
+    })
+}
+
+/// The tab-completion snapshot [`ReplHelper`] needs: `session`'s current
+/// schema, plus every name in `saved`. Pulled out as a pure function — taking
+/// an already-loaded [`Queries`] rather than reading `queries.toml` itself —
+/// so it's unit-tested directly against an in-memory `Session`/`Queries`,
+/// with no `$HOME`/filesystem or live `Editor` involved; the live
+/// `editor.helper_mut()` push [`refresh_helper`] performs with this result
+/// isn't drivable headless. Shared by [`run`]'s start-up snapshot and
+/// [`refresh_helper`]'s later ones (W55).
+fn helper_snapshot(session: &Session, saved: &Queries) -> (Vec<String>, Vec<String>) {
+    (session.schema(), saved.names().map(String::from).collect())
+}
+
+/// Recomputes [`ReplHelper`]'s tab-completion snapshot — `session`'s current
+/// schema plus every saved query's name, via [`helper_snapshot`] — and writes
+/// it into the *live* helper, so a frontmatter field or saved query added
+/// mid-session tab-completes without a REPL restart. Called from [`run`]'s
+/// loop after a [`DotOutcome::Refresh`] (a successful `.reload`, `.refresh`,
+/// `.refresh-all`, or `.query save`) (W55). A missing helper — never actually
+/// the case, since [`run`] always sets one before the loop starts — is a
+/// silent no-op rather than a panic.
+fn refresh_helper(editor: &mut Editor<ReplHelper, FileHistory>, session: &Session) {
+    let saved = load_saved_queries_or_warn();
+    let (schema, query_names) = helper_snapshot(session, &saved);
+    if let Some(helper) = editor.helper_mut() {
+        helper.schema = schema;
+        helper.query_names = query_names;
     }
 }
 
@@ -1251,13 +1325,14 @@ fn complete_candidates(
 /// tab-completion, leaving hinting/highlighting/validation as no-ops (their
 /// trait defaults, brought in via `#[derive]`).
 ///
-/// `schema` and `query_names` are one-time snapshots — of [`Session::schema`]
-/// and [`saved_query_names`] respectively — taken in [`run`] when the REPL
-/// starts. Neither refreshes after `.reload`/`.refresh`/`.refresh-all` (for
-/// `schema`) or a saved query added mid-session (for `query_names`), so a
-/// frontmatter field or saved query added after start won't tab-complete
-/// until the REPL is restarted — acceptable for v1; revisit if it's ever a
-/// real friction point.
+/// `schema` and `query_names` are snapshots — of [`Session::schema`] and every
+/// saved query's name, respectively — computed via [`helper_snapshot`] in
+/// [`run`] at start-up, and refreshed live by [`refresh_helper`] after
+/// `.reload`, `.refresh`, `.refresh-all`, and a successful `.query save`
+/// (W55). A saved query added by a DIFFERENT process (e.g. `querymatter
+/// query save` in another terminal), or `queries.toml` edited by hand, still
+/// won't tab-complete until this REPL restarts — only in-session mutations
+/// refresh the live helper.
 #[derive(Helper, Hinter, Highlighter, Validator)]
 struct ReplHelper {
     schema: Vec<String>,
@@ -1511,6 +1586,86 @@ mod tests {
         assert_eq!(resolve_save_sql(None, None), None);
     }
 
+    /// A failed `.query save` (no inline SQL and no statement run yet this
+    /// session) must not signal a tab-completion refresh — nothing was
+    /// actually saved. Kept disk-free (unlike a successful save, which writes
+    /// through `crate::save_named_query` to the REAL `queries.toml`/`$HOME`
+    /// and is instead exercised by `tests/cli.rs`'s subprocess-isolated
+    /// `query save` tests) by only exercising the "nothing to save" branch
+    /// (W55).
+    #[test]
+    fn dispatch_query_save_without_sql_does_not_signal_refresh() {
+        assert_eq!(
+            dispatch_query_save("stale", None, None),
+            DotOutcome::Continue
+        );
+    }
+
+    /// `.reload` must signal [`DotOutcome::Refresh`] so `run`'s loop
+    /// recomputes the tab-completion helper — a field added to a file since
+    /// start-up only shows up in `schema` after a rescan (W55).
+    #[test]
+    fn dispatch_dot_reload_signals_refresh() {
+        let td = tempdir().unwrap();
+        fs::write(td.path().join("a.md"), "---\nstatus: draft\n---\n").unwrap();
+        let mut session = query_cmd_test_session(td.path());
+        let mut sink = OutputSink::Stdout;
+
+        assert_eq!(
+            dispatch_dot(DotCommand::Reload, &mut session, &mut sink, None),
+            DotOutcome::Refresh
+        );
+    }
+
+    /// `.refresh-all` must likewise signal [`DotOutcome::Refresh`] — mirrors
+    /// `dispatch_dot_reload_signals_refresh` for the vault-less fallback path
+    /// (see [`Session::refresh`]), which is what a session with no
+    /// `.querymatter` cache actually takes (W55).
+    #[test]
+    fn dispatch_dot_refresh_all_signals_refresh() {
+        let td = tempdir().unwrap();
+        fs::write(td.path().join("a.md"), "---\nstatus: draft\n---\n").unwrap();
+        let mut session = query_cmd_test_session(td.path());
+        let mut sink = OutputSink::Stdout;
+
+        assert_eq!(
+            dispatch_dot(DotCommand::RefreshAll, &mut session, &mut sink, None),
+            DotOutcome::Refresh
+        );
+    }
+
+    /// `helper_snapshot`'s recomputation — the piece [`refresh_helper`]
+    /// performs against the LIVE `editor.helper_mut()`, which itself isn't
+    /// drivable headless — reflects both a schema change picked up by
+    /// `session.reload()` and a newly-saved query name (W55).
+    #[test]
+    fn helper_snapshot_reflects_reload_and_a_newly_saved_query() {
+        let td = tempdir().unwrap();
+        fs::write(td.path().join("a.md"), "---\nstatus: draft\n---\n").unwrap();
+        let mut session = query_cmd_test_session(td.path());
+
+        let (schema, query_names) = helper_snapshot(&session, &Queries::default());
+        assert_eq!(schema, vec!["status".to_string()]);
+        assert!(query_names.is_empty());
+
+        // A field added after start-up only shows up in `schema` once
+        // `.reload` reruns the walk — the snapshot must reflect it
+        // immediately after, with no REPL restart needed.
+        fs::write(
+            td.path().join("b.md"),
+            "---\nprd: '010'\nstatus: draft\n---\n",
+        )
+        .unwrap();
+        session.reload();
+
+        let mut saved = Queries::default();
+        queries::set(&mut saved, "stale-plans", "SELECT status").unwrap();
+
+        let (schema, query_names) = helper_snapshot(&session, &saved);
+        assert_eq!(schema, vec!["prd".to_string(), "status".to_string()]);
+        assert_eq!(query_names, vec!["stale-plans".to_string()]);
+    }
+
     /// `dispatch_dot` wires `.header off` through to `Session::set_header`,
     /// reusing the same `Session` builder the `.query` dispatch tests below
     /// use — the header setting defaults to `on`, so this also proves the
@@ -1524,12 +1679,15 @@ mod tests {
         assert!(session.header(), "header must default to on");
         let mut sink = OutputSink::Stdout;
 
-        assert!(!dispatch_dot(
-            DotCommand::Header(Some(false)),
-            &mut session,
-            &mut sink,
-            None
-        ));
+        assert_eq!(
+            dispatch_dot(
+                DotCommand::Header(Some(false)),
+                &mut session,
+                &mut sink,
+                None
+            ),
+            DotOutcome::Continue
+        );
         assert!(!session.header());
     }
 
@@ -1898,12 +2056,10 @@ mod tests {
         assert!(!session.timer(), "timer must default to off");
         let mut sink = OutputSink::Stdout;
 
-        assert!(!dispatch_dot(
-            DotCommand::Timer(Some(true)),
-            &mut session,
-            &mut sink,
-            None
-        ));
+        assert_eq!(
+            dispatch_dot(DotCommand::Timer(Some(true)), &mut session, &mut sink, None),
+            DotOutcome::Continue
+        );
         assert!(session.timer());
     }
 
