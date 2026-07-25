@@ -175,6 +175,11 @@ fn rewrite_expr_literals(expr: &mut Expr, now: SystemTime) {
             rewrite_expr_literals(l, now);
             rewrite_expr_literals(r, now);
         }
+        Expr::Coalesce(args) => {
+            for arg in args {
+                rewrite_expr_literals(arg, now);
+            }
+        }
     }
 }
 
@@ -515,6 +520,7 @@ fn expr_columns(expr: &Expr) -> Vec<&ColRef> {
         Expr::Lit(_) => Vec::new(),
         Expr::Scalar(_, args) => args.iter().flat_map(expr_columns).collect(),
         Expr::Binary(_, l, r) => expr_columns(l).into_iter().chain(expr_columns(r)).collect(),
+        Expr::Coalesce(args) => args.iter().flat_map(expr_columns).collect(),
     }
 }
 
@@ -911,10 +917,11 @@ fn resolve_col(record: &Record, col: &ColRef) -> Value {
 /// Evaluates a scalar expression against `record`: a column/`file.*`
 /// pseudo-column resolves via [`resolve_col`], a literal evaluates to its
 /// `Value`, a scalar-function call evaluates its arguments first then
-/// applies [`apply_scalar`], and a binary op evaluates both sides then
-/// applies [`apply_binary`]. Used by both the ungrouped projection (per row,
-/// [`expand_select`]) and the grouped projection (over a group's
-/// representative row, [`eval_group_expr`]).
+/// applies [`apply_scalar`], a binary op evaluates both sides then applies
+/// [`apply_binary`], and `COALESCE` evaluates its arguments left to right,
+/// short-circuiting on the first non-null. Used by both the ungrouped
+/// projection (per row, [`expand_select`]) and the grouped projection (over
+/// a group's representative row, [`eval_group_expr`]).
 pub(crate) fn eval_expr(record: &Record, expr: &Expr) -> Value {
     match expr {
         Expr::Col(col) => resolve_col(record, col),
@@ -928,6 +935,11 @@ pub(crate) fn eval_expr(record: &Record, expr: &Expr) -> Value {
             let r = eval_expr(record, right);
             apply_binary(op.clone(), &l, &r)
         }
+        Expr::Coalesce(args) => args
+            .iter()
+            .map(|arg| eval_expr(record, arg))
+            .find(|v| !v.is_null())
+            .unwrap_or(Value::Null),
     }
 }
 
@@ -1561,6 +1573,38 @@ mod tests {
         assert_eq!(
             execute(&q, rows.iter(), false).unwrap().rows,
             vec![vec![Value::Float(4.5)]]
+        );
+    }
+
+    #[test]
+    fn coalesce_returns_first_non_null() {
+        let rows = [
+            rec(
+                "s",
+                "s/a.md",
+                &[("jira", Value::Str("DCP-1".into())), ("epic", Value::Null)],
+            ),
+            rec(
+                "s",
+                "s/b.md",
+                &[("jira", Value::Null), ("epic", Value::Null)],
+            ),
+        ];
+
+        let q = parse("SELECT COALESCE(epic, jira, 'none')").unwrap();
+        assert_eq!(
+            execute(&q, rows.iter(), false).unwrap().rows,
+            vec![
+                vec![Value::Str("DCP-1".into())],
+                vec![Value::Str("none".into())],
+            ]
+        );
+
+        // No fallback literal: every argument null yields Null, not 'none'.
+        let all_null = parse("SELECT COALESCE(epic, jira)").unwrap();
+        assert_eq!(
+            execute(&all_null, rows[1..2].iter(), false).unwrap().rows,
+            vec![vec![Value::Null]]
         );
     }
 
@@ -2436,6 +2480,33 @@ mod agg_tests {
         // be rejected — validation walks into scalar/arithmetic
         // sub-expressions, not just bare columns.
         let q = parse("SELECT lower(prd), count(*) GROUP BY status").unwrap();
+        assert!(matches!(
+            execute(&q, recs().iter(), false),
+            Err(ExecError::NonGroupedColumn(_))
+        ));
+    }
+    #[test]
+    fn grouped_coalesce_over_grouping_key() {
+        // `COALESCE(status, 'x')` is valid because `status` is a GROUP BY
+        // key; `expr_columns` recurses into COALESCE's arguments the same
+        // as any other nested expression.
+        let q =
+            parse("SELECT COALESCE(status, 'x'), count(*) AS n GROUP BY status ORDER BY status")
+                .unwrap();
+        let t = execute(&q, recs().iter(), false).unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec![Value::Str("draft".into()), Value::Int(1)],
+                vec![Value::Str("synced".into()), Value::Int(2)],
+            ]
+        );
+    }
+    #[test]
+    fn grouped_coalesce_referencing_non_group_key_errors() {
+        // `prd` isn't a GROUP BY key; wrapping it in `COALESCE(...)` must
+        // still be rejected, mirroring `grouped_select_expr_referencing_non_group_key_errors`.
+        let q = parse("SELECT COALESCE(prd, 'x'), count(*) GROUP BY status").unwrap();
         assert!(matches!(
             execute(&q, recs().iter(), false),
             Err(ExecError::NonGroupedColumn(_))

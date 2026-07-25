@@ -93,6 +93,11 @@ pub enum Expr {
     Scalar(ScalarFn, Vec<Expr>),
     /// A binary arithmetic or string-concat operation.
     Binary(BinOp, Box<Expr>, Box<Expr>),
+    /// `COALESCE(a, b, ...)` — the first non-null argument, evaluated
+    /// left to right; `Value::Null` if every argument is null. Variadic and
+    /// short-circuiting, so it doesn't fit `Scalar`'s fixed-arity shape or
+    /// `Binary`'s two-operand shape.
+    Coalesce(Vec<Expr>),
 }
 
 /// A scalar string function, as it may appear in a `SELECT` expression.
@@ -447,6 +452,11 @@ fn collect_expr_fields(expr: &Expr, fields: &mut BTreeSet<String>) {
             collect_expr_fields(l, fields);
             collect_expr_fields(r, fields);
         }
+        Expr::Coalesce(args) => {
+            for arg in args {
+                collect_expr_fields(arg, fields);
+            }
+        }
     }
 }
 
@@ -570,6 +580,10 @@ fn expr_label(expr: &Expr) -> String {
         }
         Expr::Binary(op, l, r) => {
             format!("{} {} {}", expr_label(l), bin_op_symbol(op), expr_label(r))
+        }
+        Expr::Coalesce(args) => {
+            let rendered: Vec<String> = args.iter().map(expr_label).collect();
+            format!("coalesce({})", rendered.join(", "))
         }
     }
 }

@@ -302,10 +302,10 @@ fn lower_expr(expr: &sql::Expr) -> Result<Expr, ParseError> {
 }
 
 /// Lowers a scalar-function call (`lower(...)`, `ltrim(...)`, `replace(...)`,
-/// …). An aggregate name here means an aggregate nested inside a larger
-/// expression (e.g. `count(*) + 1`), which this batch does not support —
-/// mixing agg and scalar in one tree needs group-context threading beyond
-/// this scope.
+/// …), or `coalesce(...)`. An aggregate name here means an aggregate nested
+/// inside a larger expression (e.g. `count(*) + 1`), which this batch does
+/// not support — mixing agg and scalar in one tree needs group-context
+/// threading beyond this scope.
 ///
 /// `trim`/`substr` never reach this function: `sqlparser` intercepts those
 /// keywords as the dedicated [`sql::Expr::Trim`]/[`sql::Expr::Substring`]
@@ -320,6 +320,10 @@ fn lower_scalar_call(func: &sql::Function) -> Result<Expr, ParseError> {
     }
 
     let name = object_name_to_string(&func.name).to_ascii_lowercase();
+    if name == "coalesce" {
+        return lower_coalesce(func, &name);
+    }
+
     let Some(scalar) = scalar_fn_from_name(&name) else {
         if is_aggregate_name(&name) {
             return Err(unsupported("an aggregate inside an expression"));
@@ -338,6 +342,27 @@ fn lower_scalar_call(func: &sql::Function) -> Result<Expr, ParseError> {
         .collect::<Result<Vec<_>, _>>()?;
     check_scalar_arity(&scalar, &name, args.len())?;
     Ok(Expr::Scalar(scalar, args))
+}
+
+/// Lowers a `COALESCE(...)` call: every argument lowers via [`lower_expr`]
+/// (through [`scalar_arg`]), so a nested aggregate (`COALESCE(count(*), 0)`)
+/// is rejected by the same "aggregate inside an expression" path as any
+/// other scalar-call argument (see [`lower_scalar_call`]). At least one
+/// argument is required — `COALESCE()` is a parse-time arity error.
+fn lower_coalesce(func: &sql::Function, name: &str) -> Result<Expr, ParseError> {
+    let list = arg_list(func, name)?;
+    if list.duplicate_treatment.is_some() {
+        return Err(unsupported(format!("DISTINCT inside {name}(...)")));
+    }
+    let args = list
+        .args
+        .iter()
+        .map(scalar_arg)
+        .collect::<Result<Vec<_>, _>>()?;
+    if args.is_empty() {
+        return Err(unsupported("coalesce() requires at least one argument"));
+    }
+    Ok(Expr::Coalesce(args))
 }
 
 /// Maps a lowercased function name to the [`ScalarFn`] it calls, or `None`
@@ -1467,6 +1492,23 @@ mod tests {
             parse("SELECT lower(status) + min(status)"),
             Err(ParseError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn coalesce_parses_and_references_all_columns() {
+        let q = parse("SELECT COALESCE(epic, 'none') AS e").unwrap();
+        assert!(q.referenced_fields().contains("epic"));
+        assert_eq!(q.select[0].header(), "e");
+        // zero-arg is an error
+        assert!(parse("SELECT COALESCE() AS e").is_err());
+        // aggregate inside coalesce rejected
+        assert!(parse("SELECT COALESCE(count(*), 0)").is_err());
+    }
+
+    #[test]
+    fn coalesce_default_header() {
+        let q = parse("SELECT COALESCE(epic, 'none')").unwrap();
+        assert_eq!(q.select[0].header(), "coalesce(epic, 'none')");
     }
 
     #[test]
