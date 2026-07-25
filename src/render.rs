@@ -371,6 +371,28 @@ mod tests {
         assert_eq!(v[0]["status"], "synced");
         assert_eq!(v[0]["Count"], 2);
     }
+    /// Spec W1: a zero-row table renders to the bare empty JSON array — the
+    /// pretty-printer's empty-array form, not `"[\n]"` or `"[\n\n]"`. Pins
+    /// the value `render_to`'s empty case is built on, complementing the
+    /// end-to-end `empty_result_json_is_bracket_bracket_newline` CLI test in
+    /// `tests/cli.rs`.
+    #[test]
+    fn json_empty_table_is_bracket_bracket() {
+        let empty = ResultTable {
+            headers: vec!["status".into()],
+            rows: vec![],
+        };
+        assert_eq!(
+            render(
+                &empty,
+                Output::Format(Format::Json),
+                TableStyle::Ascii,
+                true
+            ),
+            "[]"
+        );
+    }
+
     #[test]
     fn csv_has_header_and_rows() {
         let s = render(

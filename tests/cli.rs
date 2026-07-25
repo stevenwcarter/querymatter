@@ -3260,3 +3260,25 @@ fn streaming_output_flag_writes_file_bytes() {
         "status\ndraft\nsynced\nsynced\n"
     );
 }
+
+/// Spec W1: a zero-row result renders to the empty JSON array plus one
+/// trailing newline. `streaming_formats_are_byte_identical` above never
+/// exercises zero rows, so this was previously "byte-identical by
+/// construction" rather than actually pinned — this asserts the exact bytes
+/// the streaming JSON path emits, not merely that it produced valid JSON.
+#[test]
+fn empty_result_json_is_bracket_bracket_newline() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args([
+            "-e",
+            "SELECT status WHERE status = 'nonexistent'",
+            "--format",
+            "json",
+        ])
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout("[]\n");
+}
