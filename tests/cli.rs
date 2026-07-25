@@ -1849,6 +1849,120 @@ fn completions_survive_a_malformed_config() {
         .stdout(predicates::str::contains("querymatter"));
 }
 
+/// `completions --install bash` writes the generated script straight into
+/// bash's user completion directory (rather than requiring the caller to
+/// redirect stdout there themselves) and confirms the path on stderr.
+#[test]
+fn completions_install_writes_the_script_into_place() {
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["completions", "--install", "bash"])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("installed"));
+
+    let path = home
+        .path()
+        .join(".local/share/bash-completion/completions/querymatter");
+    let script = fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("expected a completion script at {path:?}: {err}"));
+    assert!(script.contains("querymatter"), "script:\n{script}");
+}
+
+/// zsh installs to a dedicated fpath directory of our own (`~/.zsh/completions`,
+/// not `${fpath[1]}` — see the README's note on why) with the `_`-prefixed
+/// filename zsh's completion system expects.
+#[test]
+fn completions_install_writes_zsh_with_underscore_prefix() {
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["completions", "--install", "zsh"])
+        .assert()
+        .success();
+
+    let path = home.path().join(".zsh/completions/_querymatter");
+    assert!(path.exists(), "expected {path:?} to exist");
+}
+
+/// fish installs to `~/.config/fish/completions/<name>.fish`.
+#[test]
+fn completions_install_writes_fish_to_its_completions_dir() {
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["completions", "--install", "fish"])
+        .assert()
+        .success();
+
+    let path = home
+        .path()
+        .join(".config/fish/completions/querymatter.fish");
+    assert!(path.exists(), "expected {path:?} to exist");
+}
+
+/// `--install` with no shell named auto-detects one from `$SHELL`.
+#[test]
+fn completions_install_auto_detects_the_shell_from_env() {
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .env("SHELL", "/usr/bin/fish")
+        .arg("completions")
+        .arg("--install")
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("installed"));
+
+    let path = home
+        .path()
+        .join(".config/fish/completions/querymatter.fish");
+    assert!(path.exists(), "expected {path:?} to exist");
+}
+
+/// An unwritable/uncreatable target must not leave the user stuck: a clear
+/// stderr error, PLUS the same script on stdout `--install` would otherwise
+/// have replaced (today's plain behavior). `.local` is pre-created as a
+/// plain file (not a directory) so `create_dir_all` deterministically fails —
+/// unlike a chmod-based permission test, which a root-run CI would silently
+/// ignore.
+#[test]
+fn completions_install_falls_back_to_stdout_when_the_target_is_unwritable() {
+    let home = TempDir::new().unwrap();
+    fs::write(home.path().join(".local"), "not a directory").unwrap();
+
+    qm(home.path())
+        .args(["completions", "--install", "bash"])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("could not install"))
+        .stdout(predicates::str::contains("querymatter"));
+}
+
+/// With no shell named and an unrecognized/absent `$SHELL`, there is no
+/// script to produce at all — the one case `--install` treats as a hard
+/// error rather than falling back.
+#[test]
+fn completions_install_errors_clearly_when_the_shell_cannot_be_detected() {
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .env("SHELL", "/bin/tcsh")
+        .arg("completions")
+        .arg("--install")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("SHELL"));
+}
+
+/// The plain (no `--install`) path must be completely unaffected by any of
+/// the above: still a required positional, still stdout-only.
+#[test]
+fn completions_with_no_shell_and_no_install_errors_clearly() {
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg("completions")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("required"));
+}
+
 /// A typo'd column (`staus` for `status`) must fail the query with a
 /// non-zero exit and a message naming both the offending column and the
 /// nearest real one, in every mode — here, one-shot `-e`.

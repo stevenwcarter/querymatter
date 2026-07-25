@@ -36,6 +36,7 @@ use std::time::SystemTime;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use clap::{ArgMatches, CommandFactory, FromArgMatches};
+use directories::BaseDirs;
 
 use crate::cache::CacheSummary;
 use crate::cli::{
@@ -115,7 +116,7 @@ fn dispatch(cli: &Cli, matches: &ArgMatches) -> anyhow::Result<ExitCode> {
     // below, after config loads, like every other config-needing command.
     match &cli.command {
         Some(Command::Completions(args)) => {
-            run_completions(args);
+            run_completions(args)?;
             return Ok(ExitCode::SUCCESS);
         }
         Some(Command::Config(ConfigArgs {
@@ -174,14 +175,141 @@ fn dispatch(cli: &Cli, matches: &ArgMatches) -> anyhow::Result<ExitCode> {
     }
 }
 
-/// Writes a shell completion script for `args.shell` to stdout.
+/// Writes a shell completion script for `args.shell` to stdout — or, with
+/// `--install`, straight into that shell's user completion directory.
 ///
-/// The script is data, so it goes to stdout for redirection into the shell's
-/// completion directory (see the README).
-fn run_completions(args: &CompletionsArgs) {
+/// The plain (no `--install`) path is exactly what this did before `--install`
+/// existed: the script is data, so it goes to stdout for redirection into the
+/// shell's completion directory (see the README).
+///
+/// A shell is required either way. When `args.shell` is absent — only
+/// possible together with `--install`, since [`CompletionsArgs::shell`] is
+/// otherwise `required_unless_present` — it's auto-detected from `$SHELL` via
+/// [`detect_shell`]. Failing that IS a hard error: with no shell known at
+/// all, there is no script to produce, install or otherwise.
+fn run_completions(args: &CompletionsArgs) -> anyhow::Result<()> {
     let mut command = Cli::command();
-    let name = command.get_name().to_string();
-    clap_complete::generate(args.shell, &mut command, name, &mut io::stdout());
+    let bin_name = command.get_name().to_string();
+
+    let shell = match args.shell {
+        Some(shell) => shell,
+        None => detect_shell().ok_or_else(|| {
+            anyhow::anyhow!(
+                "completions --install needs a shell: $SHELL is unset or not one this crate \
+                 recognizes; pass one explicitly, e.g. `completions --install bash`"
+            )
+        })?,
+    };
+
+    if args.install {
+        install_completions(shell, &mut command, &bin_name);
+    } else {
+        clap_complete::generate(shell, &mut command, bin_name, &mut io::stdout());
+    }
+    Ok(())
+}
+
+/// Auto-detects the user's shell from `$SHELL` (e.g. `/bin/zsh` → `Zsh`), for
+/// `completions --install` with no shell named explicitly. `None` when
+/// `$SHELL` is unset or names a shell this crate doesn't generate completions
+/// for.
+fn detect_shell() -> Option<clap_complete::Shell> {
+    let shell_path = env::var_os("SHELL")?;
+    match Path::new(&shell_path).file_name()?.to_str()? {
+        "bash" => Some(clap_complete::Shell::Bash),
+        "zsh" => Some(clap_complete::Shell::Zsh),
+        "fish" => Some(clap_complete::Shell::Fish),
+        _ => None,
+    }
+}
+
+/// Writes `shell`'s completion script into its user completion directory
+/// under the real home directory ([`BaseDirs`], which itself honors `$HOME` —
+/// see its docs — so tests can redirect it exactly like they already do for
+/// config).
+///
+/// `--install` is pure convenience, so nothing here is a hard error: a shell
+/// with no known install directory ([`install_path`] returning `None` — e.g.
+/// `elvish`/`powershell`), an undeterminable home directory, or a
+/// `create_dir_all`/write failure (e.g. permissions) all print a clear reason
+/// to stderr and fall back to printing the script to stdout — today's
+/// behavior — so the caller is never left empty-handed.
+fn install_completions(shell: clap_complete::Shell, command: &mut clap::Command, bin_name: &str) {
+    let Some(base_dirs) = BaseDirs::new() else {
+        eprintln!(
+            "querymatter: --install could not determine your home directory; \
+             printing the script to stdout instead"
+        );
+        clap_complete::generate(shell, command, bin_name, &mut io::stdout());
+        return;
+    };
+    let Some(path) = install_path(shell, base_dirs.home_dir(), bin_name) else {
+        eprintln!(
+            "querymatter: --install has no known completion directory for {shell}; \
+             printing the script to stdout instead"
+        );
+        clap_complete::generate(shell, command, bin_name, &mut io::stdout());
+        return;
+    };
+
+    if let Err(err) = write_completion_script(shell, command, bin_name, &path) {
+        eprintln!(
+            "querymatter: could not install completions to {} ({err}); printing the script to \
+             stdout instead",
+            path.display()
+        );
+        clap_complete::generate(shell, command, bin_name, &mut io::stdout());
+        return;
+    }
+    eprintln!(
+        "querymatter: installed {shell} completions to {}",
+        path.display()
+    );
+}
+
+/// The path `shell`'s completion script installs to under `home`, when this
+/// crate knows a user completion directory for it: bash uses
+/// `~/.local/share/bash-completion/completions/<bin>`; zsh uses
+/// `~/.zsh/completions/_<bin>` — an fpath directory of our own, since not
+/// every distro's default `$fpath` entry is user-writable (see the README);
+/// fish uses `~/.config/fish/completions/<bin>.fish`. `clap_complete::Shell`
+/// also includes `elvish`/`powershell`, which have no such convention to
+/// target — `None` there tells [`install_completions`] to fall back to
+/// stdout.
+fn install_path(shell: clap_complete::Shell, home: &Path, bin_name: &str) -> Option<PathBuf> {
+    match shell {
+        clap_complete::Shell::Bash => Some(
+            home.join(".local/share/bash-completion/completions")
+                .join(bin_name),
+        ),
+        clap_complete::Shell::Zsh => {
+            Some(home.join(".zsh/completions").join(format!("_{bin_name}")))
+        }
+        clap_complete::Shell::Fish => Some(
+            home.join(".config/fish/completions")
+                .join(format!("{bin_name}.fish")),
+        ),
+        _ => None,
+    }
+}
+
+/// `create_dir_all`s the target's parent directory, then writes the
+/// generated script — split out of [`install_completions`] so its one
+/// fallible step has a single error type (`io::Error`) to match on, rather
+/// than `create_dir_all` and `fs::write` needing separate handling.
+fn write_completion_script(
+    shell: clap_complete::Shell,
+    command: &mut clap::Command,
+    bin_name: &str,
+    path: &Path,
+) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .expect("install_path always returns a path with a parent");
+    fs::create_dir_all(parent)?;
+    let mut script = Vec::new();
+    clap_complete::generate(shell, command, bin_name, &mut script);
+    fs::write(path, script)
 }
 
 /// Discovers and loads the vault-level `.querymatter.toml` a team can commit

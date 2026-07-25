@@ -200,7 +200,8 @@ pub enum Command {
     Query(QueryArgs),
     /// Report whether a file would be discovered, and if not, why.
     Explain(ExplainArgs),
-    /// Print a shell completion script to stdout.
+    /// Print a shell completion script to stdout, or install it directly
+    /// with `--install`.
     Completions(CompletionsArgs),
 }
 
@@ -343,12 +344,24 @@ pub struct ExplainArgs {
     pub walk: WalkFlags,
 }
 
-/// Arguments for `querymatter completions <SHELL>`.
+/// Arguments for `querymatter completions [SHELL]`.
+///
+/// `shell` is required unless `--install` is given — enforced here via
+/// `required_unless_present` so a bare `completions` fails fast with clap's
+/// own clear usage error, rather than `run_completions` (`main.rs`)
+/// discovering the missing shell itself. With `--install` and no shell,
+/// `run_completions` auto-detects one from `$SHELL`.
 #[derive(Debug, Args)]
 pub struct CompletionsArgs {
-    /// Shell to generate a completion script for.
-    #[arg(value_enum)]
-    pub shell: clap_complete::Shell,
+    /// Shell to generate a completion script for; auto-detected from `$SHELL`
+    /// when omitted together with `--install`.
+    #[arg(value_enum, required_unless_present = "install")]
+    pub shell: Option<clap_complete::Shell>,
+
+    /// Write the script directly into the shell's user completion directory
+    /// (bash, zsh, fish) instead of printing it to stdout.
+    #[arg(long)]
+    pub install: bool,
 }
 
 impl Cli {
@@ -842,5 +855,26 @@ mod tests {
     #[test]
     fn completions_rejects_an_unknown_shell() {
         assert!(try_parse(&["querymatter", "completions", "tcsh"]).is_err());
+    }
+
+    /// `--install` makes the shell optional (`main.rs` auto-detects it from
+    /// `$SHELL` when it's left out this way).
+    #[test]
+    fn completions_install_without_a_shell_parses() {
+        match parse(&["querymatter", "completions", "--install"]).command {
+            Some(Command::Completions(args)) => {
+                assert!(args.install);
+                assert_eq!(args.shell, None);
+            }
+            other => panic!("expected Completions, got {other:?}"),
+        }
+    }
+
+    /// Without `--install`, a shell is still required — clap rejects a bare
+    /// `completions` up front rather than leaving `run_completions` to
+    /// discover the missing shell itself.
+    #[test]
+    fn completions_with_neither_shell_nor_install_is_rejected() {
+        assert!(try_parse(&["querymatter", "completions"]).is_err());
     }
 }
