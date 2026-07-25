@@ -240,10 +240,6 @@ impl Session {
 
     /// Switches whether the header row is shown for the rest of this session
     /// only.
-    // Not yet called: the `.header [on|off]` REPL dot-command that wires this
-    // up lands in the very next task of this plan (W32 task 3). Remove this
-    // allow once that call site lands.
-    #[allow(dead_code)]
     pub fn set_header(&mut self, on: bool) {
         self.settings.header = Resolved {
             value: on,

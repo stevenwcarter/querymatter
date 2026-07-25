@@ -61,6 +61,7 @@ const DOT_COMMAND_NAMES: &[&str] = &[
     ".describe",
     ".format",
     ".style",
+    ".header",
     ".output",
     ".settings",
     ".set",
@@ -104,6 +105,9 @@ pub enum DotCommand {
     Format(Option<Format>),
     /// `.style [style]` — set (`Some`) or report (`None`) the table style.
     Style(Option<TableStyle>),
+    /// `.header [on|off]` — set (`Some`) or report (`None`) whether results
+    /// include a header row.
+    Header(Option<bool>),
     /// `.output [path]` — redirect subsequent statement results to `path`
     /// (`Some`), or reset to stdout (`None`, from a bare `.output` or an
     /// explicit `.output stdout`).
@@ -270,6 +274,10 @@ pub fn parse_dot(line: &str) -> DotCommand {
                 Err(_) => DotCommand::BadStyle(arg.to_string()),
             },
         },
+        "header" => match parse_on_off(words.next()) {
+            Some(value) => DotCommand::Header(value),
+            None => DotCommand::Unknown(line.to_string()),
+        },
         "output" => match words.next() {
             None => DotCommand::Output(None),
             Some(arg) if arg.eq_ignore_ascii_case("stdout") => DotCommand::Output(None),
@@ -302,6 +310,21 @@ pub fn parse_dot(line: &str) -> DotCommand {
             None => DotCommand::MissingArg("query"),
         },
         _ => unreachable!("cmd already checked against DOT_COMMAND_NAMES above"),
+    }
+}
+
+/// Parses an optional `on`/`off` argument (case-insensitive), shared by every
+/// dot-command that toggles a boolean setting — `.header` here, and `.timer`
+/// in a later task. The outer `Option` is `None` for an unrecognized argument
+/// (any word but `on`/`off`), which the caller maps to an error; the inner
+/// `Option` is `None` for a bare command with no argument at all, meaning
+/// "report the current state" rather than change it.
+fn parse_on_off(arg: Option<&str>) -> Option<Option<bool>> {
+    match arg {
+        None => Some(None),
+        Some(a) if a.eq_ignore_ascii_case("on") => Some(Some(true)),
+        Some(a) if a.eq_ignore_ascii_case("off") => Some(Some(false)),
+        Some(_) => None,
     }
 }
 
@@ -468,8 +491,9 @@ fn history_entry(line: &Line) -> Option<String> {
 /// and returning `true` when the REPL should exit (`.quit`/`.exit`).
 ///
 /// stdout/stderr policy: reference/inspection output (`.help`, `.schema`,
-/// `.settings`, `.query list`, and `.format`'s/`.style`'s reports of the
-/// current format/style) goes to stdout; the `.reload`/`.refresh`/
+/// `.settings`, `.query list`, and `.format`'s/`.style`'s/`.header`'s reports
+/// of the current format/style/header setting) goes to stdout; the
+/// `.reload`/`.refresh`/
 /// `.refresh-all` reports, `.set`/`.unset` confirmations, `.output`'s
 /// confirmation, and all error messages (unknown command, bad format, bad
 /// style, bad key, missing argument, unknown saved-query name) go to stderr,
@@ -486,6 +510,10 @@ fn dispatch_dot(cmd: DotCommand, session: &mut Session, sink: &mut OutputSink) -
         DotCommand::Format(None) => println!("format: {}", format_name(session.format())),
         DotCommand::Style(Some(style)) => session.set_style(style),
         DotCommand::Style(None) => println!("style: {}", style_name(session.style())),
+        DotCommand::Header(Some(on)) => session.set_header(on),
+        DotCommand::Header(None) => {
+            println!("header: {}", if session.header() { "on" } else { "off" });
+        }
         DotCommand::Output(target) => apply_output(sink, target),
         DotCommand::Reload => report_reload(session),
         DotCommand::Refresh(path) => report_refresh(session, path.as_deref().map(Path::new)),
@@ -685,6 +713,10 @@ fn help_text() -> String {
     let _ = writeln!(
         text,
         "  .style [style]     show, or set, the table border style (ascii, unicode, compact, plain)"
+    );
+    let _ = writeln!(
+        text,
+        "  .header [on|off]   show, or set, whether results include a header row"
     );
     let _ = writeln!(
         text,
@@ -1210,6 +1242,26 @@ mod tests {
         }
     }
     #[test]
+    fn parses_header_on_off_and_report() {
+        assert_eq!(parse_dot(".header on"), DotCommand::Header(Some(true)));
+        assert_eq!(parse_dot(".header off"), DotCommand::Header(Some(false)));
+        assert_eq!(parse_dot(".header"), DotCommand::Header(None));
+    }
+
+    /// An unrecognized `.header` argument is `Unknown` carrying the whole
+    /// line — unlike `.format`/`.style`, whose bad-argument case names the
+    /// offending value via a dedicated `BadFormat`/`BadStyle` variant. There's
+    /// no `on`/`off` equivalent worth naming individually, so the existing
+    /// unknown-command error path handles it directly.
+    #[test]
+    fn header_bad_arg_is_unknown_command() {
+        assert_eq!(
+            parse_dot(".header maybe"),
+            DotCommand::Unknown(".header maybe".to_string())
+        );
+    }
+
+    #[test]
     fn dot_commands_parse() {
         assert!(matches!(parse_dot(".help"), DotCommand::Help));
         assert!(matches!(parse_dot(".schema"), DotCommand::Schema));
@@ -1262,6 +1314,27 @@ mod tests {
             parse_dot(".query RUN stale"),
             DotCommand::Query(QueryCmd::Run("stale".to_string()))
         );
+    }
+
+    /// `dispatch_dot` wires `.header off` through to `Session::set_header`,
+    /// reusing the same `Session` builder the `.query` dispatch tests below
+    /// use — the header setting defaults to `on`, so this also proves the
+    /// dispatch actually flips it rather than the default coincidentally
+    /// matching.
+    #[test]
+    fn dispatch_header_off_sets_session() {
+        let td = tempdir().unwrap();
+        fs::write(td.path().join("a.md"), "---\nstatus: draft\n---\n").unwrap();
+        let mut session = query_cmd_test_session(td.path());
+        assert!(session.header(), "header must default to on");
+        let mut sink = OutputSink::Stdout;
+
+        assert!(!dispatch_dot(
+            DotCommand::Header(Some(false)),
+            &mut session,
+            &mut sink
+        ));
+        assert!(!session.header());
     }
 
     /// An unrecognized `.query` action word is `BadQueryAction` (reported as
