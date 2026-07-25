@@ -12,6 +12,7 @@
 //! thread happens to finish first.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 /// The number of worker threads [`map_paths`] spreads work across: the
@@ -60,29 +61,38 @@ where
         return results;
     }
 
-    // `workers >= 2` and `paths.len() >= 2` here, so this is always >= 1 —
-    // `chunks` below never sees a zero chunk size.
-    let chunk_size = paths.len().div_ceil(workers);
+    // Shared work-stealing cursor: every worker pulls the next unclaimed
+    // index rather than owning a fixed contiguous slice, so a run of
+    // expensive paths doesn't strand one worker with a heavy chunk while
+    // others sit idle. `Relaxed` suffices — each index is claimed by exactly
+    // one thread (the `fetch_add` itself is the only synchronization
+    // needed), and `paths`/the results vectors are combined only after every
+    // worker thread has been joined.
+    let cursor = AtomicUsize::new(0);
     let mut results: Vec<(PathBuf, T)> = thread::scope(|scope| {
-        let handles: Vec<_> = paths
-            .chunks(chunk_size)
-            .map(|chunk| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
                 scope.spawn(|| {
-                    chunk
-                        .iter()
-                        .map(|path| (path.clone(), f(path)))
-                        .collect::<Vec<_>>()
+                    let mut mapped = Vec::new();
+                    loop {
+                        let i = cursor.fetch_add(1, Ordering::Relaxed);
+                        let Some(path) = paths.get(i) else {
+                            break;
+                        };
+                        mapped.push((path.clone(), f(path)));
+                    }
+                    mapped
                 })
             })
             .collect();
         handles
             .into_iter()
             .flat_map(|handle| match handle.join() {
-                Ok(chunk_results) => chunk_results,
+                Ok(worker_results) => worker_results,
                 // A worker only ever calls `f`, which reads from disk and
                 // reports failure through its return value rather than
                 // panicking — propagate rather than silently dropping a
-                // chunk's results on the (unexpected) panic.
+                // worker's results on the (unexpected) panic.
                 Err(payload) => std::panic::resume_unwind(payload),
             })
             .collect()
@@ -136,5 +146,50 @@ mod tests {
         assert_eq!(got.len(), want.len());
         got.sort();
         assert_eq!(got, want);
+    }
+
+    /// Characterization test: a size-skewed workload (`f`'s cost varies wildly
+    /// by path, simulated with a busy-spin proportional to a value baked into
+    /// the path name) must still come back sorted by path and byte-identical
+    /// to what a plain serial `paths.iter().map(f)` would produce — regardless
+    /// of how work happens to be split or interleaved across worker threads.
+    /// This must hold both today (static contiguous chunks) and after the
+    /// planned refactor to a shared work-stealing cursor, so a few of the
+    /// "expensive" paths are deliberately clustered in one contiguous region
+    /// of the input to make a naive static split imbalanced.
+    #[test]
+    fn size_skewed_workload_matches_serial_map_sorted_by_path() {
+        // Work units, deliberately skewed: a run of expensive paths up front
+        // (would land in one worker's chunk under static contiguous
+        // splitting) followed by many cheap ones.
+        let work_units: Vec<u64> = std::iter::repeat_n(5_000_u64, 6)
+            .chain(std::iter::repeat_n(50_u64, 150))
+            .collect();
+        let paths: Vec<PathBuf> = (0..work_units.len())
+            .map(|i| PathBuf::from(format!("{i:04}")))
+            .collect();
+
+        // Simulates variable-cost work with a busy-spin rather than a sleep,
+        // so the test runs fast while still making some units far more
+        // expensive than others.
+        let cost_by_path = |path: &Path| -> u64 {
+            let idx: usize = path.to_string_lossy().parse().expect("numeric test path");
+            let units = work_units[idx];
+            let mut acc = 0_u64;
+            for i in 0..units {
+                acc = acc.wrapping_add(i);
+            }
+            acc
+        };
+
+        let serial: Vec<(PathBuf, u64)> = paths
+            .iter()
+            .map(|path| (path.clone(), cost_by_path(path)))
+            .collect();
+
+        let parallel = map_paths(paths, cost_by_path);
+
+        assert_eq!(parallel, serial);
+        assert!(parallel.windows(2).all(|w| w[0].0 <= w[1].0));
     }
 }
