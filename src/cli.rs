@@ -133,6 +133,22 @@ pub struct Cli {
     #[arg(long, conflicts_with = "lenient")]
     pub no_lenient: bool,
 
+    /// Suppress the header row in table/csv/tsv/md output.
+    #[arg(long)]
+    pub no_header: bool,
+
+    /// Force the header row on, overriding a config `header = false`.
+    #[arg(long, conflicts_with = "no_header")]
+    pub header: bool,
+
+    /// Suppress non-error stderr chatter (skipped-file warnings, scan summaries).
+    #[arg(long, short = 'q')]
+    pub quiet: bool,
+
+    /// Force chatter on, overriding a config `quiet = true`.
+    #[arg(long, conflicts_with = "quiet")]
+    pub no_quiet: bool,
+
     /// Flags shared with `querymatter init` that shape the directory walk.
     #[command(flatten)]
     pub walk: WalkFlags,
@@ -178,6 +194,8 @@ pub enum Command {
     Init(InitArgs),
     /// Show or change the persistent configuration.
     Config(ConfigArgs),
+    /// Inspect the `.querymatter` cache.
+    Cache(CacheArgs),
     /// Save, list, inspect, run, or delete a saved named query.
     Query(QueryArgs),
     /// Report whether a file would be discovered, and if not, why.
@@ -221,6 +239,25 @@ pub enum ConfigAction {
     },
     /// Print the config file's path, whether or not it exists.
     Path,
+}
+
+/// Arguments for `querymatter cache <ACTION>`.
+#[derive(Debug, Args)]
+pub struct CacheArgs {
+    /// What to do with the cache.
+    #[command(subcommand)]
+    pub action: CacheAction,
+}
+
+/// The `querymatter cache` actions. Only `status` exists today; the group
+/// leaves room for a future `cache clear` without reshaping the CLI surface.
+#[derive(Debug, Subcommand)]
+pub enum CacheAction {
+    /// Show cache location, size, counts, TTL, and per-directory scan times.
+    Status {
+        /// Directory whose vault to inspect; defaults to the current directory.
+        dir: Option<PathBuf>,
+    },
 }
 
 /// Arguments for `querymatter query <ACTION>`.
@@ -394,7 +431,7 @@ pub(crate) fn canonicalize_roots(dirs: &[PathBuf]) -> anyhow::Result<Vec<PathBuf
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, ConfigAction, QueryAction, canonicalize_roots};
+    use super::{CacheAction, Cli, Command, ConfigAction, QueryAction, canonicalize_roots};
     use crate::cache::Freshness;
     use crate::config::ConfigKey;
     use crate::render::{Format, TableStyle};
@@ -687,6 +724,24 @@ mod tests {
     fn config_key_is_rejected_when_misspelled() {
         assert!(try_parse(&["querymatter", "config", "get", "table-style"]).is_err());
         assert!(try_parse(&["querymatter", "config", "get", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn cache_status_parses_with_and_without_dir() {
+        match parse(&["querymatter", "cache", "status"]).command {
+            Some(Command::Cache(args)) => match args.action {
+                CacheAction::Status { dir } => assert_eq!(dir, None),
+            },
+            other => panic!("expected a Cache subcommand, got {other:?}"),
+        }
+        match parse(&["querymatter", "cache", "status", "somedir"]).command {
+            Some(Command::Cache(args)) => match args.action {
+                CacheAction::Status { dir } => {
+                    assert_eq!(dir.as_deref(), Some(Path::new("somedir")));
+                }
+            },
+            other => panic!("expected a Cache subcommand, got {other:?}"),
+        }
     }
 
     #[test]

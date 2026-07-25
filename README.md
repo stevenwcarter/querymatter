@@ -93,19 +93,33 @@ SELECT [DISTINCT] cols [AS alias] [FROM 'glob'] [WHERE ...] [GROUP BY ...] [HAVI
   and a literal (e.g. `HAVING count(*) > 1`, `HAVING status = 'draft'`),
   combined with `AND`/`OR`/`NOT`. The aggregate need not appear in `SELECT` —
   it's computed on demand from each group's rows. Requires `GROUP BY`.
-- **ORDER BY** — a column, a `SELECT AS` alias, `file.*`, or a bare aggregate
+- **ORDER BY** — a column, a `SELECT AS` alias, `file.*`, a bare aggregate
   call needing no alias (`ORDER BY count(*) DESC`, valid only alongside
-  `GROUP BY`) — each with optional `ASC`/`DESC`. NULLs sort last regardless
-  of direction.
+  `GROUP BY`), or any other computed expression — arithmetic, `CASE`,
+  `COALESCE`, a scalar function call (see the boundary noted below) — each
+  with optional `ASC`/`DESC`. NULLs sort last regardless of direction.
+- **`CASE`** — `CASE WHEN cond THEN val [WHEN cond THEN val ...] [ELSE val]
+  END` (the *searched* form; each `WHEN` is a full `WHERE`-style condition —
+  comparisons, `LIKE`, `IN`, `MEMBER OF`, `AND`/`OR`/`NOT`) or `CASE expr WHEN
+  val THEN val2 ... [ELSE val] END` (the *simple* form; each `WHEN` value is
+  compared against `expr` for equality). The first matching arm wins; a
+  missing `ELSE` yields `Null` when none match. Usable in `SELECT`, `WHERE`,
+  and `ORDER BY` — e.g. `SELECT CASE WHEN status = 'draft' THEN 'D' ELSE 'S'
+  END AS c`.
 - **LIMIT n [OFFSET m]**.
 
 ### Boundaries worth knowing
 
 A few spots where this subset stops short of full SQL:
 
-- **`ORDER BY`** accepts a column, a `SELECT` alias, or a bare aggregate call
-  — not an arbitrary scalar expression (`ORDER BY upper(status)` is
-  rejected; add `SELECT upper(status) AS s ... ORDER BY s` instead).
+- **`ORDER BY`** accepts arbitrary computed expressions (`ORDER BY CASE WHEN
+  status = 'draft' THEN 0 ELSE 1 END`, `ORDER BY length(status) + 1`) in
+  addition to a column/alias/bare-aggregate — but a **bare, top-level scalar
+  function call** is still rejected: `ORDER BY <fn>(...)` is tried as an
+  aggregate first, so `ORDER BY upper(status)` errors naming the function
+  `upper` rather than falling through. Wrap it in parentheses (`ORDER BY
+  (upper(status))`) or alias it in `SELECT` (`SELECT upper(status) AS s ...
+  ORDER BY s`) instead.
 - **`HAVING`** only compares a leaf (grouping-key column or aggregate)
   against a literal — never aggregate-vs-aggregate (`HAVING count(*) <
   sum(n)`) and never a scalar function.
@@ -240,6 +254,10 @@ forces strict validation for one invocation, overriding a configured `lenient
 | `--output <PATH>` | Write query results to `PATH` instead of stdout (one-shot/batch mode only). See [Redirecting output](#redirecting-output---output). |
 | `--lenient` | Disable unknown-column validation — an unknown column reads as `NULL` instead of failing the query. Off by default — see [Unknown-column validation](#unknown-column-validation). |
 | `--no-lenient` | Force strict unknown-column validation, overriding a config `lenient = true`. |
+| `--header` | Force the header row on in table/csv/tsv/md output, overriding a config `header = false`. On by default. |
+| `--no-header` | Suppress the header row in table/csv/tsv/md output. |
+| `-q, --quiet` | Suppress the non-error stderr chatter a query run emits (skipped/unparsable-file warnings); errors are always shown. |
+| `--no-quiet` | Force chatter on, overriding a config `quiet = true`. |
 | `--ext <LIST>` | Comma-separated extensions to include. Default `md,markdown`. |
 | `--respect-gitignore` | Honor `.gitignore`/`.ignore` while walking. **Off by default** — see below. |
 | `--no-respect-gitignore` | Ignore `.gitignore`/`.ignore` rules, overriding a config `respect_gitignore = true`. |
@@ -279,12 +297,12 @@ one row, the whole run exits `0`.
 `--exit-code` only applies to **query mode** (no subcommand, `-e`/piped
 stdin/the REPL's non-interactive paths) and **`query run`** (which resolves a
 saved name to SQL and runs it exactly like `-e` would). Every other
-subcommand — `init`, `config …`, `query save`/`list`/`get`/`delete`,
-`explain`, `completions` — keeps today's plain "error exits 1, success exits
-0" behavior regardless of `--exit-code`; those aren't query-result concepts
-the 0/1/2 mapping has an analog for. `--exit-code` has no effect on the
-interactive REPL itself, which has no single "total rows for the whole
-session" to report.
+subcommand — `init`, `config …`, `cache status`, `query
+save`/`list`/`get`/`delete`, `explain`, `completions` — keeps today's plain
+"error exits 1, success exits 0" behavior regardless of `--exit-code`; those
+aren't query-result concepts the 0/1/2 mapping has an analog for.
+`--exit-code` has no effect on the interactive REPL itself, which has no
+single "total rows for the whole session" to report.
 
 ```console
 $ querymatter -e "SELECT status WHERE status = 'archived'" --exit-code; echo $?
@@ -318,6 +336,7 @@ interactive REPL.** Use `.output` inside the REPL instead:
 | Command | Effect |
 | --- | --- |
 | `.output <path>` | Truncate/open `<path>`; every later statement's result is appended there instead of printed. |
+| `.output \|<cmd>` | Pipe every later statement's result through `<cmd>` via the shell (the `sqlite3` convention), e.g. `.output \|less` or `.output \|column -t`. |
 | `.output` / `.output stdout` | Reset: later results print to stdout again. |
 
 ```
@@ -328,8 +347,20 @@ querymatter> .output stdout
 querymatter: results on stdout
 ```
 
-A `.output <path>` that can't be opened for writing reports the error on
-stderr and leaves the session writing wherever it already was.
+A `.output <path>` that can't be opened for writing, or a `.output |<cmd>`
+that can't be spawned, reports the error on stderr and leaves the session
+writing wherever it already was — a live piped command keeps running and
+accepting writes exactly as before the failed switch. A `.output |<cmd>`
+spawns `<cmd>` once and keeps its stdin open across every later statement
+until the next `.output` switch (or REPL exit) closes and reaps it:
+
+```
+querymatter> .output |less
+querymatter: piping results through less
+querymatter> SELECT status;
+querymatter> .output stdout
+querymatter: results on stdout
+```
 
 ## Saved queries (`querymatter query`)
 
@@ -373,10 +404,15 @@ draft
 
 Inside the REPL, `.query run <name>` runs a saved query in-session (splitting
 a multi-statement saved query and running each statement in turn, exactly
-like typing them one after another) and `.query list` lists every saved name
-and its SQL — see the dot-commands table below. `query save`/`get`/`delete`
-are CLI-only. Tab-completion offers saved-query names right after
-`.query run `.
+like typing them one after another), `.query list` lists every saved name and
+its SQL, and `.query save <name> [sql]` saves `sql` — or, with `sql` omitted,
+the last successfully-run statement of this session — under `name`, using the
+exact same validation as `querymatter query save` (a bad name or unparseable
+SQL is rejected the same way; nothing is written). `.query save` with
+neither an inline `sql` nor a prior statement this session is a clean error;
+nothing is saved. See the dot-commands table below. `query get`/`delete`
+remain CLI-only. Tab-completion offers saved-query names right after
+`.query run ` (not yet after `.query save`).
 
 ## Diagnosing exclusions (`querymatter explain <path>`)
 
@@ -503,6 +539,34 @@ appends a `.querymatter/` line. A non-interactive run (piped stdin — e.g. in a
 script or CI) never touches `.gitignore`; it prints a one-line stderr hint
 instead.
 
+### Inspecting the cache (`querymatter cache status`)
+
+`querymatter cache status [DIR]` reports an existing `.querymatter` cache's
+health: its root and on-disk location, how many directories/files it covers,
+its size on disk, its TTL, the crate version it was built with, and each
+cached directory's last-scanned time — printed to stdout, like `config list`.
+`DIR` defaults to the current directory; the vault is found the same way a
+real query finds one (searching upward for an ancestor `.querymatter/`).
+
+```console
+$ querymatter cache status ~/notes
+root:        /home/steve/notes
+cache dir:   /home/steve/notes/.querymatter
+directories: 3
+files:       128
+size:        42.1 KiB
+ttl:         300s
+built with:  querymatter 0.1.0
+
+directories scanned:
+  /home/steve/notes/plans            2026-07-20 10:30
+  /home/steve/notes/product/stories  2026-07-20 10:30
+```
+
+It errors — naming `querymatter init` as the fix — both when no
+`.querymatter` cache is found at or above `DIR`, and when one is found but
+unreadable (corrupt, or written by an incompatible crate version).
+
 ### Limitation
 
 Positional `[DIRS]` restrict a vault query at **directory granularity** — a
@@ -540,6 +604,9 @@ respect_gitignore = true
 hidden            = false
 exclude           = ["**/templates/**"]
 lenient           = false
+timer             = false
+header            = true
+quiet             = false
 ```
 
 Every key is optional; an absent key falls through to the next layer. Values
@@ -555,6 +622,14 @@ and `--no-hidden` turns it back off for one run. Likewise a configured
 `--no-lenient` turns it back to strict for one run. `--table-style`
 additionally reads `QUERYMATTER_TABLE_STYLE`, which outranks the file but
 loses to the flag.
+
+`header` and `quiet` follow the same rule: a configured `header = false` still
+suppresses the header row when you pass no flag, and `--header` turns it back
+on for one run (`--no-header`/`--no-quiet` work the same way in reverse).
+`timer` has no CLI flag at all — `config set timer true` is the only durable
+way to turn it on. Either way, a REPL session's own `.header [on|off]` /
+`.timer [on|off]` (see [REPL dot-commands](#repl-dot-commands)) toggle just
+that session, on top of whatever the flag/config layers already resolved.
 
 | Command | Meaning |
 | --- | --- |
@@ -576,6 +651,9 @@ respect_gitignore  false        (default)
 hidden             false        (default)
 exclude            (none)       (default)
 lenient            false        (default)
+timer              false        (default)
+header             true         (default)
+quiet              false        (default)
 ```
 
 A malformed config file, an unknown key, or an invalid value is a hard error
@@ -641,7 +719,9 @@ rather than SQL:
 | `.describe [field]` | With no argument, a one-line-per-field summary of every field's type and coverage. With `<field>`, that field's `Value` type(s), non-null coverage, and its most-frequent-first value list (or a bare distinct count, when there are too many distinct values to list). |
 | `.format [fmt]` | Show, or set, the output format for subsequent queries. |
 | `.style [style]` | Show, or set, the table border style (`ascii`, `unicode`, `compact`, `plain`) for subsequent queries. |
-| `.output [path\|stdout]` | Redirect subsequent results to `path` (truncating it first), or back to stdout with `.output`/`.output stdout`. See [Redirecting output](#redirecting-output---output). |
+| `.header [on\|off]` | Show, or toggle, whether results include a header row (this session only). |
+| `.timer [on\|off]` | Show, or toggle, whether the `-- N rows` line also reports elapsed query time (this session only). |
+| `.output [path\|stdout]` | Redirect subsequent results to `path` (truncating it first), pipe them through a shell command with `.output \|cmd`, or back to stdout with `.output`/`.output stdout`. See [Redirecting output](#redirecting-output---output). |
 | `.settings` | List every setting, its resolved value, and which layer supplied it. |
 | `.set <key> <value>` | Save a setting to the config file. Rendering settings (`format`, `table_style`) also apply immediately; scan settings take effect on the next run. |
 | `.unset <key>` | Remove a setting from the config file. |
@@ -650,6 +730,7 @@ rather than SQL:
 | `.refresh-all` | Force a re-scan of the whole vault; alias for `.refresh` with no path. |
 | `.query run <name>` | Run a saved query in-session, honoring the current `.format`/`.style`/`.output`. See [Saved queries](#saved-queries-querymatter-query). |
 | `.query list` | List every saved query's name and SQL. |
+| `.query save <name> [sql]` | Save `sql` under `name`, or, when `sql` is omitted, the last successfully-run statement of this session. Same validation as `querymatter query save`. |
 | `.quit` / `.exit` | Leave the REPL (Ctrl-D also exits; Ctrl-C cancels the current line). |
 
 SQL statements may span multiple lines; a trailing `;` ends the statement and
@@ -659,15 +740,31 @@ as in `SELECT * LIMIT 1\G`. `\g` is accepted as a synonym for `;`. `\G`
 overrides whatever `.format` is set to, and works in `-e` and piped batch mode
 as well as the REPL.
 
+On a real terminal, `--format table` (and `.format table`) also fits the
+table to the terminal's width automatically instead of overflowing off the
+screen; piped or redirected output (a script, `--output`, `.output <path>`)
+is unaffected and stays exactly as wide as its content, since an interchange
+format has to be terminal-independent. For a single very wide record, `\G`
+(above) is still the more readable option; piping through a pager works too,
+e.g. `.output |less -S` inside the REPL.
+
 `.format` and `.style` change the current session only; `.set format` and
-`.set table_style` persist to the config file — so you can try a setting, then
-keep it.
+`.set table_style` persist to the config file *and* apply immediately — so you
+can try a setting, then keep it. `.header`/`.timer` are session-only the same
+way, but their `.set`/`config set` counterparts are **deferred**, like any
+scan setting: `.set header false`/`.set timer true`/`.set quiet true` persist
+the default for future runs without changing what's already resolved for
+*this* session — use `.header`/`.timer` directly to change this session's
+behavior right now.
 
 After each REPL statement's result, a `-- N rows` line (singular for exactly
 one row) is printed to stderr — a quick sanity check that distinguishes a
 genuinely empty result from a typo'd `WHERE`. It's REPL-only, printed to
 stderr rather than stdout, and never appears in `-e` or piped batch mode, so
-it never corrupts piped output.
+it never corrupts piped output. With `.timer on` (or a configured `timer =
+true`), the same line also reports the statement's wall-clock time in seconds
+to three decimal places, e.g. `-- 3 rows (0.004s)`; `.timer off` (the
+default) reproduces the untimed line exactly.
 
 Tab-completion is available for: frontmatter column names and the `file.*`
 pseudo-columns, in SQL position; dot-command names, right after a leading
@@ -693,7 +790,7 @@ rather than a fragment of it.
 - **Files with no frontmatter block are skipped entirely** — they never show
   up as an all-`NULL` row. A file whose frontmatter exists but fails to parse
   as YAML is also skipped, with a warning on stderr (stdout stays clean for
-  piping).
+  piping) — silenced by `--quiet`/`-q` (see [Flags](#flags)).
 - **Unquoted leading-zero YAML values parse as integers.** `prd: 010` loads
   as the integer `10`, not the string `"010"` — quote it (`prd: '010'`) if
   you need it to stay a string.

@@ -98,6 +98,29 @@ pub enum Expr {
     /// short-circuiting, so it doesn't fit `Scalar`'s fixed-arity shape or
     /// `Binary`'s two-operand shape.
     Coalesce(Vec<Expr>),
+    /// `CASE [operand] WHEN cond THEN val ... [ELSE val] END`. Searched form
+    /// has `operand: None` (each WHEN is a boolean condition); simple form
+    /// carries an operand each WHEN value is compared against for equality.
+    Case {
+        /// The simple-form operand, or `None` for the searched form.
+        operand: Option<Box<Expr>>,
+        /// Each `WHEN cond THEN val` arm, evaluated in order: the first
+        /// whose condition is true (searched) or whose value equals the
+        /// operand (simple) wins.
+        whens: Vec<(Expr, Expr)>,
+        /// The `ELSE` value, or `None` (which evaluates to `Value::Null`
+        /// when no arm matches).
+        else_expr: Option<Box<Expr>>,
+    },
+    /// A `WHERE`-style boolean predicate used as an `Expr`, evaluating to
+    /// `Value::Bool` (or `Value::Null` when the predicate is 3VL-unknown —
+    /// see `exec::eval_predicate`) instead of `Predicate`'s tri-valued
+    /// `Option<bool>`. The only place `query::parse` ever constructs this is
+    /// a searched `CASE WHEN`'s condition, which needs the full comparison/
+    /// `LIKE`/`IN`/`MEMBER OF`/`AND`/`OR`/`NOT` grammar `WHERE` already has —
+    /// reusing `Predicate` here rather than duplicating that grammar into
+    /// `Expr` keeps it defined in exactly one place.
+    Predicate(Box<Predicate>),
 }
 
 /// A scalar string function, as it may appear in a `SELECT` expression.
@@ -359,8 +382,8 @@ pub struct OrderKey {
     pub desc: bool,
 }
 
-/// The sort key of an `ORDER BY` clause: a projection alias, a column, or a
-/// bare aggregate call.
+/// The sort key of an `ORDER BY` clause: a projection alias, a column, a
+/// bare aggregate call, or an arbitrary computed expression.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OrderTarget {
     /// An identifier that matched a `SELECT` alias.
@@ -373,6 +396,13 @@ pub enum OrderTarget {
     /// single-group case, where `group_by` is empty too) rather than
     /// leaving that combination representable.
     Agg(Aggregate),
+    /// Any other computed expression, e.g. `ORDER BY CASE WHEN status =
+    /// 'draft' THEN 0 ELSE 1 END` or `ORDER BY n + 1`. Evaluated per row
+    /// (ungrouped) or over a group's representative row (grouped, only
+    /// valid when built entirely from `GROUP BY` keys — see
+    /// `exec::resolve_group_order_targets`), the same as an
+    /// `Expr` `SELECT` item.
+    Expr(Expr),
 }
 
 impl Query {
@@ -381,10 +411,11 @@ impl Query {
     /// never checked against the schema, see spec §3.4), across every
     /// column position: `SELECT` (including a column nested inside a
     /// `Expr::Scalar`/`Expr::Binary` argument or an aggregate's argument),
-    /// `WHERE`, `GROUP BY`, `ORDER BY` (a bare column or an aggregate
-    /// target — an alias is not a field reference, since it names a
-    /// `SELECT` item rather than a column), `HAVING`, and `MEMBER OF`'s
-    /// column. A `file.*` pseudo-column is never included (its validity is
+    /// `WHERE`, `GROUP BY`, `ORDER BY` (a bare column, an aggregate target,
+    /// or every column inside a computed expression target — an alias is
+    /// not a field reference, since it names a `SELECT` item rather than a
+    /// column), `HAVING`, and `MEMBER OF`'s column. A `file.*` pseudo-column
+    /// is never included (its validity is
     /// checked at parse time, not against the schema), and neither is the
     /// `*` wildcard, which names no specific field.
     ///
@@ -413,6 +444,7 @@ impl Query {
                 OrderTarget::Alias(_) => {}
                 OrderTarget::Col(col) => collect_col_field(col, &mut fields),
                 OrderTarget::Agg(agg) => collect_aggregate_fields(agg, &mut fields),
+                OrderTarget::Expr(expr) => collect_expr_fields(expr, &mut fields),
             }
         }
         if let Some(having) = &self.having {
@@ -457,6 +489,23 @@ fn collect_expr_fields(expr: &Expr, fields: &mut BTreeSet<String>) {
                 collect_expr_fields(arg, fields);
             }
         }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+        } => {
+            if let Some(op) = operand {
+                collect_expr_fields(op, fields);
+            }
+            for (cond, then) in whens {
+                collect_expr_fields(cond, fields);
+                collect_expr_fields(then, fields);
+            }
+            if let Some(e) = else_expr {
+                collect_expr_fields(e, fields);
+            }
+        }
+        Expr::Predicate(pred) => collect_predicate_fields(pred, fields),
     }
 }
 
@@ -585,6 +634,86 @@ fn expr_label(expr: &Expr) -> String {
             let rendered: Vec<String> = args.iter().map(expr_label).collect();
             format!("coalesce({})", rendered.join(", "))
         }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+        } => case_label(operand, whens, else_expr),
+        Expr::Predicate(pred) => predicate_label(pred),
+    }
+}
+
+/// A SQL-ish rendering of a `CASE` expression, for [`expr_label`].
+fn case_label(
+    operand: &Option<Box<Expr>>,
+    whens: &[(Expr, Expr)],
+    else_expr: &Option<Box<Expr>>,
+) -> String {
+    let mut parts = vec!["case".to_string()];
+    if let Some(op) = operand {
+        parts.push(expr_label(op));
+    }
+    for (cond, then) in whens {
+        parts.push(format!(
+            "when {} then {}",
+            expr_label(cond),
+            expr_label(then)
+        ));
+    }
+    if let Some(e) = else_expr {
+        parts.push(format!("else {}", expr_label(e)));
+    }
+    parts.push("end".to_string());
+    parts.join(" ")
+}
+
+/// A SQL-ish rendering of a `WHERE`-style predicate, for [`expr_label`]'s
+/// [`Expr::Predicate`] arm (a searched `CASE WHEN`'s condition).
+fn predicate_label(pred: &Predicate) -> String {
+    match pred {
+        Predicate::Compare(l, op, r) => {
+            format!("{} {} {}", expr_label(l), cmp_op_symbol(op), expr_label(r))
+        }
+        Predicate::Like(col, pattern, negated) => format!(
+            "{} {}like '{pattern}'",
+            col.label(),
+            if *negated { "not " } else { "" }
+        ),
+        Predicate::In(col, lits, negated) => {
+            let rendered: Vec<String> = lits.iter().map(literal_label).collect();
+            format!(
+                "{} {}in ({})",
+                col.label(),
+                if *negated { "not " } else { "" },
+                rendered.join(", ")
+            )
+        }
+        Predicate::MemberOf(lit, col, negated) => format!(
+            "{}{} member of({})",
+            if *negated { "not " } else { "" },
+            literal_label(lit),
+            col.label()
+        ),
+        Predicate::IsNull(col, negated) => format!(
+            "{} is {}null",
+            col.label(),
+            if *negated { "not " } else { "" }
+        ),
+        Predicate::And(a, b) => format!("{} and {}", predicate_label(a), predicate_label(b)),
+        Predicate::Or(a, b) => format!("{} or {}", predicate_label(a), predicate_label(b)),
+        Predicate::Not(inner) => format!("not {}", predicate_label(inner)),
+    }
+}
+
+/// The infix symbol for a [`CmpOp`], for [`predicate_label`].
+fn cmp_op_symbol(op: &CmpOp) -> &'static str {
+    match op {
+        CmpOp::Eq => "=",
+        CmpOp::Ne => "<>",
+        CmpOp::Lt => "<",
+        CmpOp::Le => "<=",
+        CmpOp::Gt => ">",
+        CmpOp::Ge => ">=",
     }
 }
 

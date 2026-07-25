@@ -31,13 +31,16 @@ use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::SystemTime;
 
 use anyhow::Context;
+use chrono::{DateTime, Utc};
 use clap::{ArgMatches, CommandFactory, FromArgMatches};
 
+use crate::cache::CacheSummary;
 use crate::cli::{
-    Cli, Command, CompletionsArgs, ConfigAction, ConfigArgs, ExplainArgs, InitArgs, QueryAction,
-    QueryArgs,
+    CacheAction, CacheArgs, Cli, Command, CompletionsArgs, ConfigAction, ConfigArgs, ExplainArgs,
+    InitArgs, QueryAction, QueryArgs,
 };
 use crate::config::Config;
 use crate::output::OutputSink;
@@ -146,6 +149,10 @@ fn dispatch(cli: &Cli, matches: &ArgMatches) -> anyhow::Result<ExitCode> {
         }
         Some(Command::Config(args)) => {
             run_config(&args.action, cli, &config, matches)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(Command::Cache(args)) => {
+            run_cache(args)?;
             Ok(ExitCode::SUCCESS)
         }
         Some(Command::Query(QueryArgs {
@@ -380,6 +387,108 @@ fn run_config_path() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Runs a `querymatter cache` action; only `status` exists today.
+fn run_cache(args: &CacheArgs) -> anyhow::Result<()> {
+    match &args.action {
+        CacheAction::Status { dir } => run_cache_status(dir.as_deref()),
+    }
+}
+
+/// Reports the `.querymatter` cache's health for the vault enclosing `dir`
+/// (or the cwd when `dir` is absent): its location, size, counts, TTL, and
+/// each cached directory's last scan time. Printed to stdout — inspection
+/// data, matching `config list`'s convention. Errors, naming `querymatter
+/// init`, both when no vault is found at or above the resolved directory
+/// and when one is found but its `manifest.bin` is unreadable (corrupt, or
+/// written by an incompatible crate version) — [`cache::cache_summary`]'s
+/// own error doesn't mention `init`, so this wraps it with context that
+/// does.
+fn run_cache_status(dir: Option<&Path>) -> anyhow::Result<()> {
+    let start = match dir {
+        Some(dir) => fs::canonicalize(dir)
+            .with_context(|| format!("cannot access directory {}", dir.display()))?,
+        None => env::current_dir().context("failed to determine the current directory")?,
+    };
+    let vault = cache::find_vault(&start).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no .querymatter cache found at or above {} (run `querymatter init` first)",
+            start.display()
+        )
+    })?;
+    let summary = cache::cache_summary(&vault).with_context(|| {
+        format!(
+            "cache at {} may be corrupt or from an incompatible querymatter version \
+             (run `querymatter init` to rebuild it)",
+            cache::cache_dir(&vault).display()
+        )
+    })?;
+    println!("{}", render_cache_summary(&summary));
+    Ok(())
+}
+
+/// Renders a [`CacheSummary`] exactly as `querymatter cache status` prints
+/// it: aligned key/value fields (location, counts, size, TTL, crate
+/// version), followed by each cached directory's last scan time in the
+/// order [`CacheSummary::dirs`] already carries (`manifest.bin`'s own
+/// order).
+fn render_cache_summary(summary: &CacheSummary) -> String {
+    let cache_dir = cache::cache_dir(&summary.root);
+    let mut lines = vec![
+        format!("root:        {}", summary.root.display()),
+        format!("cache dir:   {}", cache_dir.display()),
+        format!("directories: {}", summary.dir_count),
+        format!("files:       {}", summary.file_count),
+        format!("size:        {}", human_bytes(summary.bytes)),
+        format!("ttl:         {}s", summary.ttl_secs),
+        format!("built with:  querymatter {}", summary.crate_version),
+    ];
+
+    if !summary.dirs.is_empty() {
+        lines.push(String::new());
+        lines.push("directories scanned:".to_string());
+        let width = summary
+            .dirs
+            .iter()
+            .map(|(dir, _)| dir.display().to_string().len())
+            .max()
+            .unwrap_or(0);
+        for (dir, scanned_at) in &summary.dirs {
+            lines.push(format!(
+                "  {:width$}  {}",
+                dir.display(),
+                format_scan_time(*scanned_at)
+            ));
+        }
+    }
+
+    lines.join("\n")
+}
+
+/// Renders `bytes` human-readably: whole bytes below 1 KiB, one decimal
+/// place for KiB, and one decimal place for MiB and above — a `.querymatter`
+/// cache is not expected to reach GiB scale, so there's no step past MiB.
+fn human_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    let bytes_f = bytes as f64;
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes_f < MIB {
+        format!("{:.1} KiB", bytes_f / KIB)
+    } else {
+        format!("{:.1} MiB", bytes_f / MIB)
+    }
+}
+
+/// Renders a cached directory's scan time as `YYYY-MM-DD HH:MM` UTC, matching
+/// [`crate::model::system_time_to_iso`]'s UTC convention for on-disk
+/// timestamps.
+fn format_scan_time(t: SystemTime) -> String {
+    DateTime::<Utc>::from(t)
+        .format("%Y-%m-%d %H:%M")
+        .to_string()
+}
+
 /// Runs a config-free `querymatter query` action: `save`/`list`/`get`/
 /// `delete` operate only on the `queries.toml` file (see [`queries`]) and
 /// never build a record store — matching `config`'s stdout/stderr split,
@@ -391,12 +500,7 @@ fn run_config_path() -> anyhow::Result<()> {
 fn run_query_action(action: &QueryAction) -> anyhow::Result<ExitCode> {
     match action {
         QueryAction::Save { name, sql } => {
-            // Rejected up front, naming the parse error, so a saved query can
-            // never be a broken one that only fails later at `query run`.
-            query::parse(sql).with_context(|| format!("failed to parse query: {sql}"))?;
-            let mut saved = queries::load()?;
-            queries::set(&mut saved, name, sql)?;
-            let path = queries::save(&saved)?;
+            let path = save_named_query(name, sql)?;
             eprintln!("querymatter: saved query '{name}' in {}", path.display());
             Ok(ExitCode::SUCCESS)
         }
@@ -438,6 +542,23 @@ fn run_query_action(action: &QueryAction) -> anyhow::Result<ExitCode> {
             unreachable!("Run is dispatched separately, after config::load — see run_query_run")
         }
     }
+}
+
+/// Validates and persists `sql` under `name` in the user's saved-queries
+/// file: rejects `sql` up front (naming the parse error), so a saved query
+/// can never be a broken one that only fails later at `query run`, then
+/// rejects `name` per [`queries::set`]'s allowed-character rule, then loads
+/// the current file, inserts (overwriting any existing SQL already saved
+/// under the same name), and saves it back.
+///
+/// Shared by the CLI's `query save` ([`run_query_action`]'s `Save` arm) and
+/// the REPL's `.query save` ([`repl`]'s dispatch), so the two surfaces can
+/// never validate or persist differently.
+pub(crate) fn save_named_query(name: &str, sql: &str) -> anyhow::Result<PathBuf> {
+    query::parse(sql).with_context(|| format!("failed to parse query: {sql}"))?;
+    let mut saved = queries::load()?;
+    queries::set(&mut saved, name, sql)?;
+    queries::save(&saved)
 }
 
 /// Runs `query run <name> [DIR]`: resolves `name` to its saved SQL — a clean
@@ -677,8 +798,10 @@ fn build_session(
         }
     };
 
-    for warning in &report.warnings {
-        eprintln!("querymatter: {warning}");
+    if !settings.quiet.value {
+        for warning in &report.warnings {
+            eprintln!("querymatter: {warning}");
+        }
     }
     let fallback = Settings::resolve(cli, &Config::default(), matches);
     Ok(Session::new(
@@ -736,15 +859,31 @@ fn canonicalize_dirs(dirs: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
 /// statement that fails aborts the run: its error propagates to `main`,
 /// which reports it on stderr and exits non-zero. Statements that ran before
 /// it have already been written.
+///
+/// A failing statement's error is prefixed with its 1-based position —
+/// `statement N of M failed: ...` — whenever the batch has more than one
+/// statement (design W36), so a partial `--output` run tells the caller
+/// exactly which statement to blame. A lone statement needs no "1 of 1"
+/// noise, so the prefix is omitted when `M == 1`. This is batch/`-e`/`query
+/// run` only; the REPL runs statements one at a time via its own loop and is
+/// unaffected.
 fn run_statements(session: &Session, input: &str, output: Option<&Path>) -> anyhow::Result<usize> {
     let mut sink = match output {
         Some(path) => OutputSink::open_file(path)
             .with_context(|| format!("cannot write results to {}", path.display()))?,
         None => OutputSink::Stdout,
     };
+    let statements = split_statements(input);
+    let total = statements.len();
     let mut total_rows = 0;
-    for statement in split_statements(input) {
-        let (rendered, rows) = session.render_statement_counted(&statement)?;
+    for (i, statement) in statements.iter().enumerate() {
+        let (rendered, rows) =
+            session
+                .render_statement_counted(statement)
+                .map_err(|e| match total {
+                    1 => e,
+                    _ => e.context(format!("statement {} of {total} failed", i + 1)),
+                })?;
         sink.write_block(&rendered)
             .context("failed to write query results")?;
         total_rows += rows;

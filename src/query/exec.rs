@@ -142,9 +142,9 @@ fn execute_with_schema_at<'a>(
 /// ISO-8601 date/datetime it resolves to against `now` (see
 /// [`resolve_reldate`]). Walks every literal position in the query tree —
 /// `SELECT` expressions, the `WHERE` predicate (comparison operands, `IN`
-/// lists, `MEMBER OF`'s literal), and `HAVING` — so no relative-date literal
-/// can reach evaluation unresolved, regardless of where in the query it
-/// appears.
+/// lists, `MEMBER OF`'s literal), `ORDER BY`'s computed-expression target,
+/// and `HAVING` — so no relative-date literal can reach evaluation
+/// unresolved, regardless of where in the query it appears.
 fn rewrite_relative_dates(q: &mut Query, now: SystemTime) {
     for item in &mut q.select {
         if let SelectExpr::Expr(expr) = &mut item.expr {
@@ -153,6 +153,11 @@ fn rewrite_relative_dates(q: &mut Query, now: SystemTime) {
     }
     if let Some(pred) = &mut q.filter {
         rewrite_predicate_literals(pred, now);
+    }
+    for key in &mut q.order_by {
+        if let OrderTarget::Expr(expr) = &mut key.target {
+            rewrite_expr_literals(expr, now);
+        }
     }
     if let Some(having) = &mut q.having {
         rewrite_having_literals(having, now);
@@ -180,6 +185,23 @@ fn rewrite_expr_literals(expr: &mut Expr, now: SystemTime) {
                 rewrite_expr_literals(arg, now);
             }
         }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+        } => {
+            if let Some(op) = operand {
+                rewrite_expr_literals(op, now);
+            }
+            for (cond, then) in whens {
+                rewrite_expr_literals(cond, now);
+                rewrite_expr_literals(then, now);
+            }
+            if let Some(e) = else_expr {
+                rewrite_expr_literals(e, now);
+            }
+        }
+        Expr::Predicate(pred) => rewrite_predicate_literals(pred, now),
     }
 }
 
@@ -366,7 +388,7 @@ fn execute_ungrouped<'a>(
     }
 
     let order = resolve_order_targets(&q.order_by, &headers)?;
-    rows.sort_by(|(ra, rowa), (rb, rowb)| {
+    let cmp = |(ra, rowa): &(&Record, Vec<Value>), (rb, rowb): &(&Record, Vec<Value>)| {
         order
             .iter()
             .map(|(target, desc)| {
@@ -376,9 +398,22 @@ fn execute_ungrouped<'a>(
             })
             .find(|ord| *ord != Ordering::Equal)
             .unwrap_or(Ordering::Equal)
-    });
+    };
 
     let offset = q.offset.unwrap_or(0);
+    let rows = match q.limit {
+        // Only the `offset + limit` window can ever be observed, so select
+        // just that many rows instead of fully sorting the rest.
+        Some(limit) => {
+            let n = offset.saturating_add(limit).min(rows.len());
+            bounded_top_k(rows, n, cmp)
+        }
+        None => {
+            rows.sort_by(cmp);
+            rows
+        }
+    };
+
     let rows: Vec<Vec<Value>> = rows
         .into_iter()
         .map(|(_, row)| row)
@@ -387,6 +422,39 @@ fn execute_ungrouped<'a>(
         .collect();
 
     Ok(ResultTable { headers, rows })
+}
+
+/// The smallest `n` of `items` under `cmp`, sorted, with ties broken by each
+/// item's original position — byte-identical to a full stable sort by `cmp`
+/// followed by `.take(n)`. Used by [`execute_ungrouped`] and
+/// [`execute_grouped`] to bound `ORDER BY` + `LIMIT` to the requested window.
+///
+/// `n` is clamped to `items.len()`. Selection runs in expected `O(len)` via
+/// [`slice::select_nth_unstable_by`] rather than a full `O(len log len)`
+/// sort, so cost tracks the requested window (`offset + limit`) rather than
+/// the whole result.
+fn bounded_top_k<T>(items: Vec<T>, n: usize, cmp: impl Fn(&T, &T) -> Ordering) -> Vec<T> {
+    let mut indexed: Vec<(usize, T)> = items.into_iter().enumerate().collect();
+    let len = indexed.len();
+    let n = n.min(len);
+
+    // Folding the original index in as a final ascending tiebreaker turns
+    // `cmp` (which may rank equal-key items as ties) into a strict total
+    // order, so the partial selection below and the final sort agree with
+    // what a *stable* sort by `cmp` alone would produce: equal-key items
+    // keep their input order, exactly as `Vec::sort_by`'s stability
+    // guarantees for a full sort.
+    let total_order = |a: &(usize, T), b: &(usize, T)| cmp(&a.1, &b.1).then(a.0.cmp(&b.0));
+
+    if n == 0 {
+        return Vec::new();
+    }
+    if n < len {
+        indexed.select_nth_unstable_by(n - 1, &total_order);
+        indexed.truncate(n);
+    }
+    indexed.sort_by(&total_order);
+    indexed.into_iter().map(|(_, item)| item).collect()
 }
 
 /// Drops duplicate projected rows in place for `SELECT DISTINCT`, keeping
@@ -450,7 +518,7 @@ fn execute_grouped<'a>(
         .map(|(_, row, order_keys)| (row, order_keys))
         .collect();
 
-    rows.sort_by(|(_, oa), (_, ob)| {
+    let cmp = |(_, oa): &(Vec<Value>, Vec<Value>), (_, ob): &(Vec<Value>, Vec<Value>)| {
         order
             .iter()
             .zip(oa)
@@ -458,9 +526,22 @@ fn execute_grouped<'a>(
             .map(|(((_, desc), va), vb)| order_cmp(va, vb, *desc))
             .find(|ord| *ord != Ordering::Equal)
             .unwrap_or(Ordering::Equal)
-    });
+    };
 
     let offset = q.offset.unwrap_or(0);
+    let rows = match q.limit {
+        // Only the `offset + limit` window of groups can ever be observed,
+        // so select just that many instead of fully sorting the rest.
+        Some(limit) => {
+            let n = offset.saturating_add(limit).min(rows.len());
+            bounded_top_k(rows, n, cmp)
+        }
+        None => {
+            rows.sort_by(cmp);
+            rows
+        }
+    };
+
     let rows: Vec<Vec<Value>> = rows
         .into_iter()
         .map(|(row, _)| row)
@@ -521,6 +602,42 @@ fn expr_columns(expr: &Expr) -> Vec<&ColRef> {
         Expr::Scalar(_, args) => args.iter().flat_map(expr_columns).collect(),
         Expr::Binary(_, l, r) => expr_columns(l).into_iter().chain(expr_columns(r)).collect(),
         Expr::Coalesce(args) => args.iter().flat_map(expr_columns).collect(),
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+        } => {
+            let mut cols: Vec<&ColRef> = operand
+                .as_deref()
+                .into_iter()
+                .flat_map(expr_columns)
+                .collect();
+            for (cond, then) in whens {
+                cols.extend(expr_columns(cond));
+                cols.extend(expr_columns(then));
+            }
+            cols.extend(else_expr.as_deref().into_iter().flat_map(expr_columns));
+            cols
+        }
+        Expr::Predicate(pred) => predicate_columns(pred),
+    }
+}
+
+/// Every column a `WHERE`-style predicate tree references, mirroring
+/// [`expr_columns`] but for [`Predicate`] — used when a `CASE WHEN`
+/// condition ([`Expr::Predicate`]) reaches [`expr_columns`].
+fn predicate_columns(pred: &Predicate) -> Vec<&ColRef> {
+    match pred {
+        Predicate::Compare(l, _, r) => expr_columns(l).into_iter().chain(expr_columns(r)).collect(),
+        Predicate::Like(col, _, _) | Predicate::In(col, _, _) | Predicate::IsNull(col, _) => {
+            vec![col]
+        }
+        Predicate::MemberOf(_, col, _) => vec![col],
+        Predicate::And(a, b) | Predicate::Or(a, b) => predicate_columns(a)
+            .into_iter()
+            .chain(predicate_columns(b))
+            .collect(),
+        Predicate::Not(inner) => predicate_columns(inner),
     }
 }
 
@@ -674,15 +791,45 @@ fn compare_key_tuple(a: &[Value], b: &[Value]) -> Ordering {
         .unwrap_or(Ordering::Equal)
 }
 
+/// One `SELECT` item's projection state while [`project_group`] folds a
+/// group's rows: a non-aggregate expression just carries the expression to
+/// evaluate afterward (it only ever looks at the group's representative
+/// row, never the whole group — see [`eval_group_expr`]), while an aggregate
+/// carries a running [`AggState`] to be updated once per row.
+enum ProjectedItem<'a> {
+    Expr(&'a Expr),
+    Agg(AggState<'a>),
+}
+
 /// Projects one group's row: a non-aggregate expression is evaluated over
-/// the group's representative row, an aggregate is computed over the
-/// group's records.
+/// the group's representative row; every aggregate `SELECT` item instead
+/// gets its own [`AggState`], and ALL of them are folded together over a
+/// SINGLE pass through `group.rows` — rather than each aggregate rescanning
+/// the group on its own (which is what calling [`compute_aggregate`] once
+/// per item would do). The more aggregates a query projects, the more this
+/// saves.
 fn project_group(group: &Group<'_>, items: &[GroupedSelectItem]) -> Vec<Value> {
-    items
+    let mut projected: Vec<ProjectedItem<'_>> = items
         .iter()
         .map(|item| match item {
-            GroupedSelectItem::Expr(expr) => eval_group_expr(&group.rows, expr),
-            GroupedSelectItem::Agg(agg) => compute_aggregate(agg, &group.rows),
+            GroupedSelectItem::Expr(expr) => ProjectedItem::Expr(expr),
+            GroupedSelectItem::Agg(agg) => ProjectedItem::Agg(AggState::new(agg)),
+        })
+        .collect();
+
+    for record in &group.rows {
+        for item in &mut projected {
+            if let ProjectedItem::Agg(state) = item {
+                state.update(record);
+            }
+        }
+    }
+
+    projected
+        .into_iter()
+        .map(|item| match item {
+            ProjectedItem::Expr(expr) => eval_group_expr(&group.rows, expr),
+            ProjectedItem::Agg(state) => state.finish(),
         })
         .collect()
 }
@@ -712,35 +859,166 @@ fn empty_record() -> Record {
     )
 }
 
-/// Computes one aggregate function's value over a group's rows.
-fn compute_aggregate(agg: &Aggregate, rows: &[&Record]) -> Value {
-    match agg {
-        Aggregate::CountStar => Value::Int(rows.len() as i64),
-        Aggregate::Count(col, false) => Value::Int(non_null_values(rows, col).count() as i64),
-        Aggregate::Count(col, true) => {
-            let distinct: BTreeSet<String> = non_null_values(rows, col)
-                .map(|v| v.to_cmp_string())
-                .collect();
-            Value::Int(distinct.len() as i64)
+/// One aggregate call's running state, updated one row at a time. This is
+/// the single source of truth for every aggregate's NULL-handling and
+/// finalization rule, shared by two callers with different scanning needs:
+/// [`project_group`] builds one `AggState` per `SELECT` aggregate and folds
+/// a group's rows into all of them in one pass, while [`compute_aggregate`]
+/// below folds a group's rows into just one — for `HAVING`
+/// ([`eval_having_leaf`]) and a bare `ORDER BY` aggregate
+/// ([`resolve_group_order_targets`]), which each only ever need a single
+/// aggregate's value.
+enum AggState<'a> {
+    /// `count(*)` — every row counts, `NULL` or not.
+    CountStar(i64),
+    /// `count(col)` — counts only `col`'s non-null values.
+    Count { col: &'a ColRef, count: i64 },
+    /// `count(distinct col)` — the distinct non-null values seen, keyed by
+    /// [`Value::to_cmp_string`] (matching [`Value`] equality for the
+    /// purposes of this count).
+    CountDistinct {
+        col: &'a ColRef,
+        seen: BTreeSet<String>,
+    },
+    /// `sum(col)` — the running total of `col`'s numeric-coercible values;
+    /// `NULL` and non-numeric values are both skipped (mirroring
+    /// [`Value::as_number`], which returns `None` for both), so an
+    /// all-skipped group sums to the identity `0.0`.
+    Sum { col: &'a ColRef, sum: f64 },
+    /// `avg(col)` — the running sum and count of `col`'s numeric-coercible
+    /// values; `finish` divides by `count`, or yields `NULL` if `count` is
+    /// still zero (no numeric values seen).
+    Avg {
+        col: &'a ColRef,
+        sum: f64,
+        count: usize,
+    },
+    /// `min(col)`/`max(col)` — the running extreme of `col`'s non-null
+    /// values via [`compare_values`], starting at `NULL` (no extreme picked
+    /// yet). `want` is the [`Ordering`] that means "this value replaces the
+    /// running extreme" (`Less` for `MIN`, `Greater` for `MAX`).
+    Extreme {
+        col: &'a ColRef,
+        want: Ordering,
+        best: Value,
+    },
+    /// `group_concat(col)` — `col`'s non-null values, `display`-rendered and
+    /// collected in row order; `finish` joins them with `", "`.
+    GroupConcat { col: &'a ColRef, parts: Vec<String> },
+}
+
+impl<'a> AggState<'a> {
+    /// A zeroed/empty accumulator for `agg`, ready to fold in rows one at a
+    /// time via [`AggState::update`].
+    fn new(agg: &'a Aggregate) -> Self {
+        match agg {
+            Aggregate::CountStar => AggState::CountStar(0),
+            Aggregate::Count(col, false) => AggState::Count { col, count: 0 },
+            Aggregate::Count(col, true) => AggState::CountDistinct {
+                col,
+                seen: BTreeSet::new(),
+            },
+            Aggregate::Sum(col) => AggState::Sum { col, sum: 0.0 },
+            Aggregate::Avg(col) => AggState::Avg {
+                col,
+                sum: 0.0,
+                count: 0,
+            },
+            Aggregate::Min(col) => AggState::Extreme {
+                col,
+                want: Ordering::Less,
+                best: Value::Null,
+            },
+            Aggregate::Max(col) => AggState::Extreme {
+                col,
+                want: Ordering::Greater,
+                best: Value::Null,
+            },
+            Aggregate::GroupConcat(col) => AggState::GroupConcat {
+                col,
+                parts: Vec::new(),
+            },
         }
-        Aggregate::Sum(col) => Value::Float(numeric_values(rows, col).sum()),
-        Aggregate::Avg(col) => {
-            let nums: Vec<f64> = numeric_values(rows, col).collect();
-            if nums.is_empty() {
-                Value::Null
-            } else {
-                Value::Float(nums.iter().sum::<f64>() / nums.len() as f64)
+    }
+
+    /// Folds one more row into the running state. Call once per row in the
+    /// group, in row order — order matters for `GROUP_CONCAT`.
+    fn update(&mut self, record: &Record) {
+        match self {
+            AggState::CountStar(count) => *count += 1,
+            AggState::Count { col, count } => {
+                if !resolve_col(record, col).is_null() {
+                    *count += 1;
+                }
+            }
+            AggState::CountDistinct { col, seen } => {
+                let value = resolve_col(record, col);
+                if !value.is_null() {
+                    seen.insert(value.to_cmp_string());
+                }
+            }
+            AggState::Sum { col, sum } => {
+                if let Some(n) = resolve_col(record, col).as_number() {
+                    *sum += n;
+                }
+            }
+            AggState::Avg { col, sum, count } => {
+                if let Some(n) = resolve_col(record, col).as_number() {
+                    *sum += n;
+                    *count += 1;
+                }
+            }
+            AggState::Extreme { col, want, best } => {
+                let value = resolve_col(record, col);
+                if !value.is_null() {
+                    match compare_values(&value, best) {
+                        Some(ord) if ord == *want => *best = value,
+                        Some(_) => {}
+                        // `best` is still `Null` (no extreme picked yet): take `value`.
+                        None => *best = value,
+                    }
+                }
+            }
+            AggState::GroupConcat { col, parts } => {
+                let value = resolve_col(record, col);
+                if !value.is_null() {
+                    parts.push(value.display());
+                }
             }
         }
-        Aggregate::Min(col) => extreme_value(rows, col, Ordering::Less),
-        Aggregate::Max(col) => extreme_value(rows, col, Ordering::Greater),
-        Aggregate::GroupConcat(col) => Value::Str(
-            non_null_values(rows, col)
-                .map(|v| v.display())
-                .collect::<Vec<_>>()
-                .join(", "),
-        ),
     }
+
+    /// The aggregate's final value, once every row in the group has been
+    /// folded in via [`AggState::update`].
+    fn finish(self) -> Value {
+        match self {
+            AggState::CountStar(count) => Value::Int(count),
+            AggState::Count { count, .. } => Value::Int(count),
+            AggState::CountDistinct { seen, .. } => Value::Int(seen.len() as i64),
+            AggState::Sum { sum, .. } => Value::Float(sum),
+            AggState::Avg { sum, count, .. } => {
+                if count == 0 {
+                    Value::Null
+                } else {
+                    Value::Float(sum / count as f64)
+                }
+            }
+            AggState::Extreme { best, .. } => best,
+            AggState::GroupConcat { parts, .. } => Value::Str(parts.join(", ")),
+        }
+    }
+}
+
+/// Computes one aggregate function's value over a group's rows: builds a
+/// single [`AggState`] and folds every row into it. See [`AggState`]'s doc
+/// for why this and [`project_group`] share the same accumulator instead of
+/// each re-implementing per-aggregate NULL handling.
+fn compute_aggregate(agg: &Aggregate, rows: &[&Record]) -> Value {
+    let mut state = AggState::new(agg);
+    for record in rows {
+        state.update(record);
+    }
+    state.finish()
 }
 
 /// Evaluates a `HAVING` predicate tree against one group under SQL
@@ -785,33 +1063,6 @@ fn eval_having_leaf(leaf: &HavingLeaf, group: &Group<'_>, group_by: &[ColRef]) -
     }
 }
 
-/// The non-null values of `col` across `rows`, in row order.
-fn non_null_values<'a>(rows: &'a [&Record], col: &'a ColRef) -> impl Iterator<Item = Value> + 'a {
-    rows.iter()
-        .map(move |record| resolve_col(record, col))
-        .filter(|v| !v.is_null())
-}
-
-/// The numeric-coercible values of `col` across `rows`; `NULL` and
-/// non-numeric values are both skipped (mirroring `Value::as_number`, which
-/// already returns `None` for both).
-fn numeric_values<'a>(rows: &'a [&Record], col: &'a ColRef) -> impl Iterator<Item = f64> + 'a {
-    rows.iter()
-        .filter_map(move |record| resolve_col(record, col).as_number())
-}
-
-/// `MIN`/`MAX` over `col`'s non-null values via [`compare_values`], `Null`
-/// when there are none. `want` is the ordering that means "this value
-/// replaces the running extreme" (`Less` for `MIN`, `Greater` for `MAX`).
-fn extreme_value(rows: &[&Record], col: &ColRef, want: Ordering) -> Value {
-    non_null_values(rows, col).fold(Value::Null, |acc, v| match compare_values(&v, &acc) {
-        Some(ord) if ord == want => v,
-        Some(_) => acc,
-        // `acc` is still `Null` (no extreme picked yet): take `v`.
-        None => v,
-    })
-}
-
 /// An `ORDER BY` target for the grouped path, resolved once against the
 /// projection and the `GROUP BY` keys.
 enum ResolvedGroupOrderTarget {
@@ -825,6 +1076,11 @@ enum ResolvedGroupOrderTarget {
     /// — it need not appear in `SELECT`, mirroring how `HAVING` may
     /// reference an unselected aggregate (see [`HavingLeaf::Agg`]).
     Agg(Aggregate),
+    /// A computed expression (`CASE`, arithmetic, a scalar-fn call, …) built
+    /// entirely from `group_by` columns — the same restriction
+    /// [`validate_grouped_select`] applies to a non-aggregate `SELECT` item,
+    /// since it likewise must reduce to one value per group.
+    Expr(Expr),
 }
 
 /// Resolves each `ORDER BY` key's target for the grouped path: an explicit
@@ -832,7 +1088,10 @@ enum ResolvedGroupOrderTarget {
 /// bare column must be one of `group_by`'s keys — referencing anything else
 /// is as invalid as selecting it, so it's rejected the same way; a bare
 /// aggregate always resolves, since it's computed fresh per group rather
-/// than looked up in the projection or the grouping keys.
+/// than looked up in the projection or the grouping keys; a computed
+/// expression is checked the same way a grouped `SELECT` expression is (see
+/// [`validate_grouped_select`]) — every column it references must be one of
+/// `group_by`'s keys.
 fn resolve_group_order_targets(
     order_by: &[OrderKey],
     headers: &[String],
@@ -853,25 +1112,46 @@ fn resolve_group_order_targets(
                     .map(ResolvedGroupOrderTarget::GroupKey)
                     .ok_or_else(|| ExecError::NonGroupedColumn(col_header(col)))?,
                 OrderTarget::Agg(agg) => ResolvedGroupOrderTarget::Agg(agg.clone()),
+                OrderTarget::Expr(expr) => {
+                    if expr_columns(expr)
+                        .into_iter()
+                        .all(|col| group_by.contains(col))
+                    {
+                        ResolvedGroupOrderTarget::Expr(expr.clone())
+                    } else {
+                        return Err(ExecError::NonGroupedColumn(expr_header(expr)));
+                    }
+                }
             };
             Ok((target, key.desc))
         })
         .collect()
 }
 
-/// Renders a bare `ColRef` the way it would appear as a default `SELECT`
-/// header, for a `NonGroupedColumn` message about an `ORDER BY` column.
-fn col_header(col: &ColRef) -> String {
+/// Renders an arbitrary `Expr` the way it would appear as a default `SELECT`
+/// header, for a `NonGroupedColumn` message about an `ORDER BY` expression
+/// (or, via [`col_header`], a bare `ORDER BY` column).
+fn expr_header(expr: &Expr) -> String {
     SelectItem {
-        expr: SelectExpr::Expr(Expr::Col(col.clone())),
+        expr: SelectExpr::Expr(expr.clone()),
         alias: None,
     }
     .header()
 }
 
+/// Renders a bare `ColRef` the way it would appear as a default `SELECT`
+/// header, for a `NonGroupedColumn` message about an `ORDER BY` column.
+fn col_header(col: &ColRef) -> String {
+    expr_header(&Expr::Col(col.clone()))
+}
+
 /// Reads the sort key's value for one group, given its already-projected
 /// row. An aggregate target is computed fresh from `group.rows` — it need
-/// not be one of `group`'s already-projected `SELECT` cells.
+/// not be one of `group`'s already-projected `SELECT` cells. An expression
+/// target is likewise evaluated fresh, over the group's representative row
+/// (see [`eval_group_expr`]) — [`resolve_group_order_targets`] guarantees it
+/// references only `group_by` columns, so any row in the group yields the
+/// same value.
 fn group_order_key_value(
     target: &ResolvedGroupOrderTarget,
     group: &Group<'_>,
@@ -881,6 +1161,7 @@ fn group_order_key_value(
         ResolvedGroupOrderTarget::Row(idx) => row[*idx].clone(),
         ResolvedGroupOrderTarget::GroupKey(idx) => group.key[*idx].clone(),
         ResolvedGroupOrderTarget::Agg(agg) => compute_aggregate(agg, &group.rows),
+        ResolvedGroupOrderTarget::Expr(expr) => eval_group_expr(&group.rows, expr),
     }
 }
 
@@ -946,10 +1227,18 @@ fn resolve_col(record: &Record, col: &ColRef) -> Value {
 /// pseudo-column resolves via [`resolve_col`], a literal evaluates to its
 /// `Value`, a scalar-function call evaluates its arguments first then
 /// applies [`apply_scalar`], a binary op evaluates both sides then applies
-/// [`apply_binary`], and `COALESCE` evaluates its arguments left to right,
-/// short-circuiting on the first non-null. Used by both the ungrouped
+/// [`apply_binary`], `COALESCE` evaluates its arguments left to right,
+/// short-circuiting on the first non-null, `CASE` picks its first matching
+/// arm (see below), and `Expr::Predicate` evaluates a `WHERE`-style
+/// predicate to a `Value::Bool`/`Value::Null`. Used by both the ungrouped
 /// projection (per row, [`expand_select`]) and the grouped projection (over
 /// a group's representative row, [`eval_group_expr`]).
+///
+/// `CASE` evaluation: the searched form (`operand: None`) returns the first
+/// `WHEN` arm whose condition is truthy (via [`is_truthy`]); the simple form
+/// (`operand: Some`) returns the first arm whose value equals the operand
+/// (via [`eval_compare`], the same equality `IN`/`MEMBER OF` use). Neither
+/// matching falls through to `else_expr`, or `Value::Null` with no `ELSE`.
 pub(crate) fn eval_expr(record: &Record, expr: &Expr) -> Value {
     match expr {
         Expr::Col(col) => resolve_col(record, col),
@@ -968,7 +1257,43 @@ pub(crate) fn eval_expr(record: &Record, expr: &Expr) -> Value {
             .map(|arg| eval_expr(record, arg))
             .find(|v| !v.is_null())
             .unwrap_or(Value::Null),
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+        } => {
+            match operand {
+                None => {
+                    for (cond, then) in whens {
+                        if is_truthy(&eval_expr(record, cond)) {
+                            return eval_expr(record, then);
+                        }
+                    }
+                }
+                Some(op) => {
+                    let target = eval_expr(record, op);
+                    for (val, then) in whens {
+                        let candidate = eval_expr(record, val);
+                        if eval_compare(&target, &CmpOp::Eq, &candidate) == Some(true) {
+                            return eval_expr(record, then);
+                        }
+                    }
+                }
+            }
+            else_expr
+                .as_deref()
+                .map_or(Value::Null, |e| eval_expr(record, e))
+        }
+        Expr::Predicate(pred) => eval_predicate(record, pred).map_or(Value::Null, Value::Bool),
     }
+}
+
+/// Whether `v` counts as a `CASE WHEN` condition being satisfied: only
+/// `Value::Bool(true)` is truthy — `Value::Null` (the 3VL-unknown result an
+/// `Expr::Predicate` condition can produce) and any other value are not,
+/// mirroring [`filter_records`]'s "only `Some(true)` keeps a row" rule.
+fn is_truthy(v: &Value) -> bool {
+    matches!(v, Value::Bool(true))
 }
 
 /// Converts a literal constant to the `Value` it evaluates to.
@@ -1257,6 +1582,9 @@ enum ResolvedOrderTarget {
     AliasIndex(usize),
     /// A fresh column lookup on the source record.
     Col(ColRef),
+    /// A computed expression (arithmetic, `CASE`, a scalar-fn call, …),
+    /// evaluated fresh per row via [`eval_expr`].
+    Expr(Expr),
 }
 
 /// Resolves each `ORDER BY` key's target once, up front, returning the
@@ -1282,6 +1610,7 @@ fn resolve_order_targets(
                 }
                 OrderTarget::Col(col) => ResolvedOrderTarget::Col(col.clone()),
                 OrderTarget::Agg(_) => return Err(ExecError::AggregateOrderWithoutGroupBy),
+                OrderTarget::Expr(expr) => ResolvedOrderTarget::Expr(expr.clone()),
             };
             Ok((target, key.desc))
         })
@@ -1294,6 +1623,7 @@ fn order_key_value(target: &ResolvedOrderTarget, record: &Record, row: &[Value])
     match target {
         ResolvedOrderTarget::AliasIndex(idx) => row[*idx].clone(),
         ResolvedOrderTarget::Col(col) => resolve_col(record, col),
+        ResolvedOrderTarget::Expr(expr) => eval_expr(record, expr),
     }
 }
 
@@ -1637,6 +1967,70 @@ mod tests {
     }
 
     #[test]
+    fn searched_case_selects_first_true_branch() {
+        let rows = [
+            rec("s", "s/a.md", &[("status", Value::Str("draft".into()))]),
+            rec("s", "s/b.md", &[("status", Value::Str("done".into()))]),
+        ];
+        let q = parse("SELECT CASE WHEN status = 'draft' THEN 'D' ELSE 'X' END").unwrap();
+        assert_eq!(
+            execute(&q, rows.iter(), false).unwrap().rows,
+            vec![vec![Value::Str("D".into())], vec![Value::Str("X".into())]]
+        );
+    }
+
+    #[test]
+    fn simple_case_matches_operand() {
+        let rows = [
+            rec("s", "s/a.md", &[("status", Value::Str("done".into()))]),
+            rec("s", "s/b.md", &[("status", Value::Str("other".into()))]),
+        ];
+        let q = parse("SELECT CASE status WHEN 'draft' THEN 'D' WHEN 'done' THEN 'Z' END").unwrap();
+        assert_eq!(
+            execute(&q, rows.iter(), false).unwrap().rows,
+            // "done" matches the second WHEN; "other" matches no WHEN and
+            // there's no ELSE, so it falls back to `Value::Null`.
+            vec![vec![Value::Str("Z".into())], vec![Value::Null]]
+        );
+    }
+
+    #[test]
+    fn case_usable_in_where_and_order_by() {
+        let rows = [
+            rec("s", "s/b.md", &[("status", Value::Str("synced".into()))]),
+            rec("s", "s/a.md", &[("status", Value::Str("draft".into()))]),
+            rec("s", "s/c.md", &[("status", Value::Str("synced".into()))]),
+        ];
+
+        // `WHERE (CASE WHEN status = 'draft' THEN 1 ELSE 0 END) = 1` keeps
+        // only the draft row — proves a searched CASE evaluates as a
+        // comparison operand inside a WHERE predicate.
+        let where_q =
+            parse("SELECT file.name WHERE (CASE WHEN status = 'draft' THEN 1 ELSE 0 END) = 1")
+                .unwrap();
+        let t = execute(&where_q, rows.iter(), false).unwrap();
+        assert_eq!(t.rows, vec![vec![Value::Str("a.md".into())]]);
+
+        // `ORDER BY CASE WHEN status = 'draft' THEN 0 ELSE 1 END` puts
+        // drafts first even though "a.md" is neither first in scan order
+        // nor first alphabetically — proves the `ORDER BY <expr>` path.
+        // `file.name` is a tiebreaker, pinning multi-key ORDER BY semantics.
+        let order_q = parse(
+            "SELECT file.name ORDER BY CASE WHEN status = 'draft' THEN 0 ELSE 1 END, file.name",
+        )
+        .unwrap();
+        let t = execute(&order_q, rows.iter(), false).unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec![Value::Str("a.md".into())],
+                vec![Value::Str("b.md".into())],
+                vec![Value::Str("c.md".into())],
+            ]
+        );
+    }
+
+    #[test]
     fn filter_and_project_with_alias() {
         let q = parse("SELECT status AS S, file.name WHERE prd = '010'").unwrap();
         let t = execute(&q, recs().iter(), false).unwrap();
@@ -1652,6 +2046,77 @@ mod tests {
         let q = parse("SELECT status WHERE prd = '010' ORDER BY status DESC LIMIT 1").unwrap();
         let t = execute(&q, recs().iter(), false).unwrap();
         assert_eq!(t.rows, vec![vec![Value::Str("synced".into())]]);
+    }
+    #[test]
+    fn order_by_limit_preserves_tie_input_order_like_full_sort() {
+        // Five rows share the same `status` key, so a full stable sort
+        // leaves ORDER BY status LIMIT 3 with the first 3 rows in *input*
+        // (scan) order. A non-stable top-k (e.g. an unstable binary-heap
+        // selection with no tiebreaker) would be free to return any 3 of
+        // the 5 equal-key rows in any order — this is the load-bearing pin
+        // that the bounded top-k must match a stable full sort exactly.
+        let rows = [
+            rec("s", "s/a.md", &[("status", Value::Str("x".into()))]),
+            rec("s", "s/b.md", &[("status", Value::Str("x".into()))]),
+            rec("s", "s/c.md", &[("status", Value::Str("x".into()))]),
+            rec("s", "s/d.md", &[("status", Value::Str("x".into()))]),
+            rec("s", "s/e.md", &[("status", Value::Str("x".into()))]),
+        ];
+        let q = parse("SELECT file.name ORDER BY status LIMIT 3").unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec![Value::Str("a.md".into())],
+                vec![Value::Str("b.md".into())],
+                vec![Value::Str("c.md".into())],
+            ]
+        );
+    }
+    #[test]
+    fn order_by_limit_offset_window_matches_full_sort() {
+        // n: a=5, b=3, c=4, d=1, e=2. A full stable sort by n DESC is
+        // a(5), c(4), b(3), e(2), d(1); .skip(2).take(3) is b, e, d — the
+        // bounded top-k (which only ever materializes offset + limit rows)
+        // must land on the exact same window.
+        let rows = [
+            rec("s", "s/a.md", &[("n", Value::Int(5))]),
+            rec("s", "s/b.md", &[("n", Value::Int(3))]),
+            rec("s", "s/c.md", &[("n", Value::Int(4))]),
+            rec("s", "s/d.md", &[("n", Value::Int(1))]),
+            rec("s", "s/e.md", &[("n", Value::Int(2))]),
+        ];
+        let q = parse("SELECT file.name ORDER BY n DESC LIMIT 3 OFFSET 2").unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec![Value::Str("b.md".into())],
+                vec![Value::Str("e.md".into())],
+                vec![Value::Str("d.md".into())],
+            ]
+        );
+    }
+    #[test]
+    fn order_by_limit_zero_returns_no_rows() {
+        let q = parse("SELECT status ORDER BY status LIMIT 0").unwrap();
+        let t = execute(&q, recs().iter(), false).unwrap();
+        assert!(t.rows.is_empty());
+    }
+    #[test]
+    fn order_by_limit_exceeds_row_count_returns_all_rows_in_order() {
+        // `recs()` has only 3 rows; LIMIT 100 must behave exactly like no
+        // LIMIT at all rather than panicking or truncating oddly.
+        let q = parse("SELECT status ORDER BY status LIMIT 100").unwrap();
+        let t = execute(&q, recs().iter(), false).unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec![Value::Str("draft".into())],
+                vec![Value::Str("synced".into())],
+                vec![Value::Str("synced".into())],
+            ]
+        );
     }
     #[test]
     fn distinct_dedups_projection() {
@@ -2134,6 +2599,27 @@ mod tests {
     }
 
     #[test]
+    fn unknown_column_inside_case_arm_is_caught_strict_and_nulled_lenient() {
+        // Validation must walk into a CASE arm's condition too, proving
+        // `Query::referenced_fields`/`expr_columns` descend into
+        // `Expr::Case` the same as they do a scalar-fn argument (see
+        // `typo_inside_scalar_and_having_is_caught` above).
+        let q = parse("SELECT CASE WHEN bogus_col = 'x' THEN 1 END").unwrap();
+        assert!(matches!(
+            execute(&q, recs().iter(), false),
+            Err(ExecError::UnknownColumn { .. })
+        ));
+
+        // Under `--lenient`, validation is skipped entirely: `bogus_col`
+        // resolves to `Value::Null` at every row, no WHEN arm's condition is
+        // ever truthy, and (with no ELSE) the whole CASE evaluates to
+        // `Value::Null`.
+        let all = recs();
+        let t = execute(&q, all.iter(), true).unwrap();
+        assert_eq!(t.rows, vec![vec![Value::Null]; all.len()]);
+    }
+
+    #[test]
     fn dotted_path_select_and_filter_reads_nested_map() {
         // End-to-end wiring check: parse's `ColRef::Field(path)` lowering,
         // schema validation's top-level-only check, `resolve_col`, and
@@ -2380,6 +2866,70 @@ mod tests {
     }
 
     #[test]
+    fn relative_date_rewrite_recurses_into_case_arm() {
+        // Regression, mirroring `relative_date_resolves_inside_coalesce_argument`
+        // above: `rewrite_expr_literals` must recurse into `Expr::Case`'s
+        // WHEN/THEN arms (and its ELSE), not just `Coalesce`/`Scalar`/
+        // `Binary`. Pinned directly against the rewritten AST rather than
+        // through execution — the arm's literal must become a resolved
+        // `Literal::Str`, never survive the rewrite as a
+        // `Literal::RelativeDate` (which would panic in `literal_value` once
+        // evaluation reached it).
+        let mut q = parse("SELECT CASE WHEN status = 'draft' THEN '-7d' ELSE 'none' END").unwrap();
+        rewrite_relative_dates(&mut q, fixed_now());
+
+        let SelectExpr::Expr(Expr::Case { whens, .. }) = &q.select[0].expr else {
+            panic!("expected the SELECT item to lower to a CASE expression");
+        };
+        let [(_, then)] = whens.as_slice() else {
+            panic!("expected exactly one WHEN arm");
+        };
+        assert_eq!(then, &Expr::Lit(Literal::Str("2026-07-17".into())));
+    }
+
+    #[test]
+    fn relative_date_resolves_inside_order_by_case_arm() {
+        // Regression: `rewrite_relative_dates` must also walk
+        // `OrderTarget::Expr` — without that, a relative-date literal
+        // nested inside an `ORDER BY CASE ...` condition would never be
+        // visited by the rewrite at all (only `SELECT`/`WHERE`/`HAVING`
+        // were walked before this task) and would reach `literal_value` as
+        // an unresolved `Literal::RelativeDate`, panicking via its
+        // `unreachable!()`.
+        let now = fixed_now();
+        let recent = rec(
+            "s",
+            "s/a.md",
+            &[("created", Value::Str("2026-07-20".into()))],
+        );
+        let old = rec(
+            "s",
+            "s/b.md",
+            &[("created", Value::Str("2026-06-01".into()))],
+        );
+        let q = parse(
+            "SELECT file.name ORDER BY CASE WHEN created >= '-7d' THEN 0 ELSE 1 END, file.name",
+        )
+        .unwrap();
+        // Must not panic; the recent row must sort first.
+        let t = execute_with_schema_at(
+            &q,
+            [&old, &recent].into_iter(),
+            &["created".to_string()],
+            false,
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec![Value::Str("a.md".into())],
+                vec![Value::Str("b.md".into())],
+            ]
+        );
+    }
+
+    #[test]
     fn extreme_offset_magnitude_falls_back_to_str_and_does_not_panic() {
         // Each of these is malformed/out-of-bound enough that
         // `RelDate::parse` must reject it, so it stays a plain
@@ -2560,6 +3110,69 @@ mod agg_tests {
         ));
     }
     #[test]
+    fn grouped_select_case_over_grouping_key() {
+        // `CASE WHEN status = ... END` is valid because it references only
+        // `status` (a GROUP BY key); evaluated over each group's
+        // representative row, mirroring `grouped_select_expr_over_grouping_key`
+        // for `lower(...)` and `grouped_coalesce_over_grouping_key` for
+        // `COALESCE(...)` — the grouped-CASE interaction Task 9's reviewer
+        // flagged as wired but untested.
+        let q = parse(
+            "SELECT CASE WHEN status = 'draft' THEN 'D' ELSE 'S' END AS c, count(*) AS n \
+             GROUP BY status ORDER BY status",
+        )
+        .unwrap();
+        let t = execute(&q, recs().iter(), false).unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec![Value::Str("D".into()), Value::Int(1)],
+                vec![Value::Str("S".into()), Value::Int(2)],
+            ]
+        );
+    }
+    #[test]
+    fn grouped_select_case_referencing_non_group_key_errors() {
+        // `prd` isn't a GROUP BY key; referencing it inside a CASE arm must
+        // still be rejected — validation walks into CASE conditions/results
+        // the same as any other nested expression (`expr_columns`'s `Case`
+        // arm), mirroring `grouped_coalesce_referencing_non_group_key_errors`.
+        let q = parse("SELECT CASE WHEN prd = '010' THEN 1 ELSE 0 END, count(*) GROUP BY status")
+            .unwrap();
+        assert!(matches!(
+            execute(&q, recs().iter(), false),
+            Err(ExecError::NonGroupedColumn(_))
+        ));
+    }
+    #[test]
+    fn grouped_order_by_case_puts_target_group_first() {
+        // Alphabetically "approved" sorts before "draft", so the
+        // deterministic pre-`ORDER BY` group sort (`compare_key_tuple`)
+        // would put "approved" first; `ORDER BY CASE WHEN status = 'draft'
+        // THEN 0 ELSE 1 END` must override that and put "draft" first
+        // instead — proving the grouped path resolves `OrderTarget::Expr`
+        // (via `eval_group_expr`) rather than silently falling back to the
+        // pre-sort's alphabetical order.
+        let rows = [
+            rec("s/a.md", "approved", "010"),
+            rec("s/b.md", "draft", "010"),
+            rec("s/c.md", "draft", "011"),
+        ];
+        let q = parse(
+            "SELECT status, count(*) AS n GROUP BY status \
+             ORDER BY CASE WHEN status = 'draft' THEN 0 ELSE 1 END",
+        )
+        .unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec![Value::Str("draft".into()), Value::Int(2)],
+                vec![Value::Str("approved".into()), Value::Int(1)],
+            ]
+        );
+    }
+    #[test]
     fn grouped_literal_expr_survives_zero_row_aggregate_bucket() {
         // A columnless computed expression must still evaluate correctly
         // even when the implicit single group (empty GROUP BY) has zero
@@ -2635,6 +3248,51 @@ mod agg_tests {
         let q = parse("SELECT count(*) AS rows, count(n) AS non_null").unwrap();
         let t = execute(&q, rows.iter(), false).unwrap();
         assert_eq!(t.rows, vec![vec![Value::Int(3), Value::Int(2)]]);
+    }
+    #[test]
+    fn multiple_aggregates_per_group_match_single_pass() {
+        // Characterization test for the single-pass `project_group`
+        // refactor (Task 11/W40): projects five aggregates over the SAME
+        // column, across two groups, with a `NULL` in each group's `n`
+        // column — so COUNT(*)'s row count, SUM/AVG's numeric-only count,
+        // and MIN/MAX's non-null skipping are all exercised at once. Pins
+        // the exact per-group values; must stay green whether each
+        // aggregate rescans the group (today) or all five are folded from
+        // one pass over the group's rows (after the refactor).
+        let rows = [
+            rec_n("s/a.md", "draft", Value::Int(2)),
+            rec_n("s/b.md", "draft", Value::Int(4)),
+            rec_n("s/c.md", "draft", Value::Null),
+            rec_n("s/d.md", "synced", Value::Int(10)),
+            rec_n("s/e.md", "synced", Value::Null),
+        ];
+        let q = parse(
+            "SELECT status, count(*) AS c, sum(n) AS s, avg(n) AS a, min(n) AS mn, max(n) AS mx \
+             GROUP BY status ORDER BY status",
+        )
+        .unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec![
+                    Value::Str("draft".into()),
+                    Value::Int(3),
+                    Value::Float(6.0),
+                    Value::Float(3.0),
+                    Value::Int(2),
+                    Value::Int(4),
+                ],
+                vec![
+                    Value::Str("synced".into()),
+                    Value::Int(2),
+                    Value::Float(10.0),
+                    Value::Float(10.0),
+                    Value::Int(10),
+                    Value::Int(10),
+                ],
+            ]
+        );
     }
     #[test]
     fn order_by_ungrouped_column_errors() {
@@ -2772,6 +3430,58 @@ mod agg_tests {
         .unwrap();
         let t = execute(&q, rows.iter(), false).unwrap();
         assert_eq!(t.rows, vec![vec![Value::Str("x".into()), Value::Int(2)]]);
+    }
+    #[test]
+    fn grouped_order_by_limit_preserves_tie_input_order_like_full_sort() {
+        // Five single-row groups with status a..e (scanned out of order).
+        // GROUP BY pre-sorts groups by key tuple (alphabetically) before
+        // ORDER BY runs, and every group ties on count(*) == 1, so a full
+        // stable sort by count(*) DESC leaves that alphabetical order
+        // untouched — LIMIT 3 must return a, b, c, matching the ungrouped
+        // tie-stability pin above.
+        let rows = [
+            rec("s/c.md", "c", "010"),
+            rec("s/a.md", "a", "010"),
+            rec("s/e.md", "e", "010"),
+            rec("s/b.md", "b", "010"),
+            rec("s/d.md", "d", "010"),
+        ];
+        let q =
+            parse("SELECT status, count(*) AS n GROUP BY status ORDER BY count(*) DESC LIMIT 3")
+                .unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec![Value::Str("a".into()), Value::Int(1)],
+                vec![Value::Str("b".into()), Value::Int(1)],
+                vec![Value::Str("c".into()), Value::Int(1)],
+            ]
+        );
+    }
+    #[test]
+    fn grouped_order_by_limit_offset_window_matches_full_sort() {
+        // Same five tied groups as above; LIMIT 2 OFFSET 1 must equal
+        // full-sort(a, b, c, d, e).skip(1).take(2) = b, c.
+        let rows = [
+            rec("s/c.md", "c", "010"),
+            rec("s/a.md", "a", "010"),
+            rec("s/e.md", "e", "010"),
+            rec("s/b.md", "b", "010"),
+            rec("s/d.md", "d", "010"),
+        ];
+        let q = parse(
+            "SELECT status, count(*) AS n GROUP BY status ORDER BY count(*) DESC LIMIT 2 OFFSET 1",
+        )
+        .unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec![Value::Str("b".into()), Value::Int(1)],
+                vec![Value::Str("c".into()), Value::Int(1)],
+            ]
+        );
     }
     #[test]
     fn group_by_key_does_not_collide_ambiguous_concatenations() {

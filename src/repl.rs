@@ -11,6 +11,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use directories::ProjectDirs;
@@ -61,6 +62,8 @@ const DOT_COMMAND_NAMES: &[&str] = &[
     ".describe",
     ".format",
     ".style",
+    ".header",
+    ".timer",
     ".output",
     ".settings",
     ".set",
@@ -104,9 +107,17 @@ pub enum DotCommand {
     Format(Option<Format>),
     /// `.style [style]` — set (`Some`) or report (`None`) the table style.
     Style(Option<TableStyle>),
-    /// `.output [path]` — redirect subsequent statement results to `path`
-    /// (`Some`), or reset to stdout (`None`, from a bare `.output` or an
-    /// explicit `.output stdout`).
+    /// `.header [on|off]` — set (`Some`) or report (`None`) whether results
+    /// include a header row.
+    Header(Option<bool>),
+    /// `.timer [on|off]` — set (`Some`) or report (`None`) whether the
+    /// `-- N rows` line includes the query's elapsed time.
+    Timer(Option<bool>),
+    /// `.output [path]` or `.output |cmd` — redirect subsequent statement
+    /// results to `path`, or pipe them through a shell command when the
+    /// argument starts with `|` (the sqlite3 convention, e.g.
+    /// `.output |less`); both cases carried as `Some`. Reset to stdout
+    /// (`None`) from a bare `.output` or an explicit `.output stdout`.
     Output(Option<String>),
     /// `.reload` — rescan every tracked directory (in-memory only; never
     /// touches a `.querymatter` cache).
@@ -118,8 +129,10 @@ pub enum DotCommand {
     /// `.refresh-all` — force a re-scan of the whole vault, persisting the
     /// update; an explicit alias for `.refresh` with no path.
     RefreshAll,
-    /// `.query run <name>` / `.query list` — run or list saved queries (see
-    /// [`crate::queries`]). Authoring is CLI-only: `querymatter query save`.
+    /// `.query run <name>` / `.query list` / `.query save <name> [sql]` —
+    /// run, list, or save saved queries (see [`crate::queries`]). `.query
+    /// save` with `sql` omitted defaults to the last successfully-run
+    /// statement of this session.
     Query(QueryCmd),
     /// `.query <word>` where `<word>` is neither `run` nor `list`, carrying
     /// the offending word so the error can name it rather than the command.
@@ -155,6 +168,10 @@ pub enum QueryCmd {
     Run(String),
     /// `.query list` — list every saved query's name and SQL.
     List,
+    /// `.query save <name> [sql]` — persist `sql` under `name` (see
+    /// [`crate::queries`]), or, when omitted (`None`), the last
+    /// successfully-run statement of this session.
+    Save(String, Option<String>),
 }
 
 /// Accumulates raw input lines into complete SQL statements, splitting on a
@@ -270,10 +287,22 @@ pub fn parse_dot(line: &str) -> DotCommand {
                 Err(_) => DotCommand::BadStyle(arg.to_string()),
             },
         },
-        "output" => match words.next() {
+        "header" => match parse_on_off(words.next()) {
+            Some(value) => DotCommand::Header(value),
+            None => DotCommand::Unknown(line.to_string()),
+        },
+        "timer" => match parse_on_off(words.next()) {
+            Some(value) => DotCommand::Timer(value),
+            None => DotCommand::Unknown(line.to_string()),
+        },
+        // Verbatim (not `words.next()`) so `.output |column -t -s,` or
+        // `.output |grep x | wc -l` survive with their internal spaces intact
+        // — a whitespace split would truncate the piped command at its first
+        // argument.
+        "output" => match rest_after_key(rest, 1) {
             None => DotCommand::Output(None),
             Some(arg) if arg.eq_ignore_ascii_case("stdout") => DotCommand::Output(None),
-            Some(arg) => DotCommand::Output(Some(arg.to_string())),
+            Some(arg) => DotCommand::Output(Some(arg)),
         },
         "settings" => DotCommand::Settings,
         "set" => match (words.next(), rest_after_key(rest, 2)) {
@@ -298,10 +327,35 @@ pub fn parse_dot(line: &str) -> DotCommand {
                 Some(name) => DotCommand::Query(QueryCmd::Run(name.to_string())),
                 None => DotCommand::MissingArg("query"),
             },
+            Some(action) if action.eq_ignore_ascii_case("save") => match words.next() {
+                Some(name) => {
+                    // SQL is everything after `query save <name>`, taken
+                    // verbatim (may be absent) — like `.set`'s value capture,
+                    // so a multi-word/multi-clause SQL survives untouched.
+                    let sql = rest_after_key(rest, 3);
+                    DotCommand::Query(QueryCmd::Save(name.to_string(), sql))
+                }
+                None => DotCommand::MissingArg("query"),
+            },
             Some(action) => DotCommand::BadQueryAction(action.to_string()),
             None => DotCommand::MissingArg("query"),
         },
         _ => unreachable!("cmd already checked against DOT_COMMAND_NAMES above"),
+    }
+}
+
+/// Parses an optional `on`/`off` argument (case-insensitive), shared by every
+/// dot-command that toggles a boolean setting — `.header` and `.timer`. The
+/// outer `Option` is `None` for an unrecognized argument
+/// (any word but `on`/`off`), which the caller maps to an error; the inner
+/// `Option` is `None` for a bare command with no argument at all, meaning
+/// "report the current state" rather than change it.
+fn parse_on_off(arg: Option<&str>) -> Option<Option<bool>> {
+    match arg {
+        None => Some(None),
+        Some(a) if a.eq_ignore_ascii_case("on") => Some(Some(true)),
+        Some(a) if a.eq_ignore_ascii_case("off") => Some(Some(false)),
+        Some(_) => None,
     }
 }
 
@@ -312,8 +366,9 @@ fn parse_key(name: &str) -> Option<ConfigKey> {
 }
 
 /// Everything after the first `skip` whitespace-separated words of `rest`,
-/// trimmed — the value of a `.set`, taken verbatim so globs and commas
-/// survive. `None` when there are fewer than `skip + 1` words.
+/// trimmed — the value of a `.set` (or a `.output` target), taken verbatim so
+/// globs, commas, and piped-command arguments survive. `None` when there are
+/// fewer than `skip + 1` words.
 fn rest_after_key(rest: &str, skip: usize) -> Option<String> {
     let mut remainder = rest.trim_start();
     for _ in 0..skip {
@@ -356,6 +411,9 @@ pub fn run(mut session: Session) -> anyhow::Result<()> {
 
     let mut buffer = LineBuffer::new();
     let mut sink = OutputSink::Stdout;
+    // The last successfully-run statement's SQL this session — `.query save`
+    // with no inline SQL defaults to it (W46).
+    let mut last_sql: Option<String> = None;
     loop {
         let prompt = if buffer.is_pending() {
             CONTINUATION_PROMPT
@@ -382,9 +440,12 @@ pub fn run(mut session: Session) -> anyhow::Result<()> {
 
         match resolved {
             Line::Blank | Line::More => {}
-            Line::Statement(statement) => run_statement(&session, &statement, &mut sink),
+            Line::Statement(statement) => {
+                run_statement(&session, &statement, &mut sink);
+                last_sql = Some(statement.sql.clone());
+            }
             Line::Dot(cmd, _) => {
-                if dispatch_dot(cmd, &mut session, &mut sink) {
+                if dispatch_dot(cmd, &mut session, &mut sink, last_sql.as_deref()) {
                     break;
                 }
             }
@@ -399,6 +460,11 @@ pub fn run(mut session: Session) -> anyhow::Result<()> {
             path.display()
         );
     }
+    // Reap a piped command still running when the session ends (`.quit`/EOF)
+    // so its process doesn't outlive the REPL with a dangling stdin.
+    if let Err(err) = sink.finish() {
+        eprintln!("querymatter: error finishing output: {err}");
+    }
     Ok(())
 }
 
@@ -408,12 +474,14 @@ pub fn run(mut session: Session) -> anyhow::Result<()> {
 /// [`dispatch_query`] (each statement inside a `.query run <name>`'s saved
 /// SQL), so both paths format results identically.
 fn run_statement(session: &Session, statement: &Statement, sink: &mut OutputSink) {
+    let start = Instant::now();
     match session.render_statement_counted(statement) {
         Ok((rendered, count)) => {
             if let Err(err) = sink.write_block(&rendered) {
                 eprintln!("querymatter: failed to write results: {err}");
             }
-            eprintln!("{}", row_count_line(count));
+            let elapsed = session.timer().then(|| start.elapsed());
+            eprintln!("{}", row_count_line(count, elapsed));
         }
         Err(err) => eprintln!("querymatter: {err:#}"),
     }
@@ -422,9 +490,16 @@ fn run_statement(session: &Session, statement: &Statement, sink: &mut OutputSink
 /// The `-- N rows` line printed to stderr after a REPL statement's result,
 /// distinguishing a genuinely empty result from a mistake (REPL-only; batch
 /// and `-e` mode never print this). Pulled out as a pure function so the
-/// singular/plural wording is unit-tested without a TTY.
-fn row_count_line(n: usize) -> String {
-    format!("-- {n} row{}", if n == 1 { "" } else { "s" })
+/// singular/plural wording is unit-tested without a TTY. `elapsed` is
+/// `Some` only when `.timer` is on, in which case the query's wall-clock
+/// time is appended in seconds to 3 decimal places; `None` reproduces
+/// exactly the untimed line.
+fn row_count_line(n: usize, elapsed: Option<Duration>) -> String {
+    let plural = if n == 1 { "" } else { "s" };
+    match elapsed {
+        Some(d) => format!("-- {n} row{plural} ({:.3}s)", d.as_secs_f64()),
+        None => format!("-- {n} row{plural}"),
+    }
 }
 
 /// The startup banner [`run`] prints to stdout on entering the REPL: the
@@ -468,16 +543,25 @@ fn history_entry(line: &Line) -> Option<String> {
 /// and returning `true` when the REPL should exit (`.quit`/`.exit`).
 ///
 /// stdout/stderr policy: reference/inspection output (`.help`, `.schema`,
-/// `.settings`, `.query list`, and `.format`'s/`.style`'s reports of the
-/// current format/style) goes to stdout; the `.reload`/`.refresh`/
-/// `.refresh-all` reports, `.set`/`.unset` confirmations, `.output`'s
-/// confirmation, and all error messages (unknown command, bad format, bad
-/// style, bad key, missing argument, unknown saved-query name) go to stderr,
-/// keeping stdout clean for piping. `.query run <name>`'s query results
-/// follow a typed statement's own policy instead — the rendered result goes
-/// wherever `sink` points, and the `-- N rows` line stays on stderr (see
-/// [`run_statement`]).
-fn dispatch_dot(cmd: DotCommand, session: &mut Session, sink: &mut OutputSink) -> bool {
+/// `.settings`, `.query list`, and `.format`'s/`.style`'s/`.header`'s/
+/// `.timer`'s reports of the current format/style/header/timer setting) goes
+/// to stdout; the `.reload`/`.refresh`/`.refresh-all` reports, `.set`/`.unset`
+/// confirmations, `.output`'s confirmation, `.query save`'s confirmation, and
+/// all error messages (unknown command, bad format, bad style, bad key,
+/// missing argument, unknown saved-query name) go to stderr, keeping stdout
+/// clean for piping. `.query run <name>`'s query results follow a typed
+/// statement's own policy instead — the rendered result goes wherever `sink`
+/// points, and the `-- N rows` line stays on stderr (see [`run_statement`]).
+///
+/// `last_sql` is the last successfully-run statement's SQL this session (see
+/// [`run`]'s `last_sql` local), threaded through purely so `.query save` with
+/// no inline SQL can fall back to it.
+fn dispatch_dot(
+    cmd: DotCommand,
+    session: &mut Session,
+    sink: &mut OutputSink,
+    last_sql: Option<&str>,
+) -> bool {
     match cmd {
         DotCommand::Help => print_help(),
         DotCommand::Schema => print_schema(session),
@@ -486,11 +570,19 @@ fn dispatch_dot(cmd: DotCommand, session: &mut Session, sink: &mut OutputSink) -
         DotCommand::Format(None) => println!("format: {}", format_name(session.format())),
         DotCommand::Style(Some(style)) => session.set_style(style),
         DotCommand::Style(None) => println!("style: {}", style_name(session.style())),
+        DotCommand::Header(Some(on)) => session.set_header(on),
+        DotCommand::Header(None) => {
+            println!("header: {}", if session.header() { "on" } else { "off" });
+        }
+        DotCommand::Timer(Some(on)) => session.set_timer(on),
+        DotCommand::Timer(None) => {
+            println!("timer: {}", if session.timer() { "on" } else { "off" });
+        }
         DotCommand::Output(target) => apply_output(sink, target),
         DotCommand::Reload => report_reload(session),
         DotCommand::Refresh(path) => report_refresh(session, path.as_deref().map(Path::new)),
         DotCommand::RefreshAll => report_refresh(session, None),
-        DotCommand::Query(query_cmd) => dispatch_query(query_cmd, session, sink),
+        DotCommand::Query(query_cmd) => dispatch_query(query_cmd, session, sink, last_sql),
         DotCommand::Quit => return true,
         DotCommand::BadFormat(name) => {
             eprintln!("querymatter: unknown format '{name}' (try: table, json, csv, tsv, md)");
@@ -499,7 +591,10 @@ fn dispatch_dot(cmd: DotCommand, session: &mut Session, sink: &mut OutputSink) -
             eprintln!("querymatter: unknown style '{name}' (try: ascii, unicode, compact, plain)");
         }
         DotCommand::BadQueryAction(name) => {
-            eprintln!("querymatter: unknown '.query {name}' (try: .query run <name>, .query list)");
+            eprintln!(
+                "querymatter: unknown '.query {name}' (try: .query run <name>, .query list, \
+                 .query save <name> [sql])"
+            );
         }
         DotCommand::Settings => println!("{}", session.settings().rows()),
         DotCommand::Set(key, value) => report_set(session.persist_set(key, &value), key),
@@ -517,7 +612,9 @@ fn dispatch_dot(cmd: DotCommand, session: &mut Session, sink: &mut OutputSink) -
         DotCommand::MissingArg(cmd) => match cmd {
             "set" => eprintln!("querymatter: usage: .set <key> <value>"),
             "unset" => eprintln!("querymatter: usage: .unset <key>"),
-            "query" => eprintln!("querymatter: usage: .query run <name> | .query list"),
+            "query" => eprintln!(
+                "querymatter: usage: .query run <name> | .query list | .query save <name> [sql]"
+            ),
             _ => unreachable!("every MissingArg cmd name is handled above"),
         },
         DotCommand::Unknown(raw) => {
@@ -527,14 +624,54 @@ fn dispatch_dot(cmd: DotCommand, session: &mut Session, sink: &mut OutputSink) -
     false
 }
 
-/// Runs a `.query` dot-command: loads `queries.toml` via [`queries::load`]
-/// and delegates the resolve-and-run decision to [`run_query_cmd`]. A
-/// malformed `queries.toml` is reported on stderr, not a panic.
-fn dispatch_query(cmd: QueryCmd, session: &Session, sink: &mut OutputSink) {
+/// Runs a `.query` dot-command.
+///
+/// `.query save` is dispatched straight to [`dispatch_query_save`] — it
+/// writes `queries.toml` itself (via [`crate::save_named_query`]) rather than
+/// reading the snapshot this function loads for `.query list`/`.query run`,
+/// so there's no point loading it twice. Those two load `queries.toml` via
+/// [`queries::load`] and delegate the resolve-and-run decision to
+/// [`run_query_cmd`]; a malformed `queries.toml` is reported on stderr, not a
+/// panic.
+fn dispatch_query(cmd: QueryCmd, session: &Session, sink: &mut OutputSink, last_sql: Option<&str>) {
+    if let QueryCmd::Save(name, sql) = cmd {
+        dispatch_query_save(&name, sql, last_sql);
+        return;
+    }
     match queries::load() {
         Ok(saved) => run_query_cmd(cmd, &saved, session, sink),
         Err(err) => eprintln!("querymatter: {err:#}"),
     }
+}
+
+/// `.query save <name> [sql]`'s dispatch: resolves the SQL to persist via
+/// [`resolve_save_sql`] — the inline `sql` when given, else `last_sql` (the
+/// last successfully-run statement of this session) — then validates and
+/// writes it through [`crate::save_named_query`], the SAME helper
+/// `querymatter query save` uses, so the CLI and the REPL can never validate
+/// or persist differently. Neither an inline SQL nor a prior statement is a
+/// clean stderr error, matching `.set`'s confirmation policy; nothing is
+/// written in that case.
+fn dispatch_query_save(name: &str, sql: Option<String>, last_sql: Option<&str>) {
+    match resolve_save_sql(sql, last_sql) {
+        None => {
+            eprintln!("querymatter: .query save: no SQL given and no statement has run yet");
+        }
+        Some(sql) => match crate::save_named_query(name, &sql) {
+            Ok(path) => eprintln!("querymatter: saved query '{name}' in {}", path.display()),
+            Err(err) => eprintln!("querymatter: {err:#}"),
+        },
+    }
+}
+
+/// Resolves the SQL for `.query save <name> [sql]`: the inline `sql` when
+/// given, falling back to `last_sql` — the last successfully-run statement of
+/// this session — when omitted. `None` means neither was available, i.e.
+/// `.query save <name>` was typed with no statement having run yet this
+/// session; pulled out as a pure function so that "no SQL to save" condition
+/// is unit-testable without touching `queries.toml`.
+fn resolve_save_sql(sql: Option<String>, last_sql: Option<&str>) -> Option<String> {
+    sql.or_else(|| last_sql.map(str::to_string))
 }
 
 /// The `.query` dot-command's resolve-and-run decision, taking already-loaded
@@ -548,7 +685,9 @@ fn dispatch_query(cmd: QueryCmd, session: &Session, sink: &mut OutputSink) {
 /// `;`-separated statements, each is split out via [`split_statements`] and
 /// run (and rendered to `sink`) in order, exactly like the REPL's own
 /// multi-line statement handling. An unknown name is reported on stderr, not
-/// a panic.
+/// a panic. `.query save` is never actually passed here — [`dispatch_query`]
+/// intercepts it before loading `saved` at all — but the variant must still
+/// be matched for exhaustiveness.
 fn run_query_cmd(cmd: QueryCmd, saved: &Queries, session: &Session, sink: &mut OutputSink) {
     match cmd {
         QueryCmd::List => print!("{}", query_list_lines(saved)),
@@ -560,6 +699,9 @@ fn run_query_cmd(cmd: QueryCmd, saved: &Queries, session: &Session, sink: &mut O
             }
             None => eprintln!("querymatter: no saved query named '{name}'"),
         },
+        QueryCmd::Save(..) => {
+            unreachable!("Save is dispatched separately, before queries::load — see dispatch_query")
+        }
     }
 }
 
@@ -589,25 +731,55 @@ fn saved_query_names() -> Vec<String> {
 }
 
 /// Applies a `.output` dot-command to `sink`: `Some(path)` truncates and
-/// opens `path`, redirecting every later statement's result to it for the
-/// rest of the session; `None` (a bare `.output` or `.output stdout`) resets
-/// to stdout. Either way a one-line confirmation goes to stderr. A `path`
-/// that can't be opened for writing is reported on stderr instead, and
-/// `sink` is left exactly as it was — the session keeps running on whatever
-/// it was already writing to.
+/// opens `path`, `Some("|cmd")` (the sqlite3 convention) pipes every later
+/// statement's result through `cmd` via the shell, and `None` (a bare
+/// `.output` or `.output stdout`) resets to stdout. Either way a one-line
+/// confirmation goes to stderr.
+///
+/// The new target is opened (or spawned) *first*, without touching the old
+/// sink at all. Only once that succeeds is [`OutputSink::finish`] called on
+/// the *old* sink — closing and reaping a prior piped command — and `sink`
+/// swapped to the new value. A path that can't be opened, or a command that
+/// can't be spawned, is reported on stderr instead, and `sink` is left
+/// completely untouched: even a live piped command keeps running and
+/// accepting writes exactly as before the failed switch, since it was never
+/// finished in the first place.
 fn apply_output(sink: &mut OutputSink, target: Option<String>) {
     match target {
         None => {
+            finish_old_sink(sink);
             *sink = OutputSink::Stdout;
             eprintln!("querymatter: results on stdout");
         }
-        Some(path) => match OutputSink::open_file(Path::new(&path)) {
-            Ok(opened) => {
-                *sink = opened;
-                eprintln!("querymatter: writing results to {path}");
-            }
-            Err(err) => eprintln!("querymatter: cannot write to {path}: {err}"),
+        Some(arg) => match arg.strip_prefix('|') {
+            Some(cmd) => match OutputSink::open_command(cmd.trim()) {
+                Ok(opened) => {
+                    finish_old_sink(sink);
+                    *sink = opened;
+                    eprintln!("querymatter: piping results through {}", cmd.trim());
+                }
+                Err(err) => eprintln!("querymatter: cannot start pipe: {err}"),
+            },
+            None => match OutputSink::open_file(Path::new(&arg)) {
+                Ok(opened) => {
+                    finish_old_sink(sink);
+                    *sink = opened;
+                    eprintln!("querymatter: writing results to {arg}");
+                }
+                Err(err) => eprintln!("querymatter: cannot write to {arg}: {err}"),
+            },
         },
+    }
+}
+
+/// Finishes `sink` (closing and reaping a live piped command; a no-op for
+/// [`OutputSink::Stdout`]/[`OutputSink::File`]) now that a replacement has
+/// already been opened successfully — [`apply_output`]'s shared "the switch
+/// is confirmed, retire the old target" step. A failure here is reported but
+/// not fatal: the caller is about to overwrite `sink` regardless.
+fn finish_old_sink(sink: &mut OutputSink) {
+    if let Err(err) = sink.finish() {
+        eprintln!("querymatter: error finishing previous output: {err}");
     }
 }
 
@@ -688,7 +860,15 @@ fn help_text() -> String {
     );
     let _ = writeln!(
         text,
-        "  .output [path]     redirect results to path, or 'stdout'/no argument to reset"
+        "  .header [on|off]   show, or set, whether results include a header row"
+    );
+    let _ = writeln!(
+        text,
+        "  .timer [on|off]    show, or set, whether the row-count line shows elapsed query time"
+    );
+    let _ = writeln!(
+        text,
+        "  .output [path]     redirect results to path, '|cmd' to pipe through a shell command, or 'stdout'/no argument to reset"
     );
     let _ = writeln!(
         text,
@@ -716,11 +896,15 @@ fn help_text() -> String {
     );
     let _ = writeln!(
         text,
-        "  .query run <name>  run a saved query in-session (see 'querymatter query save')"
+        "  .query run <name>         run a saved query in-session (see 'querymatter query save')"
     );
     let _ = writeln!(
         text,
-        "  .query list        list saved queries (name and SQL)"
+        "  .query list               list saved queries (name and SQL)"
+    );
+    let _ = writeln!(
+        text,
+        "  .query save <name> [sql]  save sql, or the last statement run, as name"
     );
     let _ = writeln!(text, "  .quit / .exit      leave the REPL");
     let _ = writeln!(text);
@@ -1210,6 +1394,26 @@ mod tests {
         }
     }
     #[test]
+    fn parses_header_on_off_and_report() {
+        assert_eq!(parse_dot(".header on"), DotCommand::Header(Some(true)));
+        assert_eq!(parse_dot(".header off"), DotCommand::Header(Some(false)));
+        assert_eq!(parse_dot(".header"), DotCommand::Header(None));
+    }
+
+    /// An unrecognized `.header` argument is `Unknown` carrying the whole
+    /// line — unlike `.format`/`.style`, whose bad-argument case names the
+    /// offending value via a dedicated `BadFormat`/`BadStyle` variant. There's
+    /// no `on`/`off` equivalent worth naming individually, so the existing
+    /// unknown-command error path handles it directly.
+    #[test]
+    fn header_bad_arg_is_unknown_command() {
+        assert_eq!(
+            parse_dot(".header maybe"),
+            DotCommand::Unknown(".header maybe".to_string())
+        );
+    }
+
+    #[test]
     fn dot_commands_parse() {
         assert!(matches!(parse_dot(".help"), DotCommand::Help));
         assert!(matches!(parse_dot(".schema"), DotCommand::Schema));
@@ -1262,6 +1466,71 @@ mod tests {
             parse_dot(".query RUN stale"),
             DotCommand::Query(QueryCmd::Run("stale".to_string()))
         );
+    }
+
+    #[test]
+    fn parses_query_save_with_and_without_sql() {
+        assert_eq!(
+            parse_dot(".query save stale SELECT status"),
+            DotCommand::Query(QueryCmd::Save("stale".into(), Some("SELECT status".into())))
+        );
+        assert_eq!(
+            parse_dot(".query save stale"),
+            DotCommand::Query(QueryCmd::Save("stale".into(), None))
+        );
+    }
+
+    /// [`resolve_save_sql`]'s two real inputs: an inline SQL always wins, and
+    /// an omitted one falls back to `last_sql` (the last successfully-run
+    /// statement of this session).
+    #[test]
+    fn resolve_save_sql_prefers_inline_sql_then_falls_back_to_last_sql() {
+        assert_eq!(
+            resolve_save_sql(Some("SELECT 1".to_string()), Some("SELECT 2")),
+            Some("SELECT 1".to_string()),
+            "inline SQL must win over last_sql when both are present"
+        );
+        assert_eq!(
+            resolve_save_sql(None, Some("SELECT 2")),
+            Some("SELECT 2".to_string()),
+            "omitted inline SQL must fall back to last_sql"
+        );
+    }
+
+    /// `.query save <name>` with no inline SQL and no statement having run
+    /// yet this session must resolve to "nothing to save" — `dispatch_query_save`
+    /// maps that straight to a clean stderr error and never calls
+    /// `crate::save_named_query`, so nothing is ever written. Pinned at this
+    /// pure resolution step so it's provable without any filesystem/env
+    /// involvement; `save_named_query`'s own validate-then-persist behavior is
+    /// exercised (identically for the CLI and, after this task, the REPL)
+    /// by `tests/cli.rs`'s `query save` tests, isolated there via a
+    /// subprocess with its own `HOME`.
+    #[test]
+    fn query_save_rejects_when_no_prior_statement_and_no_sql() {
+        assert_eq!(resolve_save_sql(None, None), None);
+    }
+
+    /// `dispatch_dot` wires `.header off` through to `Session::set_header`,
+    /// reusing the same `Session` builder the `.query` dispatch tests below
+    /// use — the header setting defaults to `on`, so this also proves the
+    /// dispatch actually flips it rather than the default coincidentally
+    /// matching.
+    #[test]
+    fn dispatch_header_off_sets_session() {
+        let td = tempdir().unwrap();
+        fs::write(td.path().join("a.md"), "---\nstatus: draft\n---\n").unwrap();
+        let mut session = query_cmd_test_session(td.path());
+        assert!(session.header(), "header must default to on");
+        let mut sink = OutputSink::Stdout;
+
+        assert!(!dispatch_dot(
+            DotCommand::Header(Some(false)),
+            &mut session,
+            &mut sink,
+            None
+        ));
+        assert!(!session.header());
     }
 
     /// An unrecognized `.query` action word is `BadQueryAction` (reported as
@@ -1422,6 +1691,21 @@ mod tests {
         assert_eq!(parse_dot(".output STDOUT"), DotCommand::Output(None));
     }
 
+    /// A `|cmd` target is captured verbatim, spaces and all — a
+    /// `words.next()`-style split would truncate at the first argument and
+    /// silently drop `-s,`/the rest of the pipeline.
+    #[test]
+    fn output_command_captures_a_piped_command_verbatim() {
+        assert_eq!(
+            parse_dot(".output |column -t -s,"),
+            DotCommand::Output(Some("|column -t -s,".to_string()))
+        );
+        assert_eq!(
+            parse_dot(".output |grep x | wc -l"),
+            DotCommand::Output(Some("|grep x | wc -l".to_string()))
+        );
+    }
+
     #[test]
     fn apply_output_redirects_to_a_file_then_resets_to_stdout() {
         let dir = tempfile::tempdir().unwrap();
@@ -1450,6 +1734,51 @@ mod tests {
 
         apply_output(&mut sink, Some(bad.to_str().unwrap().to_string()));
         assert!(matches!(sink, OutputSink::Stdout));
+    }
+
+    /// `.output |cmd` pipes blocks through a real shell command, and
+    /// resetting back to stdout finishes (closes stdin, reaps) the old pipe
+    /// first — so the file `cat` was redirected to is complete by the time
+    /// this test reads it back.
+    #[test]
+    fn apply_output_pipes_through_a_shell_command_then_finishes_on_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("piped.txt");
+        let mut sink = OutputSink::Stdout;
+
+        apply_output(&mut sink, Some(format!("|cat > {}", path.display())));
+        assert!(matches!(sink, OutputSink::Command(_)));
+        sink.write_block("alpha").unwrap();
+        sink.write_block("beta").unwrap();
+
+        apply_output(&mut sink, None);
+        assert!(matches!(sink, OutputSink::Stdout));
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "alpha\nbeta\n");
+    }
+
+    /// A failed switch must not disturb a *live* pipe: the new target is
+    /// opened before the old sink is touched, so a bad path after
+    /// `.output |cmd` leaves the original child's stdin open and still
+    /// writable — proving the fix for the "dead pipe after a failed switch"
+    /// finding (W45).
+    #[test]
+    fn apply_output_keeps_the_old_pipe_alive_when_the_new_target_fails_to_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("piped.txt");
+        let mut sink = OutputSink::Stdout;
+
+        apply_output(&mut sink, Some(format!("|cat > {}", path.display())));
+        assert!(matches!(sink, OutputSink::Command(_)));
+
+        apply_output(&mut sink, Some("/no/such/dir/x".to_string()));
+        assert!(matches!(sink, OutputSink::Command(_)));
+
+        // The original pipe is still alive and usable, not a dead sink whose
+        // stdin was already closed by a `finish()` on the failed switch.
+        sink.write_block("still alive").unwrap();
+        sink.finish().unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "still alive\n");
     }
 
     #[test]
@@ -1519,9 +1848,63 @@ mod tests {
 
     #[test]
     fn row_count_line_pluralizes_correctly() {
-        assert_eq!(row_count_line(0), "-- 0 rows");
-        assert_eq!(row_count_line(1), "-- 1 row");
-        assert_eq!(row_count_line(2), "-- 2 rows");
+        assert_eq!(row_count_line(0, None), "-- 0 rows");
+        assert_eq!(row_count_line(1, None), "-- 1 row");
+        assert_eq!(row_count_line(2, None), "-- 2 rows");
+    }
+
+    /// `row_count_line(_, None)` must produce exactly today's output — every
+    /// non-timed caller passes `None` — and `Some(d)` appends the elapsed
+    /// seconds to 3 decimal places.
+    #[test]
+    fn row_count_line_appends_elapsed_when_timed() {
+        assert_eq!(row_count_line(3, None), "-- 3 rows");
+        assert_eq!(row_count_line(1, None), "-- 1 row");
+        assert_eq!(
+            row_count_line(3, Some(Duration::from_millis(12))),
+            "-- 3 rows (0.012s)"
+        );
+    }
+
+    #[test]
+    fn parses_timer_on_off() {
+        assert_eq!(parse_dot(".timer on"), DotCommand::Timer(Some(true)));
+        assert_eq!(parse_dot(".timer off"), DotCommand::Timer(Some(false)));
+        assert_eq!(parse_dot(".timer"), DotCommand::Timer(None));
+    }
+
+    /// An unrecognized `.timer` argument is `Unknown` carrying the whole
+    /// line — mirrors `header_bad_arg_is_unknown_command`: there's no
+    /// `on`/`off` equivalent worth naming individually, so the existing
+    /// unknown-command error path handles it directly.
+    #[test]
+    fn timer_bad_arg_is_unknown_command() {
+        assert_eq!(
+            parse_dot(".timer maybe"),
+            DotCommand::Unknown(".timer maybe".to_string())
+        );
+    }
+
+    /// `dispatch_dot` wires `.timer on` through to `Session::set_timer`,
+    /// reusing the same `Session` builder `dispatch_header_off_sets_session`
+    /// uses — the timer setting defaults to `off`, so this also proves the
+    /// dispatch actually flips it rather than the default coincidentally
+    /// matching.
+    #[test]
+    fn dispatch_timer_on_sets_session() {
+        let td = tempdir().unwrap();
+        fs::write(td.path().join("a.md"), "---\nstatus: draft\n---\n").unwrap();
+        let mut session = query_cmd_test_session(td.path());
+        assert!(!session.timer(), "timer must default to off");
+        let mut sink = OutputSink::Stdout;
+
+        assert!(!dispatch_dot(
+            DotCommand::Timer(Some(true)),
+            &mut session,
+            &mut sink,
+            None
+        ));
+        assert!(session.timer());
     }
 
     /// The startup banner must name the record count and hint at both

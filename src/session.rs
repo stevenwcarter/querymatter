@@ -57,6 +57,17 @@ impl Session {
         self.settings.table_style.value
     }
 
+    /// Whether the header row is shown for table/md/csv/tsv output; ignored
+    /// by JSON (keyed by header regardless) and vertical (`\G`) output.
+    pub fn header(&self) -> bool {
+        self.settings.header.value
+    }
+
+    /// Whether the REPL reports elapsed query time on the `-- N rows` line.
+    pub fn timer(&self) -> bool {
+        self.settings.timer.value
+    }
+
     /// Every setting, for `.settings`.
     pub fn settings(&self) -> &Settings {
         &self.settings
@@ -212,7 +223,7 @@ impl Session {
     ) -> anyhow::Result<(String, usize)> {
         let table = self.run(&statement.sql)?;
         let output = statement.terminator.output(self.format());
-        let rendered = render::render(&table, output, self.style());
+        let rendered = render::render(&table, output, self.style(), self.header());
         Ok((rendered, table.rows.len()))
     }
 
@@ -228,6 +239,24 @@ impl Session {
     pub fn set_style(&mut self, style: TableStyle) {
         self.settings.table_style = Resolved {
             value: style,
+            source: Source::Session,
+        };
+    }
+
+    /// Switches whether the header row is shown for the rest of this session
+    /// only.
+    pub fn set_header(&mut self, on: bool) {
+        self.settings.header = Resolved {
+            value: on,
+            source: Source::Session,
+        };
+    }
+
+    /// Switches whether the REPL reports elapsed query time, for the rest of
+    /// this session only.
+    pub fn set_timer(&mut self, on: bool) {
+        self.settings.timer = Resolved {
+            value: on,
             source: Source::Session,
         };
     }

@@ -303,6 +303,39 @@ fn malformed_frontmatter_warning_stays_off_stdout() {
 }
 
 #[test]
+fn quiet_suppresses_skipped_file_warnings_but_not_errors() {
+    let td = TempDir::new().unwrap();
+    fs::write(td.path().join("good.md"), "---\nstatus: draft\n---\n").unwrap();
+    fs::write(td.path().join("bad.md"), "---\n: : broken\n  bad\n---\n").unwrap();
+    let home = TempDir::new().unwrap();
+
+    // Without --quiet: the skipped-file warning appears on stderr.
+    qm(home.path())
+        .args(["-e", "SELECT status"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("querymatter:"));
+
+    // With --quiet: stderr carries no "querymatter: <warning>" chatter for the
+    // successful query (the "-- N rows" line is REPL-only, absent in -e mode).
+    qm(home.path())
+        .args(["--quiet", "-e", "SELECT status"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .stderr(predicates::str::is_empty());
+
+    // --quiet must never swallow a real query error.
+    qm(home.path())
+        .args(["--quiet", "-e", "SELECT FROM WHERE bogus((("])
+        .arg(td.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::is_empty().not());
+}
+
+#[test]
 fn batch_good_then_bad_exits_nonzero() {
     let td = tree();
     let home = TempDir::new().unwrap();
@@ -311,6 +344,37 @@ fn batch_good_then_bad_exits_nonzero() {
         .write_stdin("SELECT count(*) AS n;\nSELCT bad;\n")
         .assert()
         .failure();
+}
+
+/// A batch/`-e` run of 3 statements whose 2nd fails must name its 1-based
+/// position in the error, so a partial `--output` run tells the caller
+/// exactly which statement to blame (design W36).
+#[test]
+fn batch_failure_names_the_statement_index() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg("-e")
+        .arg("SELECT status; SELECT bogus((( ; SELECT status")
+        .arg(td.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("statement 2 of 3"));
+}
+
+/// A lone failing statement needs no "N of M" attribution — `1 of 1` would
+/// just be noise.
+#[test]
+fn single_statement_failure_is_not_indexed() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg("-e")
+        .arg("SELECT bogus(((")
+        .arg(td.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("statement 1 of 1").not());
 }
 
 #[test]
@@ -353,6 +417,64 @@ fn init_creates_manifest() {
         td.path().join(".querymatter/manifest.bin").is_file(),
         "init must create <dir>/.querymatter/manifest.bin"
     );
+}
+
+#[test]
+fn cache_status_reports_root_and_file_count() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg("init")
+        .arg(td.path())
+        .assert()
+        .success();
+
+    let canonical = fs::canonicalize(td.path()).unwrap();
+    qm(home.path())
+        .args(["cache", "status"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(canonical.display().to_string()))
+        .stdout(predicates::str::contains("files:       3"));
+}
+
+#[test]
+fn cache_status_without_a_vault_exits_nonzero_and_mentions_init() {
+    let td = tree(); // no `init`, so no vault exists anywhere above `td`.
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["cache", "status"])
+        .arg(td.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("init"));
+}
+
+#[test]
+fn cache_status_with_corrupt_manifest_exits_nonzero_and_mentions_init() {
+    // A vault whose `manifest.bin` is present but unreadable (corrupt, or
+    // left behind by an incompatible crate version after an upgrade) is a
+    // different failure mode than "no vault at all" — `find_vault` still
+    // resolves it, but `cache_summary`'s read of the header fails. That path
+    // must still point the user at `querymatter init` (W33).
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg("init")
+        .arg(td.path())
+        .assert()
+        .success();
+
+    let manifest = td.path().join(".querymatter/manifest.bin");
+    fs::write(&manifest, b"not a real manifest").unwrap();
+
+    qm(home.path())
+        .args(["cache", "status"])
+        .arg(td.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("init"));
 }
 
 /// `init`'s walk flags parse into the "init" subcommand's own nested

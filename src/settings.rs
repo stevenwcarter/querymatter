@@ -69,6 +69,9 @@ pub struct Settings {
     pub hidden: Resolved<bool>,
     pub exclude: Resolved<Vec<String>>,
     pub lenient: Resolved<bool>,
+    pub timer: Resolved<bool>,
+    pub header: Resolved<bool>,
+    pub quiet: Resolved<bool>,
 }
 
 impl Default for Settings {
@@ -85,6 +88,9 @@ impl Default for Settings {
             hidden: Resolved::new(false, Source::Default),
             exclude: Resolved::new(Vec::new(), Source::Default),
             lenient: Resolved::new(false, Source::Default),
+            timer: Resolved::new(false, Source::Default),
+            header: Resolved::new(true, Source::Default),
+            quiet: Resolved::new(false, Source::Default),
         }
     }
 }
@@ -113,6 +119,24 @@ impl Settings {
                 config.lenient,
                 defaults.lenient.value,
             ),
+            header: resolve_bool(
+                matches,
+                "header",
+                "no_header",
+                config.header,
+                defaults.header.value,
+            ),
+            quiet: resolve_bool(
+                matches,
+                "quiet",
+                "no_quiet",
+                config.quiet,
+                defaults.quiet.value,
+            ),
+            timer: match config.timer {
+                Some(v) => Resolved::new(v, Source::Config),
+                None => Resolved::new(defaults.timer.value, Source::Default),
+            },
             ..Settings::resolve_walk(&cli.walk, config, matches)
         }
     }
@@ -232,6 +256,18 @@ impl Settings {
             (
                 ConfigKey::Lenient,
                 (self.lenient.value.to_string(), self.lenient.source),
+            ),
+            (
+                ConfigKey::Timer,
+                (self.timer.value.to_string(), self.timer.source),
+            ),
+            (
+                ConfigKey::Header,
+                (self.header.value.to_string(), self.header.source),
+            ),
+            (
+                ConfigKey::Quiet,
+                (self.quiet.value.to_string(), self.quiet.source),
             ),
         ])
     }
@@ -530,6 +566,44 @@ mod tests {
             "config hidden = true must reach init's walk"
         );
         assert_eq!(settings.hidden.source, Source::Config);
+    }
+
+    #[test]
+    fn header_defaults_true_config_and_flags_resolve() {
+        // default
+        assert!(resolve(&["querymatter"], &Config::default()).header.value);
+        // config false
+        let cfg = config_with(|c| c.header = Some(false));
+        assert!(!resolve(&["querymatter"], &cfg).header.value);
+        // --header overrides config false
+        let s = resolve(&["querymatter", "--header"], &cfg);
+        assert!(s.header.value);
+        assert_eq!(s.header.source, Source::Flag);
+        // --no-header overrides config true
+        let cfg_t = config_with(|c| c.header = Some(true));
+        assert!(
+            !resolve(&["querymatter", "--no-header"], &cfg_t)
+                .header
+                .value
+        );
+    }
+
+    #[test]
+    fn quiet_defaults_false_and_flag_beats_config() {
+        assert!(!resolve(&["querymatter"], &Config::default()).quiet.value);
+        let cfg = config_with(|c| c.quiet = Some(false));
+        assert!(resolve(&["querymatter", "--quiet"], &cfg).quiet.value);
+        assert!(resolve(&["querymatter", "-q"], &cfg).quiet.value);
+        let cfg_t = config_with(|c| c.quiet = Some(true));
+        assert!(!resolve(&["querymatter", "--no-quiet"], &cfg_t).quiet.value);
+    }
+
+    #[test]
+    fn timer_config_beats_default_no_flag() {
+        let cfg = config_with(|c| c.timer = Some(true));
+        let s = resolve(&["querymatter"], &cfg);
+        assert!(s.timer.value);
+        assert_eq!(s.timer.source, Source::Config);
     }
 
     #[test]
