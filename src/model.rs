@@ -155,26 +155,38 @@ pub fn compare_values(a: &Value, b: &Value) -> Option<Ordering> {
 
 /// Chronological comparison for a `Date`/`DateTime` on either side.
 ///
-/// Same-type pairs (`Date` vs `Date`, `DateTime` vs `DateTime`) compare
-/// directly via chrono's own `Ord`. Every other pairing that involves a
-/// `Date`/`DateTime` — a mixed `Date`/`DateTime` pair, or either against a
-/// `Str` — compares `to_cmp_string()` of both (ISO text) instead. This is
-/// required, not just convenient: comparing a mixed pair via the `DateTime`'s
-/// date part (`.date_naive()`) is not a strict-weak ordering — a `Date` could
-/// compare `Equal` to two different `DateTime`s (same day, different times)
-/// that are themselves unequal, violating transitivity, which is undefined
-/// behavior for the `sort_by` that backs `ORDER BY`. ISO text stays a total
-/// order: a same-day `Date`'s string (`"2026-07-24"`) is a strict prefix of
-/// the `DateTime`'s (`"2026-07-24T…"`), so it always sorts before it. This
-/// also sorts identically to a chronological compare for well-formed ISO
-/// strings, and stays defined (never panics) for anything else (e.g.
-/// `"draft"`). Returns `None` when neither side is a `Date`/`DateTime`, so the
-/// caller falls through to the existing numeric/string rules unchanged.
+/// `Date` vs `Date` compares directly via chrono's own `Ord` — `NaiveDate` has
+/// no sub-second (or even sub-day) component, so its native `Ord` already
+/// agrees with a `%Y-%m-%d` text compare. Every other pairing that involves a
+/// `Date`/`DateTime` — `DateTime` vs `DateTime`, a mixed `Date`/`DateTime`
+/// pair, or either against a `Str` — compares `to_cmp_string()` of both (ISO
+/// text, rendered at whole-second granularity — see `Value::display`)
+/// instead. This is required, not just convenient, for two reasons:
+///
+/// - Comparing a mixed pair via the `DateTime`'s date part (`.date_naive()`)
+///   is not a strict-weak ordering — a `Date` could compare `Equal` to two
+///   different `DateTime`s (same day, different times) that are themselves
+///   unequal, violating transitivity.
+/// - Comparing `DateTime` vs `DateTime` at full sub-second precision (instead
+///   of via the same second-granular text every other arm uses) breaks
+///   transitivity the same way: two `DateTime`s differing only in
+///   sub-seconds would compare non-equal to each other yet each compare
+///   `Equal` to a `Str`/`Date` holding their shared seconds-granular text.
+///
+/// Both failure modes are undefined behavior for the `sort_by` that backs
+/// `ORDER BY` (it can panic on a non-transitive comparator). ISO text at
+/// second granularity stays a total order: a same-day `Date`'s string
+/// (`"2026-07-24"`) is a strict prefix of the `DateTime`'s
+/// (`"2026-07-24T…"`), so it always sorts before it. This also sorts
+/// identically to a chronological compare for well-formed ISO strings, and
+/// stays defined (never panics) for anything else (e.g. `"draft"`). Returns
+/// `None` when neither side is a `Date`/`DateTime`, so the caller falls
+/// through to the existing numeric/string rules unchanged.
 fn compare_dates(a: &Value, b: &Value) -> Option<Ordering> {
     match (a, b) {
         (Value::Date(x), Value::Date(y)) => Some(x.cmp(y)),
-        (Value::DateTime(x), Value::DateTime(y)) => Some(x.cmp(y)),
-        (
+        (Value::DateTime(_), Value::DateTime(_))
+        | (
             Value::Date(_) | Value::DateTime(_),
             Value::Str(_) | Value::Date(_) | Value::DateTime(_),
         )
@@ -569,6 +581,36 @@ mod tests {
             compare_values(&later_datetime, &earlier_date),
             Some(Ordering::Greater)
         );
+    }
+    /// Fix 3 (W57 review): the `DateTime`/`DateTime` arm must compare via the
+    /// same second-granular ISO text every cross-type arm uses, not chrono's
+    /// full sub-second `Ord`. Otherwise two `DateTime`s differing only in
+    /// sub-seconds compare non-`Equal` to each other (arm 1) yet each compare
+    /// `Equal` to a `Str` holding their shared seconds-only text (arm 2) — a
+    /// non-transitive comparator (A<B, A==C, B==C), which is undefined
+    /// behavior for the `sort_by` backing `ORDER BY` (e.g. via `ORDER BY
+    /// COALESCE(<subsecond_field>, file.mtime)`).
+    #[test]
+    fn datetime_ordering_is_second_granular_and_transitive() {
+        let whole_second = DateTime::parse_from_rfc3339("2026-07-24T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let sub_second = DateTime::parse_from_rfc3339("2026-07-24T00:00:00.900Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let a = Value::DateTime(whole_second);
+        let b = Value::DateTime(sub_second);
+        let shared_text = Value::Str("2026-07-24T00:00:00Z".to_string());
+
+        // Same-type arm now agrees with the cross-type arm: both truncate to
+        // whole seconds, so a sub-second-only difference is `Equal`.
+        assert_eq!(compare_values(&a, &b), Some(Ordering::Equal));
+        // ...and consistently `Equal` to their shared seconds-text on both
+        // sides — no A<B while A==C==B.
+        assert_eq!(compare_values(&a, &shared_text), Some(Ordering::Equal));
+        assert_eq!(compare_values(&b, &shared_text), Some(Ordering::Equal));
+        assert_eq!(compare_values(&shared_text, &a), Some(Ordering::Equal));
+        assert_eq!(compare_values(&shared_text, &b), Some(Ordering::Equal));
     }
 }
 
