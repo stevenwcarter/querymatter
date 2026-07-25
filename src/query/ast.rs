@@ -515,6 +515,8 @@ fn file_attr_label(attr: FileAttr) -> &'static str {
         FileAttr::Path => "file.path",
         FileAttr::Folder => "file.folder",
         FileAttr::Ext => "file.ext",
+        FileAttr::Mtime => "file.mtime",
+        FileAttr::Size => "file.size",
     }
 }
 

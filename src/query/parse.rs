@@ -549,6 +549,8 @@ fn file_attr_from_str(name: &str) -> Result<FileAttr, ParseError> {
         "path" => Ok(FileAttr::Path),
         "folder" => Ok(FileAttr::Folder),
         "ext" => Ok(FileAttr::Ext),
+        "mtime" => Ok(FileAttr::Mtime),
+        "size" => Ok(FileAttr::Size),
         other => Err(ParseError::BadColumn(format!(
             "unknown file attribute `file.{other}`"
         ))),

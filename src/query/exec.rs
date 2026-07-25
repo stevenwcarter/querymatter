@@ -11,6 +11,7 @@ use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
+use std::time::SystemTime;
 
 use globset::Glob;
 use indexmap::IndexMap;
@@ -528,7 +529,13 @@ fn eval_group_expr(rows: &[&Record], expr: &Expr) -> Value {
 /// A fieldless record with no `file.*` identity, used only as the
 /// evaluation context in [`eval_group_expr`]'s zero-row fallback.
 fn empty_record() -> Record {
-    Record::new(Path::new(""), Path::new(""), IndexMap::new())
+    Record::new(
+        Path::new(""),
+        Path::new(""),
+        IndexMap::new(),
+        SystemTime::UNIX_EPOCH,
+        0,
+    )
 }
 
 /// Computes one aggregate function's value over a group's rows.
@@ -1128,7 +1135,13 @@ mod tests {
         for (k, v) in kv {
             m.insert((*k).to_string(), v.clone());
         }
-        Record::new(Path::new(root), Path::new(path), m)
+        Record::new(
+            Path::new(root),
+            Path::new(path),
+            m,
+            SystemTime::UNIX_EPOCH,
+            0,
+        )
     }
     fn recs() -> Vec<Record> {
         vec![
@@ -1928,7 +1941,13 @@ mod agg_tests {
         let mut m = IndexMap::new();
         m.insert("status".into(), Value::Str(status.into()));
         m.insert("prd".into(), Value::Str(prd.into()));
-        Record::new(Path::new("s"), Path::new(path), m)
+        Record::new(
+            Path::new("s"),
+            Path::new(path),
+            m,
+            SystemTime::UNIX_EPOCH,
+            0,
+        )
     }
     fn recs() -> Vec<Record> {
         vec![
@@ -1943,7 +1962,13 @@ mod agg_tests {
         let mut m = IndexMap::new();
         m.insert("status".into(), Value::Str(status.into()));
         m.insert("n".into(), n);
-        Record::new(Path::new("s"), Path::new(path), m)
+        Record::new(
+            Path::new("s"),
+            Path::new(path),
+            m,
+            SystemTime::UNIX_EPOCH,
+            0,
+        )
     }
 
     #[test]

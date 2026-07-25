@@ -1,6 +1,8 @@
+use chrono::{DateTime, SecondsFormat, Utc};
 use indexmap::IndexMap;
 use std::cmp::Ordering;
 use std::path::Path;
+use std::time::SystemTime;
 
 /// A dynamically-typed value read from Markdown YAML frontmatter.
 ///
@@ -130,6 +132,8 @@ pub enum FileAttr {
     Path,
     Folder,
     Ext,
+    Mtime,
+    Size,
 }
 
 /// One queryable row: a Markdown file's YAML frontmatter fields, plus its
@@ -141,6 +145,8 @@ pub struct Record {
     path: String,
     folder: String,
     ext: String,
+    mtime: SystemTime,
+    size: u64,
 }
 
 impl Record {
@@ -151,8 +157,16 @@ impl Record {
     /// to the full path when `path` isn't under `root`); `folder` is the
     /// parent of that relative path, or an empty string when there is none.
     /// Path separators are normalized to `/` so output is stable across
-    /// platforms.
-    pub fn new(root: &Path, path: &Path, fields: IndexMap<String, Value>) -> Self {
+    /// platforms. `mtime`/`size` are the file's on-disk stat, already read
+    /// by the caller for cache-freshness purposes — this is zero extra I/O,
+    /// not a fresh stat.
+    pub fn new(
+        root: &Path,
+        path: &Path,
+        fields: IndexMap<String, Value>,
+        mtime: SystemTime,
+        size: u64,
+    ) -> Self {
         let relative = path.strip_prefix(root).unwrap_or(path);
         let name = path
             .file_name()
@@ -170,6 +184,8 @@ impl Record {
             path: join_components(relative),
             folder,
             ext,
+            mtime,
+            size,
         }
     }
 
@@ -190,15 +206,18 @@ impl Record {
         cur
     }
 
-    /// Resolves a `file.*` pseudo-column to its string value.
+    /// Resolves a `file.*` pseudo-column to its value: `Name`/`Path`/`Folder`/
+    /// `Ext` are strings, `Mtime` is an RFC3339 UTC string, and `Size` is an
+    /// integer byte count.
     pub fn file_attr(&self, attr: FileAttr) -> Value {
-        let s = match attr {
-            FileAttr::Name => &self.name,
-            FileAttr::Path => &self.path,
-            FileAttr::Folder => &self.folder,
-            FileAttr::Ext => &self.ext,
-        };
-        Value::Str(s.clone())
+        match attr {
+            FileAttr::Name => Value::Str(self.name.clone()),
+            FileAttr::Path => Value::Str(self.path.clone()),
+            FileAttr::Folder => Value::Str(self.folder.clone()),
+            FileAttr::Ext => Value::Str(self.ext.clone()),
+            FileAttr::Mtime => Value::Str(system_time_to_iso(self.mtime)),
+            FileAttr::Size => Value::Int(self.size as i64),
+        }
     }
 
     /// The frontmatter field names for this record.
@@ -210,6 +229,13 @@ impl Record {
     pub fn field_names(&self) -> impl Iterator<Item = &str> {
         self.fields.keys().map(String::as_str)
     }
+}
+
+/// An `mtime` as an RFC3339 UTC string (`2021-01-01T00:00:00Z`), seconds
+/// precision. Pre-epoch times format to their real negative timestamp; never
+/// panics.
+pub fn system_time_to_iso(t: SystemTime) -> String {
+    DateTime::<Utc>::from(t).to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
 /// Joins a path's components with `/`, independent of the host platform's
@@ -310,6 +336,19 @@ mod tests {
         outer.insert("a".to_string(), Value::Map(inner));
         assert_eq!(Value::Map(outer).display(), "{a: {x: 1}}");
     }
+    #[test]
+    fn system_time_to_iso_is_rfc3339_utc() {
+        use std::time::Duration;
+        // 2021-01-01T00:00:00Z == 1609459200 secs
+        let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_609_459_200);
+        assert_eq!(system_time_to_iso(t), "2021-01-01T00:00:00Z");
+    }
+    #[test]
+    fn pre_epoch_mtime_does_not_panic() {
+        use std::time::Duration;
+        let t = SystemTime::UNIX_EPOCH - Duration::from_secs(60);
+        let _ = system_time_to_iso(t); // must not panic
+    }
 }
 
 #[cfg(test)]
@@ -325,6 +364,8 @@ mod record_tests {
             Path::new("samples"),
             Path::new("samples/plans/DCP-459.md"),
             f,
+            SystemTime::UNIX_EPOCH,
+            0,
         )
     }
     #[test]
@@ -339,6 +380,17 @@ mod record_tests {
         assert_eq!(r.file_attr(FileAttr::Ext), Value::Str("md".into()));
     }
     #[test]
+    fn file_attr_mtime_and_size() {
+        use std::time::Duration;
+        let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_609_459_200);
+        let r = Record::new(Path::new("v"), Path::new("v/a.md"), IndexMap::new(), t, 42);
+        assert_eq!(r.file_attr(FileAttr::Size), Value::Int(42));
+        assert_eq!(
+            r.file_attr(FileAttr::Mtime),
+            Value::Str("2021-01-01T00:00:00Z".into())
+        );
+    }
+    #[test]
     fn field_present_and_missing() {
         let r = rec();
         assert_eq!(r.field(&["status".into()]), Value::Str("draft".into()));
@@ -350,7 +402,13 @@ mod record_tests {
         inner.insert("low".to_string(), Value::Int(5));
         let mut f = IndexMap::new();
         f.insert("estimate".to_string(), Value::Map(inner));
-        let r = Record::new(Path::new("v"), Path::new("v/a.md"), f);
+        let r = Record::new(
+            Path::new("v"),
+            Path::new("v/a.md"),
+            f,
+            SystemTime::UNIX_EPOCH,
+            0,
+        );
         assert_eq!(r.field(&["estimate".into(), "low".into()]), Value::Int(5));
         // missing sub-key -> Null
         assert_eq!(r.field(&["estimate".into(), "nope".into()]), Value::Null);

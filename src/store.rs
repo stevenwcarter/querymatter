@@ -394,9 +394,10 @@ impl RecordStore for InMemoryStore {
 ///
 /// Delegates the per-file work to [`cache::scan_file`] — the single
 /// "file → record" definition shared with the cache's freshness checks —
-/// discarding the on-disk stat it carries, since a live scan doesn't need
-/// it. A file that fails to read from disk is treated like invalid
-/// frontmatter: it's counted as skipped and warned about, not a hard error.
+/// reusing the on-disk stat it already carries as each [`Record`]'s
+/// `file.mtime`/`file.size` rather than stat-ing again. A file that fails to
+/// read from disk is treated like invalid frontmatter: it's counted as
+/// skipped and warned about, not a hard error.
 ///
 /// The read+parse itself runs across [`parallel::map_paths`]'s worker
 /// threads, but the results are folded into `records`/`report` in
@@ -425,6 +426,8 @@ fn scan_root(
         match result {
             ScanResult::Cached(file) => {
                 field_names.extend(file.fields.keys().cloned());
+                let mtime = file.mtime;
+                let size = file.size;
                 let fields = match wanted {
                     None => file.fields,
                     Some(set) => file
@@ -433,7 +436,7 @@ fn scan_root(
                         .filter(|(name, _)| set.contains(name))
                         .collect(),
                 };
-                records.push(Record::new(root, &path, fields));
+                records.push(Record::new(root, &path, fields, mtime, size));
                 report.loaded += 1;
             }
             ScanResult::NoFrontmatter => {}
@@ -459,6 +462,65 @@ mod tests {
         let p = dir.join(rel);
         fs::create_dir_all(p.parent().unwrap()).unwrap();
         fs::write(p, body).unwrap();
+    }
+
+    /// Runs `SELECT file.size, file.mtime` over `store`'s records and checks
+    /// the single row's shape: `file.size` a positive `Int` (the real
+    /// on-disk byte count, never a placeholder `0`), `file.mtime` a `Str`
+    /// starting with a 4-digit year and `-` (an RFC3339 timestamp). Shared
+    /// by the live-scan and cache-path producer-parity tests below (Task 4,
+    /// spec §9): both producers must expose these columns identically.
+    fn assert_file_size_and_mtime_row(store: &InMemoryStore) {
+        let parsed = crate::query::parse("SELECT file.size, file.mtime").unwrap();
+        let result = crate::query::execute(&parsed, store.records(), false).unwrap();
+        assert_eq!(result.rows.len(), 1);
+        let row = &result.rows[0];
+
+        let Value::Int(size) = row[0] else {
+            panic!("file.size must be Value::Int, got {:?}", row[0]);
+        };
+        assert!(size > 0, "file.size must be the real on-disk byte count");
+
+        let Value::Str(mtime) = &row[1] else {
+            panic!("file.mtime must be Value::Str, got {:?}", row[1]);
+        };
+        assert!(
+            mtime.len() >= 5
+                && mtime.as_bytes()[4] == b'-'
+                && mtime.as_bytes()[..4].iter().all(u8::is_ascii_digit),
+            "file.mtime must be an RFC3339 string starting with a 4-digit year, got {mtime:?}"
+        );
+    }
+
+    /// Producer-parity guard, LIVE half (Task 4, spec §9): `scan_root` must
+    /// surface the file's real on-disk `(mtime, size)` stat through
+    /// `file.size`/`file.mtime`, not a placeholder — this is the stat
+    /// `cache::scan_file` already read, threaded through at zero extra I/O.
+    #[test]
+    fn scan_root_exposes_file_mtime_and_size() {
+        let td = TempDir::new().unwrap();
+        write(td.path(), "a.md", "---\nstatus: draft\n---\n");
+
+        let (store, _report) =
+            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default(), None);
+
+        assert_file_size_and_mtime_row(&store);
+    }
+
+    /// Producer-parity guard, CACHE half (Task 4, spec §9): `records_from`
+    /// (behind `InMemoryStore::from_cache`) must expose `file.size`/
+    /// `file.mtime` identically to the live scan, threading through the
+    /// `CachedFile`'s stored `(mtime, size)` rather than a placeholder.
+    #[test]
+    fn from_cache_exposes_file_mtime_and_size() {
+        let td = TempDir::new().unwrap();
+        write(td.path(), "a.md", "---\nstatus: draft\n---\n");
+        cache::build_vault(td.path(), &WalkOpts::default(), 300).unwrap();
+
+        let (store, _report) =
+            InMemoryStore::from_cache(td.path(), WalkOpts::default(), Freshness::PerFile, None);
+
+        assert_file_size_and_mtime_row(&store);
     }
 
     #[test]

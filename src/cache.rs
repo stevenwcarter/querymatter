@@ -683,7 +683,7 @@ pub fn records_from(
                             .map(|(name, value)| (name.clone(), value.clone()))
                             .collect(),
                     };
-                    Record::new(root, &path, fields)
+                    Record::new(root, &path, fields, file.mtime, file.size)
                 })
                 .collect();
             (cached_dir.dir.clone(), records, field_names)
