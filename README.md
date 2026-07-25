@@ -91,8 +91,11 @@ SELECT [DISTINCT] cols [AS alias] [FROM 'glob'] [WHERE ...] [GROUP BY ...] [HAVI
 - **HAVING** — filters *groups* (evaluated after aggregation, before `ORDER
   BY`/`LIMIT`): a comparison between a grouping-key column or an aggregate
   and a literal (e.g. `HAVING count(*) > 1`, `HAVING status = 'draft'`),
-  combined with `AND`/`OR`/`NOT`. The aggregate need not appear in `SELECT` —
-  it's computed on demand from each group's rows. Requires `GROUP BY`.
+  combined with `AND`/`OR`/`NOT`. The leaf may also be a `SELECT AS` alias
+  that resolves to an aggregate or a grouping key (`count(*) AS n … HAVING n
+  > 1`), mirroring `GROUP BY`/`ORDER BY` alias handling. The aggregate need
+  not appear in `SELECT` — it's computed on demand from each group's rows.
+  Requires `GROUP BY`.
 - **ORDER BY** — a column, a `SELECT AS` alias, `file.*`, a bare aggregate
   call needing no alias (`ORDER BY count(*) DESC`, valid only alongside
   `GROUP BY`), or any other computed expression — arithmetic, `CASE`,

@@ -96,7 +96,7 @@ fn lower_query(query: &sql::Query) -> Result<Query, ParseError> {
         // combining the two is redundant/confusing rather than meaningful.
         return Err(unsupported("DISTINCT combined with GROUP BY"));
     }
-    let having = lower_having(select.having.as_ref(), &group_by)?;
+    let having = lower_having(select.having.as_ref(), &group_by, &select_items)?;
     let order_by = lower_order_by(query.order_by.as_ref(), &aliases, &group_by)?;
     let (limit, offset) = lower_limit(query.limit_clause.as_ref())?;
 
@@ -896,6 +896,7 @@ fn lower_group_by_expr(
 fn lower_having(
     having: Option<&sql::Expr>,
     group_by: &[ColRef],
+    select_items: &[SelectItem],
 ) -> Result<Option<Having>, ParseError> {
     let Some(expr) = having else {
         return Ok(None);
@@ -903,19 +904,29 @@ fn lower_having(
     if group_by.is_empty() {
         return Err(unsupported("HAVING requires GROUP BY"));
     }
-    Ok(Some(lower_having_expr(expr, group_by)?))
+    Ok(Some(lower_having_expr(expr, group_by, select_items)?))
 }
 
 /// Lowers one `HAVING` expression node: a boolean connective/negation
 /// recurses, and a comparison lowers via [`lower_having_binary`].
-fn lower_having_expr(expr: &sql::Expr, group_by: &[ColRef]) -> Result<Having, ParseError> {
+fn lower_having_expr(
+    expr: &sql::Expr,
+    group_by: &[ColRef],
+    select_items: &[SelectItem],
+) -> Result<Having, ParseError> {
     match expr {
-        sql::Expr::BinaryOp { left, op, right } => lower_having_binary(left, op, right, group_by),
-        sql::Expr::Nested(inner) => lower_having_expr(inner, group_by),
+        sql::Expr::BinaryOp { left, op, right } => {
+            lower_having_binary(left, op, right, group_by, select_items)
+        }
+        sql::Expr::Nested(inner) => lower_having_expr(inner, group_by, select_items),
         sql::Expr::UnaryOp {
             op: sql::UnaryOperator::Not,
             expr,
-        } => Ok(Having::Not(Box::new(lower_having_expr(expr, group_by)?))),
+        } => Ok(Having::Not(Box::new(lower_having_expr(
+            expr,
+            group_by,
+            select_items,
+        )?))),
         _ => Err(unsupported("this HAVING expression")),
     }
 }
@@ -928,21 +939,22 @@ fn lower_having_binary(
     op: &sql::BinaryOperator,
     right: &sql::Expr,
     group_by: &[ColRef],
+    select_items: &[SelectItem],
 ) -> Result<Having, ParseError> {
     use sql::BinaryOperator as B;
     match op {
         B::And => Ok(Having::And(
-            Box::new(lower_having_expr(left, group_by)?),
-            Box::new(lower_having_expr(right, group_by)?),
+            Box::new(lower_having_expr(left, group_by, select_items)?),
+            Box::new(lower_having_expr(right, group_by, select_items)?),
         )),
         B::Or => Ok(Having::Or(
-            Box::new(lower_having_expr(left, group_by)?),
-            Box::new(lower_having_expr(right, group_by)?),
+            Box::new(lower_having_expr(left, group_by, select_items)?),
+            Box::new(lower_having_expr(right, group_by, select_items)?),
         )),
         _ => {
             let cmp =
                 cmp_op_from_binary(op).ok_or_else(|| unsupported(format!("operator `{op}`")))?;
-            lower_having_compare(left, cmp, right, group_by)
+            lower_having_compare(left, cmp, right, group_by, select_items)
         }
     }
 }
@@ -958,11 +970,12 @@ fn lower_having_compare(
     cmp: CmpOp,
     right: &sql::Expr,
     group_by: &[ColRef],
+    select_items: &[SelectItem],
 ) -> Result<Having, ParseError> {
-    if let Some(leaf) = try_having_leaf(left, group_by)? {
+    if let Some(leaf) = try_having_leaf(left, group_by, select_items)? {
         return Ok(Having::Compare(leaf, cmp, lower_having_literal(right)?));
     }
-    if let Some(leaf) = try_having_leaf(right, group_by)? {
+    if let Some(leaf) = try_having_leaf(right, group_by, select_items)? {
         return Ok(Having::Compare(
             leaf,
             flip_cmp_op(cmp),
@@ -993,21 +1006,70 @@ fn lower_having_literal(expr: &sql::Expr) -> Result<Literal, ParseError> {
 fn try_having_leaf(
     expr: &sql::Expr,
     group_by: &[ColRef],
+    select_items: &[SelectItem],
 ) -> Result<Option<HavingLeaf>, ParseError> {
     match expr {
         sql::Expr::Function(func) => Ok(Some(HavingLeaf::Agg(lower_aggregate(func)?))),
-        sql::Expr::Identifier(_) | sql::Expr::CompoundIdentifier(_) => {
-            let col = lower_col_ref(expr)?;
-            if group_by.contains(&col) {
-                Ok(Some(HavingLeaf::Group(col)))
-            } else {
-                Err(unsupported(format!(
-                    "HAVING column `{}` must be a GROUP BY key",
-                    col.label()
-                )))
+        sql::Expr::Identifier(ident) => {
+            // A bare identifier may name a `SELECT` alias — resolve it to what
+            // it projects (an aggregate, or a GROUP BY-key column) before
+            // falling back to treating it as a literal column. Alias resolution
+            // wins, mirroring how `ORDER BY` resolves a projection alias.
+            if let Some(leaf) = resolve_having_alias(&ident.value, group_by, select_items)? {
+                return Ok(Some(leaf));
             }
+            having_column_leaf(expr, group_by)
         }
+        sql::Expr::CompoundIdentifier(_) => having_column_leaf(expr, group_by),
         _ => Ok(None),
+    }
+}
+
+/// Lowers a bare column identifier as a [`HavingLeaf::Group`], erroring when it
+/// isn't one of the query's `GROUP BY` keys — the fallback once alias
+/// resolution ([`resolve_having_alias`]) has found no matching projection.
+fn having_column_leaf(
+    expr: &sql::Expr,
+    group_by: &[ColRef],
+) -> Result<Option<HavingLeaf>, ParseError> {
+    let col = lower_col_ref(expr)?;
+    if group_by.contains(&col) {
+        Ok(Some(HavingLeaf::Group(col)))
+    } else {
+        Err(unsupported(format!(
+            "HAVING column `{}` must be a GROUP BY key or a SELECT alias",
+            col.label()
+        )))
+    }
+}
+
+/// Resolves a bare `HAVING` identifier that matches a `SELECT` alias to the
+/// leaf it projects: an aggregate projection (`count(*) AS n` … `HAVING n`) →
+/// [`HavingLeaf::Agg`]; a projection that is exactly a `GROUP BY`-key column
+/// (`status AS s` … `HAVING s`) → [`HavingLeaf::Group`]. `Ok(None)` when no
+/// projection carries that alias (the caller then tries it as a plain column).
+/// An alias that projects anything else — a scalar expression, arithmetic, a
+/// non-grouped column — is an `Err`: `HAVING`'s leaf grammar is
+/// aggregate-or-group-key only, so such an alias has no valid `HAVING` meaning.
+fn resolve_having_alias(
+    name: &str,
+    group_by: &[ColRef],
+    select_items: &[SelectItem],
+) -> Result<Option<HavingLeaf>, ParseError> {
+    let Some(item) = select_items
+        .iter()
+        .find(|item| item.alias.as_deref() == Some(name))
+    else {
+        return Ok(None);
+    };
+    match &item.expr {
+        SelectExpr::Agg(agg) => Ok(Some(HavingLeaf::Agg(agg.clone()))),
+        SelectExpr::Expr(Expr::Col(col)) if group_by.contains(col) => {
+            Ok(Some(HavingLeaf::Group(col.clone())))
+        }
+        SelectExpr::Expr(_) | SelectExpr::Star => Err(unsupported(format!(
+            "HAVING alias `{name}` refers to a non-aggregate, non-GROUP BY expression"
+        ))),
     }
 }
 
@@ -1717,6 +1779,71 @@ mod tests {
     fn having_without_group_by_is_unsupported() {
         assert!(matches!(
             parse("SELECT status HAVING count(*) > 1"),
+            Err(ParseError::Unsupported(_))
+        ));
+    }
+    #[test]
+    fn having_resolves_an_aggregate_select_alias() {
+        // `count` is the alias for count(*); HAVING resolves it to the
+        // aggregate, exactly as if the user had written `HAVING count(*) > 1`.
+        let q = parse("SELECT type, count(*) AS count GROUP BY type HAVING count > 1").unwrap();
+        assert_eq!(
+            q.having,
+            Some(Having::Compare(
+                HavingLeaf::Agg(Aggregate::CountStar),
+                CmpOp::Gt,
+                Literal::Int(1)
+            ))
+        );
+        // The alias form and the aggregate-call form must lower identically.
+        let agg_form =
+            parse("SELECT type, count(*) AS count GROUP BY type HAVING count(*) > 1").unwrap();
+        assert_eq!(q.having, agg_form.having);
+    }
+    #[test]
+    fn having_resolves_an_aggregate_alias_on_either_side() {
+        // Alias resolution also works when the leaf is on the right of the
+        // comparison (operator flips, same as a bare aggregate call).
+        let q = parse("SELECT type, count(*) AS n GROUP BY type HAVING 1 < n").unwrap();
+        assert_eq!(
+            q.having,
+            Some(Having::Compare(
+                HavingLeaf::Agg(Aggregate::CountStar),
+                CmpOp::Gt,
+                Literal::Int(1)
+            ))
+        );
+    }
+    #[test]
+    fn having_resolves_a_group_key_select_alias() {
+        // Aliasing a GROUP BY key and referencing the alias in HAVING resolves
+        // to that group key (previously rejected as "not a GROUP BY key").
+        let q = parse("SELECT status AS s GROUP BY status HAVING s = 'draft'").unwrap();
+        assert_eq!(
+            q.having,
+            Some(Having::Compare(
+                HavingLeaf::Group(ColRef::Field(vec!["status".into()])),
+                CmpOp::Eq,
+                Literal::Str("draft".into())
+            ))
+        );
+    }
+    #[test]
+    fn having_alias_to_a_non_aggregate_non_group_expr_is_unsupported() {
+        // `u` aliases a scalar expression over a group key — constant per
+        // group, but HAVING's leaf grammar is aggregate-or-group-key only, so
+        // referencing it is rejected rather than silently mis-evaluated.
+        assert!(matches!(
+            parse("SELECT status, lower(status) AS u GROUP BY status HAVING u = 'draft'"),
+            Err(ParseError::Unsupported(_))
+        ));
+    }
+    #[test]
+    fn having_unknown_identifier_still_rejected_with_no_matching_alias() {
+        // A bare identifier that is neither a GROUP BY key nor a SELECT alias
+        // is still an error.
+        assert!(matches!(
+            parse("SELECT status, count(*) AS n GROUP BY status HAVING bogus > 1"),
             Err(ParseError::Unsupported(_))
         ));
     }
