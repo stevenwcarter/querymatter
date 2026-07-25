@@ -85,13 +85,18 @@ SELECT [DISTINCT] cols [AS alias] [FROM 'glob'] [WHERE ...] [GROUP BY ...] [HAVI
   against **any scalar expression**, not just a bare column (e.g.
   `lower(status) REGEXP 'draft'`); an uncompilable pattern is rejected at
   parse time rather than on every row. Also `IN (...)`/`NOT IN (...)`, `IS
-  NULL`/`IS NOT NULL`, and `[NOT] '<value>' MEMBER OF(<col>)` for a
-  list-valued field (e.g. `WHERE 'mobile' MEMBER OF(tags)`) — combined with
-  `AND`, `OR`, `NOT`, and parentheses. A quoted string literal forces string
-  comparison — unless it matches the [relative-date
-  grammar](#relative-date-literals) (`'-7d'`, `'today'`, `'now'`, …), in
-  which case it's resolved to a concrete date/timestamp before comparing; a
-  bare numeric literal compares numerically.
+  NULL`/`IS NOT NULL`, and `[NOT] <expr> MEMBER OF(<col>)` for a
+  list-valued field. **The tested side of `LIKE`, `IN`, `IS NULL`, and
+  `MEMBER OF` is likewise a full scalar expression**, not just a bare
+  column, so `WHERE lower(status) LIKE '%draft%'`, `WHERE trim(x) IS
+  NULL`, and `WHERE lead MEMBER OF(tags)` (a column on the left —
+  previously it had to be a literal) all work, e.g. `WHERE 'mobile' MEMBER
+  OF(tags)` still does too — combined with `AND`, `OR`, `NOT`, and
+  parentheses. A quoted string literal forces string comparison — unless
+  it matches the [relative-date grammar](#relative-date-literals)
+  (`'-7d'`, `'today'`, `'now'`, …), in which case it's resolved to a
+  concrete date/timestamp before comparing; a bare numeric literal
+  compares numerically.
 - **GROUP BY** — one or more grouping keys, each a column or a `SELECT AS`
   alias that resolves to one (`GROUP BY <alias>`); every non-aggregate
   `SELECT` item must be composed entirely of grouping-key columns.
