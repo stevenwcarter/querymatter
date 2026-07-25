@@ -58,6 +58,13 @@ fn write_config(dir: &Path, body: &str) {
     fs::write(path.join("config.toml"), body).unwrap();
 }
 
+/// Writes a vault-level `.querymatter.toml` directly into `dir` (the vault
+/// root) — distinct from [`write_config`]'s per-user
+/// `<home>/querymatter/config.toml` (W54).
+fn write_vault_config(dir: &Path, body: &str) {
+    fs::write(dir.join(".querymatter.toml"), body).unwrap();
+}
+
 /// Finds the `config list`/`.settings` row for `key` (the line whose first
 /// word is its name), so a test can assert a value and source are on the
 /// SAME row rather than merely present somewhere in the output.
@@ -1044,6 +1051,142 @@ fn force_cache_returns_stale_value_after_on_disk_edit() {
     );
 }
 
+/// Task 7 (W56 part 2), test 1 (brief): `WHERE file.body LIKE '%TODO%'`
+/// matches a fixture whose body contains it, end to end through the real
+/// CLI/cache path (not just the in-process executor unit tests).
+#[test]
+fn file_body_like_matches_a_fixture_containing_todo() {
+    let td = TempDir::new().unwrap();
+    fs::write(
+        td.path().join("has-todo.md"),
+        "---\nstatus: draft\n---\nTODO fix this\n",
+    )
+    .unwrap();
+    fs::write(
+        td.path().join("no-todo.md"),
+        "---\nstatus: draft\n---\nall done\n",
+    )
+    .unwrap();
+    let home = TempDir::new().unwrap();
+
+    let out = qm(home.path())
+        .current_dir(td.path())
+        .args([
+            "-e",
+            "SELECT file.name WHERE file.body LIKE '%TODO%'",
+            "--format",
+            "csv",
+            "--no-cache",
+            ".",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    assert_eq!(s.lines().last().unwrap().trim(), "has-todo.md");
+}
+
+/// Task 7 (W56 part 2), test 2 (brief): under `--force-cache`, a `file.body`
+/// query yields NULL under `--lenient`, and a clear diagnostic (nonzero exit,
+/// stderr naming `--force-cache`) in strict (default) mode — never a wrong
+/// answer.
+#[test]
+fn file_body_under_force_cache_is_null_lenient_and_diagnostic_strict() {
+    let td = TempDir::new().unwrap();
+    fs::write(
+        td.path().join("a.md"),
+        "---\nstatus: draft\n---\nTODO fix this\n",
+    )
+    .unwrap();
+    let home = TempDir::new().unwrap();
+
+    qm(home.path())
+        .arg("init")
+        .arg(td.path())
+        .assert()
+        .success();
+
+    // Strict (default): the whole query fails fast with a clear diagnostic.
+    qm(home.path())
+        .current_dir(td.path())
+        .args(["-e", "SELECT file.body", "--force-cache"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("force-cache"));
+
+    // --lenient: the query still runs, resolving file.body to NULL (empty
+    // in CSV) rather than erroring or returning stale/wrong text.
+    let out = qm(home.path())
+        .current_dir(td.path())
+        .args([
+            "-e",
+            "SELECT file.body",
+            "--force-cache",
+            "--lenient",
+            "--format",
+            "csv",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    assert_eq!(
+        s.lines().last().unwrap().trim(),
+        "\"\"",
+        "file.body under --force-cache --lenient must be NULL (empty in CSV), got: {s:?}"
+    );
+}
+
+/// Task 7 (W56 part 2), test 3 (brief): a frontmatter-only query performs NO
+/// body read — proven by deleting every source file after `init` builds the
+/// cache, then running a normal-freshness (not `--force-cache`) query that
+/// never references `file.body`. If evaluating an unrelated column ever
+/// eagerly touched `file.body`'s disk read, `--force-cache` (which forbids
+/// ANY filesystem access beyond the initial cache read) would surface it as
+/// a hard failure — the source files are gone, so any such access errors.
+/// Plain per-file freshness isn't a suitable vehicle for this check: it
+/// would itself notice the deletion and drop the row (a correct, unrelated
+/// behavior — see `new_file_added_and_deleted_file_dropped` in
+/// `cache.rs`), giving a false signal either way.
+#[test]
+fn frontmatter_only_query_needs_no_body_read_after_files_deleted() {
+    let td = TempDir::new().unwrap();
+    fs::write(
+        td.path().join("a.md"),
+        "---\nstatus: draft\n---\nTODO fix this\n",
+    )
+    .unwrap();
+    let home = TempDir::new().unwrap();
+
+    qm(home.path())
+        .arg("init")
+        .arg(td.path())
+        .assert()
+        .success();
+
+    fs::remove_file(td.path().join("a.md")).unwrap();
+
+    let out = qm(home.path())
+        .current_dir(td.path())
+        .args(["-e", "SELECT status", "--format", "csv", "--force-cache"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    assert_eq!(
+        s.lines().last().unwrap().trim(),
+        "draft",
+        "a frontmatter-only --force-cache query must succeed from the cache \
+         alone, even though the source file is gone; got: {s:?}"
+    );
+}
+
 #[test]
 fn default_freshness_reflects_on_disk_edit() {
     // Spec §4 default mode: accurate per-file (mtime+size) freshness
@@ -1361,6 +1504,149 @@ fn config_list_reports_env_as_table_styles_source() {
     assert!(
         table_style_row.contains("unicode") && table_style_row.contains("(env)"),
         "table_style row must show the env value and (env) source, got: {table_style_row:?}"
+    );
+}
+
+// -- Vault-level `.querymatter.toml` (W54): flag > env > vault > config > default
+
+#[test]
+fn vault_config_beats_user_config() {
+    let td = tree();
+    write_vault_config(td.path(), "table_style = \"unicode\"\n");
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "table_style = \"compact\"\n");
+    qm(home.path())
+        .current_dir(td.path())
+        .args(["-e", "SELECT status WHERE prd = '010'"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("╭"));
+}
+
+#[test]
+fn flag_beats_vault_config() {
+    let td = tree();
+    write_vault_config(td.path(), "table_style = \"unicode\"\n");
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .current_dir(td.path())
+        .args([
+            "-e",
+            "SELECT status WHERE prd = '010'",
+            "--table-style",
+            "ascii",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("+--"))
+        .stdout(predicates::str::contains("╭").not());
+}
+
+#[test]
+fn env_beats_vault_config() {
+    let td = tree();
+    write_vault_config(td.path(), "table_style = \"ascii\"\n");
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .current_dir(td.path())
+        .env("QUERYMATTER_TABLE_STYLE", "unicode")
+        .args(["-e", "SELECT status WHERE prd = '010'"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("╭"));
+}
+
+#[test]
+fn config_list_reports_vault_as_table_styles_source() {
+    let td = tree();
+    write_vault_config(td.path(), "table_style = \"unicode\"\n");
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "table_style = \"compact\"\n");
+    let out = qm(home.path())
+        .current_dir(td.path())
+        .args(["config", "list"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(out).unwrap();
+    let table_style_row = row_for(&text, "table_style");
+    assert!(
+        table_style_row.contains("unicode") && table_style_row.contains("(vault)"),
+        "table_style row must show the vault value and (vault) source, got: {table_style_row:?}"
+    );
+}
+
+/// No `.querymatter.toml` anywhere in `td`'s ancestry: vault discovery must
+/// be a pure no-op, falling straight through to the per-user config exactly
+/// as it did before this feature existed.
+#[test]
+fn absent_vault_file_falls_through_to_user_config() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "table_style = \"unicode\"\n");
+    qm(home.path())
+        .current_dir(td.path())
+        .args(["-e", "SELECT status WHERE prd = '010'"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("╭"));
+}
+
+/// A broken vault config blocks every command, just like a broken per-user
+/// config does (`malformed_config_exits_non_zero_naming_the_path` above); its
+/// message must name the vault file specifically, not the user's config.toml.
+#[test]
+fn malformed_vault_config_exits_nonzero_naming_the_path() {
+    let td = tree();
+    write_vault_config(td.path(), "table_style = = broken\n");
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .current_dir(td.path())
+        .args(["-e", "SELECT status"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(".querymatter.toml"));
+}
+
+/// A vault-configured `hidden = true` (no `--hidden` flag, no per-user
+/// config) must reach `init`'s walk exactly like a per-user configured one
+/// does (`config_hidden_true_reaches_init_without_a_flag` above), proving
+/// `run_init` discovers/loads it from the target directory (`args.dir`).
+#[test]
+fn vault_config_hidden_true_reaches_init_without_a_flag() {
+    let td = TempDir::new().unwrap();
+    fs::create_dir_all(td.path().join(".hidden")).unwrap();
+    fs::write(td.path().join(".hidden/a.md"), "---\nstatus: draft\n---\n").unwrap();
+    fs::write(td.path().join("visible.md"), "---\nstatus: draft\n---\n").unwrap();
+    write_vault_config(td.path(), "hidden = true\n");
+
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg("init")
+        .arg(td.path())
+        .assert()
+        .success();
+
+    let out = qm(home.path())
+        .current_dir(td.path())
+        .args([
+            "-e",
+            "SELECT count(*) AS n",
+            "--format",
+            "csv",
+            "--force-cache",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(
+        String::from_utf8(out).unwrap().trim(),
+        "n\n2",
+        "a vault-configured hidden = true must reach init's walk"
     );
 }
 
@@ -1697,6 +1983,120 @@ fn completions_survive_a_malformed_config() {
         .assert()
         .success()
         .stdout(predicates::str::contains("querymatter"));
+}
+
+/// `completions --install bash` writes the generated script straight into
+/// bash's user completion directory (rather than requiring the caller to
+/// redirect stdout there themselves) and confirms the path on stderr.
+#[test]
+fn completions_install_writes_the_script_into_place() {
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["completions", "--install", "bash"])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("installed"));
+
+    let path = home
+        .path()
+        .join(".local/share/bash-completion/completions/querymatter");
+    let script = fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("expected a completion script at {path:?}: {err}"));
+    assert!(script.contains("querymatter"), "script:\n{script}");
+}
+
+/// zsh installs to a dedicated fpath directory of our own (`~/.zsh/completions`,
+/// not `${fpath[1]}` — see the README's note on why) with the `_`-prefixed
+/// filename zsh's completion system expects.
+#[test]
+fn completions_install_writes_zsh_with_underscore_prefix() {
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["completions", "--install", "zsh"])
+        .assert()
+        .success();
+
+    let path = home.path().join(".zsh/completions/_querymatter");
+    assert!(path.exists(), "expected {path:?} to exist");
+}
+
+/// fish installs to `~/.config/fish/completions/<name>.fish`.
+#[test]
+fn completions_install_writes_fish_to_its_completions_dir() {
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args(["completions", "--install", "fish"])
+        .assert()
+        .success();
+
+    let path = home
+        .path()
+        .join(".config/fish/completions/querymatter.fish");
+    assert!(path.exists(), "expected {path:?} to exist");
+}
+
+/// `--install` with no shell named auto-detects one from `$SHELL`.
+#[test]
+fn completions_install_auto_detects_the_shell_from_env() {
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .env("SHELL", "/usr/bin/fish")
+        .arg("completions")
+        .arg("--install")
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("installed"));
+
+    let path = home
+        .path()
+        .join(".config/fish/completions/querymatter.fish");
+    assert!(path.exists(), "expected {path:?} to exist");
+}
+
+/// An unwritable/uncreatable target must not leave the user stuck: a clear
+/// stderr error, PLUS the same script on stdout `--install` would otherwise
+/// have replaced (today's plain behavior). `.local` is pre-created as a
+/// plain file (not a directory) so `create_dir_all` deterministically fails —
+/// unlike a chmod-based permission test, which a root-run CI would silently
+/// ignore.
+#[test]
+fn completions_install_falls_back_to_stdout_when_the_target_is_unwritable() {
+    let home = TempDir::new().unwrap();
+    fs::write(home.path().join(".local"), "not a directory").unwrap();
+
+    qm(home.path())
+        .args(["completions", "--install", "bash"])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("could not install"))
+        .stdout(predicates::str::contains("querymatter"));
+}
+
+/// With no shell named and an unrecognized/absent `$SHELL`, there is no
+/// script to produce at all — the one case `--install` treats as a hard
+/// error rather than falling back.
+#[test]
+fn completions_install_errors_clearly_when_the_shell_cannot_be_detected() {
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .env("SHELL", "/bin/tcsh")
+        .arg("completions")
+        .arg("--install")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("SHELL"));
+}
+
+/// The plain (no `--install`) path must be completely unaffected by any of
+/// the above: still a required positional, still stdout-only.
+#[test]
+fn completions_with_no_shell_and_no_install_errors_clearly() {
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg("completions")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("required"));
 }
 
 /// A typo'd column (`staus` for `status`) must fail the query with a
@@ -2580,4 +2980,101 @@ fn explain_verdict_matches_discover_membership_end_to_end() {
             assert!(out.contains("excluded:"), "{rel}: got {out:?}");
         }
     }
+}
+
+/// I2 (W57 characterization): a strict-ISO `created` field auto-detects to
+/// `Value::Date` at ingest rather than staying `Value::Str`, and the
+/// relative-date literal it's compared against resolves to an ISO string —
+/// pin that `WHERE created > '-7d'` still returns exactly the rows it would
+/// have before dates existed, end to end through the real binary. Fixture
+/// dates are computed from the real clock (this codebase has no `--now`
+/// override for the CLI, unlike `execute_with_schema_at`'s test-only seam),
+/// so the test stays correct regardless of when it runs.
+#[test]
+fn relative_date_filter_matches_after_auto_detected_date_type() {
+    use chrono::{DateTime, Duration, Utc};
+
+    // `chrono`'s "clock" feature is off (see Cargo.toml), so read the real
+    // time via `std::time::SystemTime::now()` and convert, rather than
+    // `Utc::now()` directly — the same pattern `model::system_time_to_iso`
+    // and `query::exec::resolve_reldate` already use.
+    let today = DateTime::<Utc>::from(std::time::SystemTime::now()).date_naive();
+    let recent = (today - Duration::days(3)).format("%Y-%m-%d").to_string();
+    let old = (today - Duration::days(30)).format("%Y-%m-%d").to_string();
+
+    let td = TempDir::new().unwrap();
+    fs::write(
+        td.path().join("recent.md"),
+        format!("---\ncreated: {recent}\n---\n"),
+    )
+    .unwrap();
+    fs::write(
+        td.path().join("old.md"),
+        format!("---\ncreated: {old}\n---\n"),
+    )
+    .unwrap();
+
+    let home = TempDir::new().unwrap();
+    let out = qm(home.path())
+        .args([
+            "-e",
+            "SELECT file.name WHERE created > '-7d'",
+            "--format",
+            "csv",
+        ])
+        .arg(td.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(
+        String::from_utf8(out).unwrap().trim(),
+        "file.name\nrecent.md"
+    );
+}
+
+/// I1 (W57 characterization): a `Value::Date` field must render its ISO text
+/// byte-identical to the source frontmatter string, across every output
+/// format — a date must not render any differently from the `Value::Str` it
+/// would have been before auto-detection.
+#[test]
+fn date_field_renders_verbatim_across_csv_json_table() {
+    let td = TempDir::new().unwrap();
+    fs::write(td.path().join("a.md"), "---\ncreated: 2026-03-15\n---\n").unwrap();
+    let home = TempDir::new().unwrap();
+
+    let csv = qm(home.path())
+        .args(["-e", "SELECT created", "--format", "csv"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(
+        String::from_utf8(csv).unwrap().trim(),
+        "created\n2026-03-15"
+    );
+
+    let json = qm(home.path())
+        .args(["-e", "SELECT created", "--format", "json"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
+    assert_eq!(
+        v.as_array().unwrap()[0]["created"],
+        serde_json::Value::String("2026-03-15".into())
+    );
+
+    qm(home.path())
+        .args(["-e", "SELECT created", "--format", "table"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("2026-03-15"));
 }

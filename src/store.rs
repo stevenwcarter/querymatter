@@ -241,7 +241,10 @@ impl InMemoryStore {
     /// [`cache::refresh_subtree`] for a directory *outside* the subtree being
     /// refreshed, where it's carried through unread rather than compared
     /// against — so its stat accuracy doesn't matter, only that it
-    /// round-trips through [`cache::save_cache`] cleanly.
+    /// round-trips through [`cache::save_cache`] cleanly. Unlike those stats,
+    /// `fields` and `word_count` are read straight off the existing `Record`
+    /// (no extra I/O), so a subsequent read of the persisted cache still
+    /// answers `file.word_count` correctly rather than a stale `0`.
     ///
     /// Invariant this depends on: `self.slices`' records must carry every
     /// field, not a projection-push-down-pruned subset (design W17) — a
@@ -278,6 +281,7 @@ impl InMemoryStore {
                     mtime: SystemTime::UNIX_EPOCH,
                     size: 0,
                     fields,
+                    word_count: record.word_count(),
                 });
             }
         }
@@ -446,6 +450,7 @@ fn scan_root(
                 field_names.extend(file.fields.keys().cloned());
                 let mtime = file.mtime;
                 let size = file.size;
+                let word_count = file.word_count;
                 let fields = match wanted {
                     None => file.fields,
                     Some(set) => file
@@ -454,7 +459,7 @@ fn scan_root(
                         .filter(|(name, _)| set.contains(name))
                         .collect(),
                 };
-                records.push(Record::new(root, &path, fields, mtime, size));
+                records.push(Record::new(root, &path, fields, mtime, size, word_count));
                 report.loaded += 1;
             }
             ScanResult::NoFrontmatter => {}
@@ -544,6 +549,59 @@ mod tests {
         );
 
         assert_file_size_and_mtime_row(&store);
+    }
+
+    /// A known fixture body: five whitespace-separated words after the
+    /// frontmatter fence. Shared by the live-scan and cache-path
+    /// `file.word_count` producer-parity tests below (Task 6, W56).
+    const WORD_COUNT_FIXTURE_BODY: &str = "---\nstatus: draft\n---\none two three four five\n";
+    const WORD_COUNT_FIXTURE_COUNT: i64 = 5;
+
+    /// Runs `SELECT file.word_count` over `store`'s records and checks the
+    /// single row matches [`WORD_COUNT_FIXTURE_COUNT`] — pinning that both
+    /// producers (live scan and on-disk cache) expose the real body word
+    /// count, not a placeholder `0`.
+    fn assert_file_word_count_row(store: &InMemoryStore) {
+        let parsed = crate::query::parse("SELECT file.word_count").unwrap();
+        let result = crate::query::execute(&parsed, store.records(), false).unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0], Value::Int(WORD_COUNT_FIXTURE_COUNT));
+    }
+
+    /// Producer-parity guard, LIVE half (Task 6, W56): `scan_root` must
+    /// surface the body's real word count through `file.word_count`, not a
+    /// placeholder `0` — the count `cache::scan_file` already computed via
+    /// `frontmatter::extract`, threaded through at zero extra work.
+    #[test]
+    fn scan_root_exposes_file_word_count() {
+        let td = TempDir::new().unwrap();
+        write(td.path(), "a.md", WORD_COUNT_FIXTURE_BODY);
+
+        let (store, _report) =
+            InMemoryStore::load(vec![td.path().to_path_buf()], WalkOpts::default(), None);
+
+        assert_file_word_count_row(&store);
+    }
+
+    /// Producer-parity guard, CACHE half (Task 6, W56): `records_from`
+    /// (behind `InMemoryStore::from_cache`) must expose `file.word_count`
+    /// identically to the live scan, threading through the persisted
+    /// `CachedFile::word_count` rather than a placeholder.
+    #[test]
+    fn from_cache_exposes_file_word_count() {
+        let td = TempDir::new().unwrap();
+        write(td.path(), "a.md", WORD_COUNT_FIXTURE_BODY);
+        cache::build_vault(td.path(), &WalkOpts::default(), 300).unwrap();
+
+        let (store, _report) = InMemoryStore::from_cache(
+            td.path(),
+            WalkOpts::default(),
+            Freshness::PerFile,
+            None,
+            None,
+        );
+
+        assert_file_word_count_row(&store);
     }
 
     #[test]
@@ -655,11 +713,13 @@ mod tests {
 
         let parsed = crate::query::parse("SELECT roadmap").unwrap();
         assert!(
-            crate::query::execute_with_schema(&parsed, store.records(), &schema, false).is_err(),
+            crate::query::execute_with_schema(&parsed, store.records(), &schema, false, true)
+                .is_err(),
             "a product-only column must be unknown under a plans-scoped default-mode query"
         );
         assert!(
-            crate::query::execute_with_schema(&parsed, store.records(), &schema, true).is_ok(),
+            crate::query::execute_with_schema(&parsed, store.records(), &schema, true, true)
+                .is_ok(),
             "--lenient must bypass the subtree-scoped validation surface"
         );
     }

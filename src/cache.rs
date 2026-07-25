@@ -39,16 +39,23 @@ pub const MAGIC: [u8; 4] = *b"QMDB";
 /// Bumped whenever any cached struct's shape changes. Together with `MAGIC`
 /// this is the only safe "format changed → discard the cache" mechanism,
 /// since bincode itself has no schema versioning.
-pub const SCHEMA_VERSION: u32 = 2;
+///
+/// 2 -> 3 (W56): [`CachedFile`] gained `word_count`, changing bincode's
+/// positional layout — a v2 blob must be rejected outright, not mis-decoded
+/// into a shifted `CachedFile`.
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// One cached Markdown file: its frontmatter fields plus enough metadata
-/// (`mtime`, `size`) to detect that it has changed on disk.
+/// (`mtime`, `size`, `word_count`) to detect that it has changed on disk and
+/// to answer `file.*` pseudo-columns without re-reading the file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CachedFile {
     pub rel_path: String,
     pub mtime: SystemTime,
     pub size: u64,
     pub fields: IndexMap<String, Value>,
+    /// The Markdown body's word count (see [`frontmatter::extract`]).
+    pub word_count: usize,
 }
 
 /// One cached filesystem directory: every matched file directly under it,
@@ -318,6 +325,35 @@ pub fn find_vault(start: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Filename of the vault-level shared config a team can commit at the vault
+/// root, spliced into [`crate::settings`] resolution between the environment
+/// and the per-user config file (`Source::Vault`).
+const VAULT_CONFIG_FILE_NAME: &str = ".querymatter.toml";
+
+/// Walks `start` upward through its ancestors, returning the path of the
+/// first `.querymatter.toml` file found — the vault-level config a team can
+/// commit at the vault root.
+///
+/// Deliberately independent of [`find_vault`]/[`manifest_exists`]: a
+/// `.querymatter.toml` need not sit alongside a `.querymatter/` cache
+/// directory (a team can commit shared defaults before anyone has ever run
+/// `init`), and a `.querymatter/` cache directory implies nothing about
+/// whether a `.querymatter.toml` exists anywhere above it. The two walks are
+/// independent for the same reason `find_vault` and this function don't
+/// share a loop: they're keyed off different files entirely.
+pub fn find_vault_config(start: &Path) -> Option<PathBuf> {
+    let mut dir = start.canonicalize().ok()?;
+    loop {
+        let candidate = dir.join(VAULT_CONFIG_FILE_NAME);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
 /// Resolves a `--refresh`/`.refresh <PATH>` argument to an absolute path
 /// under `vault`.
 ///
@@ -406,7 +442,7 @@ pub fn scan_file(dir: &Path, path: &Path) -> ScanResult {
         Err(err) => return ScanResult::Warning(format!("{}: {err}", path.display())),
     };
     match frontmatter::extract(&content) {
-        Extract::Fields(fields) => ScanResult::Cached(CachedFile {
+        Extract::Fields { fields, word_count } => ScanResult::Cached(CachedFile {
             rel_path: path
                 .strip_prefix(dir)
                 .unwrap_or(path)
@@ -415,6 +451,7 @@ pub fn scan_file(dir: &Path, path: &Path) -> ScanResult {
             mtime,
             size,
             fields,
+            word_count,
         }),
         Extract::None => ScanResult::NoFrontmatter,
         Extract::Invalid(msg) => ScanResult::Warning(format!("{}: {msg}", path.display())),
@@ -744,7 +781,7 @@ pub fn records_from(
                             .map(|(name, value)| (name.clone(), value.clone()))
                             .collect(),
                     };
-                    Record::new(root, &path, fields, file.mtime, file.size)
+                    Record::new(root, &path, fields, file.mtime, file.size, file.word_count)
                 })
                 .collect();
             (cached_dir.dir.clone(), records, field_names)
@@ -908,6 +945,7 @@ mod tests {
                 mtime: UNIX_EPOCH + Duration::from_secs(800),
                 size: 42,
                 fields: f,
+                word_count: 7,
             }],
         }
     }
@@ -956,6 +994,30 @@ mod tests {
         };
         let mut bytes = write_manifest_bytes(&body);
         bytes[4..8].copy_from_slice(&(SCHEMA_VERSION + 1).to_le_bytes());
+        assert_eq!(read_manifest_bytes(&bytes), None);
+    }
+    /// Task 6 (W56): pins the exact bump this task makes. If this ever
+    /// fails, `SCHEMA_VERSION` moved without updating this test's
+    /// expectation alongside it.
+    #[test]
+    fn schema_version_is_3() {
+        assert_eq!(SCHEMA_VERSION, 3);
+    }
+    /// A manifest written by the pre-`word_count` v2 schema must be
+    /// rejected outright rather than mis-decoded into a `CachedFile` whose
+    /// bincode layout has since shifted (see the `SCHEMA_VERSION` doc
+    /// comment). Simulates a real v2 cache by hard-coding `2` (not
+    /// `SCHEMA_VERSION - 1`), so this test keeps meaning what it says even
+    /// if `SCHEMA_VERSION` moves again later.
+    #[test]
+    fn stale_v2_cache_is_rejected_after_schema_bump() {
+        let body = ManifestBody {
+            crate_version: "x".into(),
+            ttl_secs: 1,
+            dirs: vec![],
+        };
+        let mut bytes = write_manifest_bytes(&body);
+        bytes[4..8].copy_from_slice(&2u32.to_le_bytes());
         assert_eq!(read_manifest_bytes(&bytes), None);
     }
     #[test]
@@ -1122,6 +1184,59 @@ mod tests {
 
         let other = TempDir::new().unwrap();
         assert_eq!(find_vault(other.path()), None);
+    }
+
+    #[test]
+    fn find_vault_config_finds_ancestor_file() {
+        let td = TempDir::new().unwrap();
+        fs::write(
+            td.path().join(".querymatter.toml"),
+            "table_style = \"unicode\"\n",
+        )
+        .unwrap();
+        let deep = td.path().join("a/b/c");
+        fs::create_dir_all(&deep).unwrap();
+        assert_eq!(
+            find_vault_config(&deep),
+            Some(
+                fs::canonicalize(td.path())
+                    .unwrap()
+                    .join(".querymatter.toml")
+            )
+        );
+    }
+
+    #[test]
+    fn find_vault_config_returns_none_when_absent() {
+        let td = TempDir::new().unwrap();
+        assert_eq!(find_vault_config(td.path()), None);
+    }
+
+    /// W54: a `.querymatter.toml` is found regardless of whether a
+    /// `.querymatter/` cache directory exists anywhere in the same ancestry,
+    /// and vice versa — the two discoveries must never gate one another.
+    #[test]
+    fn find_vault_config_is_independent_of_the_cache_dir() {
+        let td = TempDir::new().unwrap();
+        save_cache(td.path(), &[], 300).unwrap();
+        assert!(manifest_exists(td.path()), "sanity: a cache dir exists");
+        assert_eq!(
+            find_vault_config(td.path()),
+            None,
+            "a cache dir with no .querymatter.toml must not be mistaken for one"
+        );
+
+        let other = TempDir::new().unwrap();
+        fs::write(other.path().join(".querymatter.toml"), "hidden = true\n").unwrap();
+        assert!(!manifest_exists(other.path()), "sanity: no cache dir here");
+        assert_eq!(
+            find_vault_config(other.path()),
+            Some(
+                fs::canonicalize(other.path())
+                    .unwrap()
+                    .join(".querymatter.toml")
+            )
+        );
     }
 
     fn write_file(dir: &Path, rel: &str, body: &str) {

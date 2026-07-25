@@ -16,16 +16,22 @@ pub enum Extract {
     /// the YAML failed to parse, or it parsed to something other than a
     /// top-level mapping. The message is human-readable.
     Invalid(String),
-    /// A fence was found and parsed into field name/value pairs.
-    ///
-    /// Order is whatever gray_matter's YAML engine hands back: its
-    /// `Pod::Hash` is a plain `HashMap`, so this is *not* guaranteed to
-    /// match the order fields appeared in the source document.
-    Fields(IndexMap<String, Value>),
+    /// A fence was found and parsed into field name/value pairs, plus the
+    /// word count of the body that follows the fence.
+    Fields {
+        /// Order is whatever gray_matter's YAML engine hands back: its
+        /// `Pod::Hash` is a plain `HashMap`, so this is *not* guaranteed to
+        /// match the order fields appeared in the source document.
+        fields: IndexMap<String, Value>,
+        /// The number of whitespace-separated words in the document's body
+        /// (everything after the closing `---` fence), per
+        /// `str::split_whitespace`.
+        word_count: usize,
+    },
 }
 
 /// Pulls the leading `---`-fenced YAML block out of `content` and converts
-/// it into a field map.
+/// it into a field map, alongside the body's word count.
 ///
 /// Returns [`Extract::None`] when there is no fence, [`Extract::Invalid`]
 /// when a fence exists but its contents aren't a valid YAML mapping, and
@@ -46,7 +52,26 @@ pub fn extract(content: &str) -> Extract {
         .into_iter()
         .map(|(key, value)| (key, pod_to_value(value)))
         .collect();
-    Extract::Fields(fields)
+    let word_count = parsed.content.split_whitespace().count();
+    Extract::Fields { fields, word_count }
+}
+
+/// The Markdown body after the frontmatter fence — the exact text [`extract`]
+/// counts words from, exposed standalone for `file.body`'s eval-time disk
+/// read ([`crate::query::exec::read_body`]), which re-parses a freshly-read
+/// file fresh rather than reusing anything cached (design W56: only the word
+/// count is ever persisted, never the body text itself).
+///
+/// `None` when `content`'s frontmatter fence, if present, isn't valid YAML —
+/// the same condition [`extract`] reports as [`Extract::Invalid`]; a file
+/// with no fence at all (or an empty one) still yields `Some` (gray_matter
+/// treats the whole input as body content in that case, matching `extract`'s
+/// [`Extract::None`] behavior for word-counting purposes).
+pub fn body(content: &str) -> Option<String> {
+    Matter::<YAML>::new()
+        .parse::<Pod>(content)
+        .ok()
+        .map(|parsed| parsed.content)
 }
 
 /// Converts gray_matter's dynamic `Pod` into our `Value`.
@@ -58,13 +83,33 @@ pub fn extract(content: &str) -> Extract {
 fn pod_to_value(pod: Pod) -> Value {
     match pod {
         Pod::Null => Value::Null,
-        Pod::String(s) => Value::Str(s),
+        Pod::String(s) => detect_scalar(&s),
         Pod::Integer(i) => Value::Int(i),
         Pod::Float(f) => Value::Float(f),
         Pod::Boolean(b) => Value::Bool(b),
         Pod::Array(items) => Value::List(items.into_iter().map(pod_to_value).collect()),
         Pod::Hash(map) => Value::Map(map.into_iter().map(|(k, v)| (k, pod_to_value(v))).collect()),
     }
+}
+
+/// A frontmatter scalar string becomes a [`Value::Date`] (strict `%Y-%m-%d`)
+/// or [`Value::DateTime`] (strict RFC3339); anything else stays a
+/// [`Value::Str`]. Strict: chrono's own parse must accept the whole string,
+/// so partial forms (`2026`, `2026-07`) and invalid dates (bad month/day)
+/// fall through to `Str`.
+///
+/// `%Y-%m-%d` doesn't require zero-padded month/day — `2026-7-4` parses as a
+/// valid date and is deliberately accepted as `Value::Date`: it's
+/// unambiguous, and rejecting it would need an extra regex pre-check for no
+/// real benefit (see `non_zero_padded_date_is_still_a_date` below).
+fn detect_scalar(s: &str) -> Value {
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return Value::Date(d);
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Value::DateTime(dt.with_timezone(&chrono::Utc));
+    }
+    Value::Str(s.to_string())
 }
 
 #[cfg(test)]
@@ -76,7 +121,7 @@ mod tests {
     fn scalars_parse_to_fields() {
         let c = "---\njira: DCP-459\nstatus: draft\n---\n# body\n";
         match extract(c) {
-            Extract::Fields(m) => {
+            Extract::Fields { fields: m, .. } => {
                 assert_eq!(m.get("jira"), Some(&Value::Str("DCP-459".into())));
                 assert_eq!(m.get("status"), Some(&Value::Str("draft".into())));
             }
@@ -100,7 +145,7 @@ mod tests {
     fn list_value_becomes_list() {
         let c = "---\ntags:\n  - a\n  - b\n---\n";
         match extract(c) {
-            Extract::Fields(m) => assert_eq!(
+            Extract::Fields { fields: m, .. } => assert_eq!(
                 m.get("tags"),
                 Some(&Value::List(vec![
                     Value::Str("a".into()),
@@ -117,7 +162,7 @@ mod tests {
     #[test]
     fn leading_zero_characterization() {
         let c = "---\nprd: 010\n---\n";
-        let Extract::Fields(m) = extract(c) else {
+        let Extract::Fields { fields: m, .. } = extract(c) else {
             panic!("expected Fields")
         };
         let got = m.get("prd").cloned().unwrap();
@@ -128,15 +173,92 @@ mod tests {
     #[test]
     fn quoted_leading_zero_is_string() {
         let c = "---\nprd: \"010\"\n---\n";
-        let Extract::Fields(m) = extract(c) else {
+        let Extract::Fields { fields: m, .. } = extract(c) else {
             panic!("expected Fields")
         };
         assert_eq!(m.get("prd"), Some(&Value::Str("010".into())));
     }
     #[test]
+    fn strict_iso_strings_become_dates_others_stay_strings() {
+        use chrono::NaiveDate;
+        assert_eq!(
+            detect_scalar("2026-07-24"),
+            Value::Date(NaiveDate::from_ymd_opt(2026, 7, 24).unwrap())
+        );
+        assert!(matches!(
+            detect_scalar("2026-07-24T10:00:00Z"),
+            Value::DateTime(_)
+        ));
+        // non-dates stay strings/ints — I5
+        for s in [
+            "2026",
+            "2026-07",
+            "1.2.3",
+            "v1",
+            "draft",
+            "2026-13-01",
+            "2026-07-99",
+        ] {
+            assert_eq!(
+                detect_scalar(s),
+                Value::Str(s.to_string()),
+                "{s} must stay a string"
+            );
+        }
+    }
+
+    // Decision (task 2, W57): non-zero-padded month/day is unambiguous, so we
+    // accept it as a Date rather than adding a regex pre-check to force
+    // zero-padding. Pinned here so a future change to detect_scalar can't
+    // silently flip this.
+    #[test]
+    fn non_zero_padded_date_is_still_a_date() {
+        use chrono::NaiveDate;
+        assert_eq!(
+            detect_scalar("2026-7-4"),
+            Value::Date(NaiveDate::from_ymd_opt(2026, 7, 4).unwrap())
+        );
+    }
+
+    // Task 6 (W56): the body's word count, split on whitespace, is returned
+    // alongside the fields rather than silently discarded.
+    #[test]
+    fn word_count_counts_the_body_after_the_fence() {
+        let c = "---\nstatus: draft\n---\none two three four five\n";
+        let Extract::Fields { word_count, .. } = extract(c) else {
+            panic!("expected Fields")
+        };
+        assert_eq!(word_count, 5);
+    }
+
+    #[test]
+    fn word_count_is_zero_for_an_empty_body() {
+        let c = "---\nstatus: draft\n---\n";
+        let Extract::Fields { word_count, .. } = extract(c) else {
+            panic!("expected Fields")
+        };
+        assert_eq!(word_count, 0);
+    }
+
+    // Task 7 (W56 part 2): `body` exposes the same post-fence text
+    // `word_count` was already counting, standalone — for `file.body`'s
+    // eval-time re-read.
+    #[test]
+    fn body_returns_the_text_after_the_fence() {
+        let c = "---\nstatus: draft\n---\nTODO fix this\n";
+        assert_eq!(body(c).as_deref(), Some("TODO fix this"));
+    }
+
+    #[test]
+    fn body_is_none_for_invalid_frontmatter_yaml() {
+        let c = "---\nkey: : : broken\n  bad indent\n---\n";
+        assert_eq!(body(c), None);
+    }
+
+    #[test]
     fn nested_mapping_becomes_value_map() {
         let c = "---\nestimate:\n  low: 5\n  high: 10\n---\n";
-        let Extract::Fields(m) = extract(c) else {
+        let Extract::Fields { fields: m, .. } = extract(c) else {
             panic!("expected Fields")
         };
         let mut expected = IndexMap::new();

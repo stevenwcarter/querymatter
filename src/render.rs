@@ -265,6 +265,7 @@ fn to_json(value: &Value) -> JsonValue {
             serde_json::Number::from_f64(*f).map_or(JsonValue::Null, JsonValue::Number)
         }
         Value::Str(s) => JsonValue::String(s.clone()),
+        Value::Date(_) | Value::DateTime(_) => JsonValue::String(value.display()),
         Value::List(items) => JsonValue::Array(items.iter().map(to_json).collect()),
         Value::Map(m) => {
             JsonValue::Object(m.iter().map(|(k, v)| (k.clone(), to_json(v))).collect())

@@ -1,7 +1,7 @@
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use indexmap::IndexMap;
 use std::cmp::Ordering;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 /// A dynamically-typed value read from Markdown YAML frontmatter.
@@ -18,6 +18,20 @@ pub enum Value {
     Str(String),
     List(Vec<Value>),
     Map(IndexMap<String, Value>),
+    /// A calendar date with no time component (e.g. from a `YYYY-MM-DD`
+    /// frontmatter field once ingest auto-detects it — not yet produced by
+    /// any code path as of this variant's introduction).
+    ///
+    /// Declared after `List`/`Map` (not alongside the other scalars) so this
+    /// serde-derive enum's variant indices — which `bincode` uses as the
+    /// on-disk tag for the `.querymatter` cache — don't shift `List`/`Map`'s
+    /// existing discriminants; see `bincode_tags_are_stable_for_list_and_map`.
+    Date(NaiveDate),
+    /// A UTC instant (e.g. from an RFC3339 frontmatter field once ingest
+    /// auto-detects it — not yet produced by any code path as of this
+    /// variant's introduction). Kept after `Date` for the same
+    /// discriminant-stability reason.
+    DateTime(DateTime<Utc>),
 }
 
 impl Value {
@@ -37,6 +51,8 @@ impl Value {
             Value::Int(i) => i.to_string(),
             Value::Float(f) => f.to_string(),
             Value::Str(s) => s.clone(),
+            Value::Date(d) => d.format("%Y-%m-%d").to_string(),
+            Value::DateTime(dt) => dt.to_rfc3339_opts(SecondsFormat::Secs, true),
             Value::List(items) => items
                 .iter()
                 .map(Value::display)
@@ -56,6 +72,8 @@ impl Value {
             Value::Int(_) => "Int",
             Value::Float(_) => "Float",
             Value::Str(_) => "Str",
+            Value::Date(_) => "Date",
+            Value::DateTime(_) => "DateTime",
             Value::List(_) => "List",
             Value::Map(_) => "Map",
         }
@@ -71,7 +89,12 @@ impl Value {
             Value::Int(i) => Some(*i as f64),
             Value::Float(f) => Some(*f),
             Value::Str(s) => s.trim().parse::<f64>().ok(),
-            Value::Bool(_) | Value::Null | Value::List(_) | Value::Map(_) => None,
+            Value::Bool(_)
+            | Value::Null
+            | Value::Date(_)
+            | Value::DateTime(_)
+            | Value::List(_)
+            | Value::Map(_) => None,
         }
     }
 
@@ -92,6 +115,7 @@ fn compact_value(v: &Value) -> String {
         Value::Int(i) => i.to_string(),
         Value::Float(f) => f.to_string(),
         Value::Str(s) => s.clone(),
+        Value::Date(_) | Value::DateTime(_) => v.display(),
         Value::List(items) => {
             let rendered: Vec<_> = items.iter().map(compact_value).collect();
             format!("[{}]", rendered.join(", "))
@@ -110,17 +134,66 @@ fn compact_value(v: &Value) -> String {
 
 /// Total-ish ordering used by `ORDER BY`/`MIN`/`MAX`.
 ///
-/// Values that both coerce to a number compare numerically; otherwise they
-/// compare lexicographically on `to_cmp_string()`. Comparing `Null` against
-/// anything (including another `Null`) returns `None` — callers are
-/// responsible for placing NULLs last.
+/// Values that both coerce to a number compare numerically; a `Date`/
+/// `DateTime` on either side is handled first by [`compare_dates`] (see its
+/// doc for exactly which pairings compare natively vs. via ISO text);
+/// otherwise they compare lexicographically on `to_cmp_string()`. Comparing
+/// `Null` against anything (including another `Null`) returns `None` —
+/// callers are responsible for placing NULLs last.
 pub fn compare_values(a: &Value, b: &Value) -> Option<Ordering> {
     if a.is_null() || b.is_null() {
         return None;
     }
+    if let Some(ord) = compare_dates(a, b) {
+        return Some(ord);
+    }
     match (a.as_number(), b.as_number()) {
         (Some(x), Some(y)) => x.partial_cmp(&y),
         _ => Some(a.to_cmp_string().cmp(&b.to_cmp_string())),
+    }
+}
+
+/// Chronological comparison for a `Date`/`DateTime` on either side.
+///
+/// `Date` vs `Date` compares directly via chrono's own `Ord` — `NaiveDate` has
+/// no sub-second (or even sub-day) component, so its native `Ord` already
+/// agrees with a `%Y-%m-%d` text compare. Every other pairing that involves a
+/// `Date`/`DateTime` — `DateTime` vs `DateTime`, a mixed `Date`/`DateTime`
+/// pair, or either against a `Str` — compares `to_cmp_string()` of both (ISO
+/// text, rendered at whole-second granularity — see `Value::display`)
+/// instead. This is required, not just convenient, for two reasons:
+///
+/// - Comparing a mixed pair via the `DateTime`'s date part (`.date_naive()`)
+///   is not a strict-weak ordering — a `Date` could compare `Equal` to two
+///   different `DateTime`s (same day, different times) that are themselves
+///   unequal, violating transitivity.
+/// - Comparing `DateTime` vs `DateTime` at full sub-second precision (instead
+///   of via the same second-granular text every other arm uses) breaks
+///   transitivity the same way: two `DateTime`s differing only in
+///   sub-seconds would compare non-equal to each other yet each compare
+///   `Equal` to a `Str`/`Date` holding their shared seconds-granular text.
+///
+/// Both failure modes are undefined behavior for the `sort_by` that backs
+/// `ORDER BY` (it can panic on a non-transitive comparator). ISO text at
+/// second granularity stays a total order: a same-day `Date`'s string
+/// (`"2026-07-24"`) is a strict prefix of the `DateTime`'s
+/// (`"2026-07-24T…"`), so it always sorts before it. This also sorts
+/// identically to a chronological compare for well-formed ISO strings, and
+/// stays defined (never panics) for anything else (e.g. `"draft"`). Returns
+/// `None` when neither side is a `Date`/`DateTime`, so the caller falls
+/// through to the existing numeric/string rules unchanged.
+fn compare_dates(a: &Value, b: &Value) -> Option<Ordering> {
+    match (a, b) {
+        (Value::Date(x), Value::Date(y)) => Some(x.cmp(y)),
+        (Value::DateTime(_), Value::DateTime(_))
+        | (
+            Value::Date(_) | Value::DateTime(_),
+            Value::Str(_) | Value::Date(_) | Value::DateTime(_),
+        )
+        | (Value::Str(_), Value::Date(_) | Value::DateTime(_)) => {
+            Some(a.to_cmp_string().cmp(&b.to_cmp_string()))
+        }
+        _ => None,
     }
 }
 
@@ -134,6 +207,13 @@ pub enum FileAttr {
     Ext,
     Mtime,
     Size,
+    /// The Markdown body's word count (see [`crate::frontmatter::extract`]).
+    WordCount,
+    /// The Markdown body text itself (the content after the frontmatter
+    /// fence), read from disk lazily at query-eval time — never cached (see
+    /// [`crate::query::exec::read_body`]). This is the one `FileAttr` this
+    /// module's own pure [`Record::file_attr`] cannot resolve.
+    Body,
 }
 
 /// One queryable row: a Markdown file's YAML frontmatter fields, plus its
@@ -147,6 +227,18 @@ pub struct Record {
     ext: String,
     mtime: SystemTime,
     size: u64,
+    word_count: usize,
+    /// The file's absolute path, for [`FileAttr::Body`]'s eval-time disk
+    /// read (see [`crate::query::exec::read_body`]) — every other `file.*`
+    /// attribute is resolved relative to `root` instead (see `path`/`folder`
+    /// below), but a real read needs the whole path. Both live producers
+    /// ([`crate::store::scan_root`]) and cache-backed ones
+    /// ([`crate::cache::records_from`]) always pass an already-canonicalized
+    /// `path` into [`Record::new`], so this is absolute in practice; a
+    /// hand-built test `Record` that passes a relative `path` just gets that
+    /// path back (harmless, since no test constructs a `Record` this way and
+    /// then reads its body).
+    abs_path: PathBuf,
 }
 
 impl Record {
@@ -159,13 +251,16 @@ impl Record {
     /// Path separators are normalized to `/` so output is stable across
     /// platforms. `mtime`/`size` are the file's on-disk stat, already read
     /// by the caller for cache-freshness purposes — this is zero extra I/O,
-    /// not a fresh stat.
+    /// not a fresh stat. `word_count` is the body's word count (see
+    /// [`crate::frontmatter::extract`]), likewise already computed by the
+    /// caller.
     pub fn new(
         root: &Path,
         path: &Path,
         fields: IndexMap<String, Value>,
         mtime: SystemTime,
         size: u64,
+        word_count: usize,
     ) -> Self {
         let relative = path.strip_prefix(root).unwrap_or(path);
         let name = path
@@ -186,6 +281,8 @@ impl Record {
             ext,
             mtime,
             size,
+            word_count,
+            abs_path: path.to_path_buf(),
         }
     }
 
@@ -207,8 +304,17 @@ impl Record {
     }
 
     /// Resolves a `file.*` pseudo-column to its value: `Name`/`Path`/`Folder`/
-    /// `Ext` are strings, `Mtime` is an RFC3339 UTC string, and `Size` is an
-    /// integer byte count.
+    /// `Ext` are strings, `Mtime` is an RFC3339 UTC string, and `Size`/
+    /// `WordCount` are integer counts.
+    ///
+    /// `Body` always resolves to `Value::Null` here — this function is pure
+    /// (`&self -> Value`, no I/O, no disk-access gate), so it cannot perform
+    /// the real read `file.body` needs. The query executor special-cases
+    /// `ColRef::File(FileAttr::Body)` *before* it would ever reach this
+    /// match, resolving it via [`crate::query::exec::read_body`] against
+    /// [`Record::abs_path`] instead (see `query::exec::resolve_col`). This
+    /// arm exists only so the match stays exhaustive over [`FileAttr`];
+    /// reaching it for a real `file.body` query would be a caller bug.
     pub fn file_attr(&self, attr: FileAttr) -> Value {
         match attr {
             FileAttr::Name => Value::Str(self.name.clone()),
@@ -217,7 +323,25 @@ impl Record {
             FileAttr::Ext => Value::Str(self.ext.clone()),
             FileAttr::Mtime => Value::Str(system_time_to_iso(self.mtime)),
             FileAttr::Size => Value::Int(self.size as i64),
+            FileAttr::WordCount => Value::Int(self.word_count as i64),
+            FileAttr::Body => Value::Null,
         }
+    }
+
+    /// This file's absolute path, for `file.body`'s eval-time disk read (see
+    /// [`crate::query::exec::read_body`]). Every other `file.*` attribute is
+    /// resolved relative to the scan root instead; only a real read needs
+    /// the whole path.
+    pub fn abs_path(&self) -> &Path {
+        &self.abs_path
+    }
+
+    /// The cached Markdown body word count, as a raw `usize` rather than a
+    /// `Value` — used by callers reconstructing a [`crate::cache::CachedFile`]
+    /// from an in-memory `Record` (e.g. [`crate::store`]'s no-on-disk-cache
+    /// fallback), which need the count itself, not its query-facing form.
+    pub fn word_count(&self) -> usize {
+        self.word_count
     }
 
     /// The frontmatter field names for this record.
@@ -349,6 +473,145 @@ mod tests {
         let t = SystemTime::UNIX_EPOCH - Duration::from_secs(60);
         let _ = system_time_to_iso(t); // must not panic
     }
+    /// Pins the `Value` enum's bincode wire format: `.querymatter` caches
+    /// serialize `Value` via serde derive + bincode, which tags each variant
+    /// by its DECLARATION-ORDER index. `List`/`Map` must keep the
+    /// discriminants (5/6) an existing on-disk cache blob was written with —
+    /// inserting a new variant earlier in the enum (as `Date`/`DateTime` once
+    /// were, between `Str` and `List`) silently shifts every later variant's
+    /// tag, so an old cache blob holding a `List`/`Map` value would decode as
+    /// the WRONG variant with no error. `Date`/`DateTime` are declared last
+    /// specifically so they land on brand-new tags (7/8) instead of
+    /// disturbing `List`/`Map`. This test fails loudly if a future edit
+    /// reorders the enum: the leading tag byte is the first thing bincode's
+    /// serde bridge writes for a serde-derived enum (one byte here since
+    /// bincode's standard config varint-encodes small indices verbatim).
+    #[test]
+    fn bincode_tags_are_stable_for_list_and_map() {
+        let list = Value::List(vec![Value::Int(1), Value::Str("a".into())]);
+        let mut map = IndexMap::new();
+        map.insert("k".to_string(), Value::Int(1));
+        let map = Value::Map(map);
+
+        let list_bytes = crate::cache::encode(&list);
+        let map_bytes = crate::cache::encode(&map);
+        assert_eq!(list_bytes[0], 5, "Value::List must keep bincode tag 5");
+        assert_eq!(map_bytes[0], 6, "Value::Map must keep bincode tag 6");
+
+        assert_eq!(crate::cache::decode::<Value>(&list_bytes), Some(list));
+        assert_eq!(crate::cache::decode::<Value>(&map_bytes), Some(map));
+    }
+    #[test]
+    fn dates_compare_by_instant_and_render_iso() {
+        use chrono::NaiveDate;
+        let a = Value::Date(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap());
+        let b = Value::Date(NaiveDate::from_ymd_opt(2026, 7, 24).unwrap());
+        assert_eq!(compare_values(&a, &b), Some(Ordering::Less));
+        assert_eq!(a.display(), "2026-01-01");
+        // date vs ISO string coerces (relative-date literals compare correctly)
+        assert_eq!(
+            compare_values(&b, &Value::Str("2026-01-01".into())),
+            Some(Ordering::Greater)
+        );
+        // date vs a non-date string: defined, panic-free (fallback to text compare)
+        assert!(compare_values(&b, &Value::Str("draft".into())).is_some());
+        // NULL still unordered
+        assert_eq!(compare_values(&a, &Value::Null), None);
+    }
+    #[test]
+    fn datetime_renders_as_rfc3339() {
+        use chrono::TimeZone;
+        let dt = Value::DateTime(Utc.with_ymd_and_hms(2026, 7, 24, 9, 30, 0).unwrap());
+        // `display()` is what both the REPL's table/CSV output and
+        // `render::to_json` (which calls `value.display()` for this variant)
+        // render, so this pins the ISO text both paths depend on.
+        assert_eq!(dt.display(), "2026-07-24T09:30:00Z");
+    }
+    #[test]
+    fn datetimes_compare_chronologically() {
+        use chrono::TimeZone;
+        let earlier = Value::DateTime(Utc.with_ymd_and_hms(2026, 7, 24, 9, 0, 0).unwrap());
+        let later = Value::DateTime(Utc.with_ymd_and_hms(2026, 7, 24, 17, 0, 0).unwrap());
+        assert_eq!(compare_values(&earlier, &later), Some(Ordering::Less));
+        assert_eq!(compare_values(&later, &earlier), Some(Ordering::Greater));
+        assert_eq!(compare_values(&earlier, &earlier), Some(Ordering::Equal));
+    }
+    /// Fix 2 (W57 review): a mixed `Date`/`DateTime` pair must compare via
+    /// ISO text, not the `DateTime`'s date part — the date-part compare was
+    /// non-transitive (a `Date` could be `Equal` to two different same-day
+    /// `DateTime`s that are themselves unequal), which is undefined behavior
+    /// for the `sort_by` backing `ORDER BY`. This pins the resulting total
+    /// order: a same-day `Date` sorts before its `DateTime` (ISO-text
+    /// prefix), and cross-day pairs sort by calendar day as expected.
+    #[test]
+    fn mixed_date_and_datetime_compare_via_iso_text() {
+        use chrono::{NaiveDate, TimeZone};
+        let date = Value::Date(NaiveDate::from_ymd_opt(2026, 7, 24).unwrap());
+        let same_day_morning = Value::DateTime(Utc.with_ymd_and_hms(2026, 7, 24, 0, 0, 1).unwrap());
+        let same_day_evening =
+            Value::DateTime(Utc.with_ymd_and_hms(2026, 7, 24, 23, 59, 0).unwrap());
+
+        // "2026-07-24" is a strict text prefix of "2026-07-24T...", so the
+        // bare date sorts before any same-day datetime — a total order, not
+        // an `Equal` that would break transitivity.
+        assert_eq!(
+            compare_values(&date, &same_day_morning),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            compare_values(&date, &same_day_evening),
+            Some(Ordering::Less)
+        );
+        // Transitivity check: the two same-day datetimes are themselves
+        // ordered relative to each other, proving `date` isn't `Equal` to
+        // both (which is exactly the bug the ISO-text fix rules out).
+        assert_eq!(
+            compare_values(&same_day_morning, &same_day_evening),
+            Some(Ordering::Less)
+        );
+
+        // Different-day pair: still sorts by calendar day.
+        let earlier_date = Value::Date(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap());
+        let later_datetime = Value::DateTime(Utc.with_ymd_and_hms(2026, 7, 24, 0, 0, 0).unwrap());
+        assert_eq!(
+            compare_values(&earlier_date, &later_datetime),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            compare_values(&later_datetime, &earlier_date),
+            Some(Ordering::Greater)
+        );
+    }
+    /// Fix 3 (W57 review): the `DateTime`/`DateTime` arm must compare via the
+    /// same second-granular ISO text every cross-type arm uses, not chrono's
+    /// full sub-second `Ord`. Otherwise two `DateTime`s differing only in
+    /// sub-seconds compare non-`Equal` to each other (arm 1) yet each compare
+    /// `Equal` to a `Str` holding their shared seconds-only text (arm 2) — a
+    /// non-transitive comparator (A<B, A==C, B==C), which is undefined
+    /// behavior for the `sort_by` backing `ORDER BY` (e.g. via `ORDER BY
+    /// COALESCE(<subsecond_field>, file.mtime)`).
+    #[test]
+    fn datetime_ordering_is_second_granular_and_transitive() {
+        let whole_second = DateTime::parse_from_rfc3339("2026-07-24T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let sub_second = DateTime::parse_from_rfc3339("2026-07-24T00:00:00.900Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let a = Value::DateTime(whole_second);
+        let b = Value::DateTime(sub_second);
+        let shared_text = Value::Str("2026-07-24T00:00:00Z".to_string());
+
+        // Same-type arm now agrees with the cross-type arm: both truncate to
+        // whole seconds, so a sub-second-only difference is `Equal`.
+        assert_eq!(compare_values(&a, &b), Some(Ordering::Equal));
+        // ...and consistently `Equal` to their shared seconds-text on both
+        // sides — no A<B while A==C==B.
+        assert_eq!(compare_values(&a, &shared_text), Some(Ordering::Equal));
+        assert_eq!(compare_values(&b, &shared_text), Some(Ordering::Equal));
+        assert_eq!(compare_values(&shared_text, &a), Some(Ordering::Equal));
+        assert_eq!(compare_values(&shared_text, &b), Some(Ordering::Equal));
+    }
 }
 
 #[cfg(test)]
@@ -365,6 +628,7 @@ mod record_tests {
             Path::new("samples/plans/DCP-459.md"),
             f,
             SystemTime::UNIX_EPOCH,
+            0,
             0,
         )
     }
@@ -383,12 +647,56 @@ mod record_tests {
     fn file_attr_mtime_and_size() {
         use std::time::Duration;
         let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_609_459_200);
-        let r = Record::new(Path::new("v"), Path::new("v/a.md"), IndexMap::new(), t, 42);
+        let r = Record::new(
+            Path::new("v"),
+            Path::new("v/a.md"),
+            IndexMap::new(),
+            t,
+            42,
+            0,
+        );
         assert_eq!(r.file_attr(FileAttr::Size), Value::Int(42));
         assert_eq!(
             r.file_attr(FileAttr::Mtime),
             Value::Str("2021-01-01T00:00:00Z".into())
         );
+    }
+    #[test]
+    fn file_attr_word_count() {
+        let r = Record::new(
+            Path::new("v"),
+            Path::new("v/a.md"),
+            IndexMap::new(),
+            SystemTime::UNIX_EPOCH,
+            0,
+            5,
+        );
+        assert_eq!(r.file_attr(FileAttr::WordCount), Value::Int(5));
+        assert_eq!(r.word_count(), 5);
+    }
+    #[test]
+    fn abs_path_is_the_path_record_new_was_given() {
+        // `abs_path` carries whatever `path` `Record::new` was constructed
+        // with verbatim (both real producers always pass an already
+        // canonicalized/absolute path — see the field's doc comment).
+        let r = Record::new(
+            Path::new("/vault"),
+            Path::new("/vault/plans/a.md"),
+            IndexMap::new(),
+            SystemTime::UNIX_EPOCH,
+            0,
+            0,
+        );
+        assert_eq!(r.abs_path(), Path::new("/vault/plans/a.md"));
+    }
+    #[test]
+    fn file_attr_body_is_a_null_sentinel() {
+        // `file_attr` is pure and cannot perform the real disk read
+        // `file.body` needs; reaching this arm directly (rather than through
+        // `query::exec::resolve_col`'s `read_body` special case) always
+        // yields `Null`, never the real body text.
+        let r = rec();
+        assert_eq!(r.file_attr(FileAttr::Body), Value::Null);
     }
     #[test]
     fn field_present_and_missing() {
@@ -407,6 +715,7 @@ mod record_tests {
             Path::new("v/a.md"),
             f,
             SystemTime::UNIX_EPOCH,
+            0,
             0,
         );
         assert_eq!(r.field(&["estimate".into(), "low".into()]), Value::Int(5));

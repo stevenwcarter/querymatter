@@ -10,14 +10,16 @@
 use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fs;
 use std::path::Path;
 use std::time::SystemTime;
 
-use chrono::{DateTime, Duration, Months, SecondsFormat, Utc};
+use chrono::{DateTime, Duration, Months, NaiveDate, SecondsFormat, Utc};
 use globset::Glob;
 use indexmap::IndexMap;
 use regex::Regex;
 
+use crate::frontmatter;
 use crate::model::{FileAttr, Record, Value, compare_values};
 use crate::query::ResultTable;
 use crate::query::ast::{
@@ -59,6 +61,18 @@ pub enum ExecError {
         name: String,
         suggestion: Option<String>,
     },
+    /// `file.body` was referenced but disk reads are disallowed for this
+    /// query (`--force-cache`, design W56) — raised once, up front, rather
+    /// than silently resolving every row's `file.body` to `Value::Null` (see
+    /// [`references_body`]). Only raised in strict (non-`--lenient`) mode;
+    /// `--lenient` instead resolves the same situation to per-row `Null` (see
+    /// [`read_body`]), matching how an unknown column degrades under
+    /// `--lenient` too.
+    #[error(
+        "file.body requires disk access, but --force-cache disables it for this query \
+         (retry without --force-cache, or drop file.body from the query)"
+    )]
+    BodyUnavailable,
 }
 
 /// Executes `q` against `records`, returning the projected, filtered,
@@ -73,6 +87,11 @@ pub enum ExecError {
 /// record store's own [`crate::store::RecordStore::schema`] (always the FULL
 /// field-name union, regardless of pruning) rather than let this function
 /// derive a schema from the (possibly narrowed) `records` it's given.
+///
+/// Always evaluates with disk reads allowed — every caller of this entry
+/// point (unit tests, and callers with an unpruned record set) has no notion
+/// of `--force-cache`; a caller that does must call [`execute_with_schema`]
+/// instead, passing its own `disk_reads_allowed`.
 pub fn execute<'a>(
     q: &Query,
     records: impl Iterator<Item = &'a Record>,
@@ -80,7 +99,14 @@ pub fn execute<'a>(
 ) -> Result<ResultTable, ExecError> {
     let records: Vec<&Record> = records.collect();
     let schema = sorted_field_union(&records);
-    execute_with_schema_at(q, records.into_iter(), &schema, lenient, SystemTime::now())
+    execute_with_schema_at(
+        q,
+        records.into_iter(),
+        &schema,
+        lenient,
+        true,
+        SystemTime::now(),
+    )
 }
 
 /// Like [`execute`], but validates against an explicit `schema` instead of
@@ -95,6 +121,12 @@ pub fn execute<'a>(
 /// fields to check against, and must not fail every query on that account
 /// alone.
 ///
+/// `disk_reads_allowed` gates `file.body` (design W56): `false` under
+/// `Freshness::ForceCache`, where the whole query fails fast with
+/// [`ExecError::BodyUnavailable`] in strict mode when it references
+/// `file.body` (see [`references_body`]), or resolves it to `Value::Null`
+/// per row under `--lenient` (see [`read_body`]).
+///
 /// Dispatches on whether `q` is grouped/aggregate; see
 /// [`is_grouped_or_aggregate`].
 pub fn execute_with_schema<'a>(
@@ -102,8 +134,16 @@ pub fn execute_with_schema<'a>(
     records: impl Iterator<Item = &'a Record>,
     schema: &[String],
     lenient: bool,
+    disk_reads_allowed: bool,
 ) -> Result<ResultTable, ExecError> {
-    execute_with_schema_at(q, records, schema, lenient, SystemTime::now())
+    execute_with_schema_at(
+        q,
+        records,
+        schema,
+        lenient,
+        disk_reads_allowed,
+        SystemTime::now(),
+    )
 }
 
 /// Like [`execute_with_schema`], but resolves relative-date literals
@@ -122,6 +162,7 @@ fn execute_with_schema_at<'a>(
     records: impl Iterator<Item = &'a Record>,
     schema: &[String],
     lenient: bool,
+    disk_reads_allowed: bool,
     now: SystemTime,
 ) -> Result<ResultTable, ExecError> {
     let mut resolved = q.clone();
@@ -132,10 +173,18 @@ fn execute_with_schema_at<'a>(
     if !lenient && !schema.is_empty() {
         validate_columns(q, schema)?;
     }
-    if is_grouped_or_aggregate(q) {
-        return execute_grouped(q, records.into_iter());
+    // Design W56: a `file.body` reference under `--force-cache` can never
+    // produce a real answer, so strict mode fails the whole query fast
+    // here — one clear diagnostic — rather than letting every row resolve
+    // it to a silent `Null` (which is still what happens under `--lenient`,
+    // mirroring the unknown-column check just above).
+    if !lenient && !disk_reads_allowed && references_body(q) {
+        return Err(ExecError::BodyUnavailable);
     }
-    execute_ungrouped(q, records.into_iter())
+    if is_grouped_or_aggregate(q) {
+        return execute_grouped(q, records.into_iter(), disk_reads_allowed);
+    }
+    execute_ungrouped(q, records.into_iter(), disk_reads_allowed)
 }
 
 /// Replaces every `Literal::RelativeDate` in `q` with the `Literal::Str`
@@ -207,9 +256,11 @@ fn rewrite_expr_literals(expr: &mut Expr, now: SystemTime) {
 
 /// Walks a `WHERE` predicate tree's literal positions for
 /// [`rewrite_relative_dates`]: both `Compare` operands, every `IN` list
-/// element, and `MEMBER OF`'s literal. `Like`'s pattern is a plain `String`
-/// (never a `Literal`) and `IsNull` carries no literal at all, so neither
-/// needs a rewrite.
+/// element, `MEMBER OF`'s literal, and `Regexp`'s `Expr` operand (mirroring
+/// `Compare`, since that operand is just as general). `Like`'s pattern is a
+/// plain `String` (never a `Literal`) and `IsNull` carries no literal at
+/// all, so neither needs a rewrite — `Regexp`'s pattern is the same plain
+/// `String` as `Like`'s, for the same reason.
 fn rewrite_predicate_literals(pred: &mut Predicate, now: SystemTime) {
     match pred {
         Predicate::Compare(l, _, r) => {
@@ -222,6 +273,7 @@ fn rewrite_predicate_literals(pred: &mut Predicate, now: SystemTime) {
             }
         }
         Predicate::MemberOf(lit, _, _) => rewrite_literal(lit, now),
+        Predicate::Regexp(expr, _, _) => rewrite_expr_literals(expr, now),
         Predicate::Like(..) | Predicate::IsNull(..) => {}
         Predicate::And(a, b) | Predicate::Or(a, b) => {
             rewrite_predicate_literals(a, now);
@@ -350,6 +402,7 @@ fn is_grouped_or_aggregate(q: &Query) -> bool {
 fn filter_records<'a>(
     q: &Query,
     records: impl Iterator<Item = &'a Record>,
+    disk_reads_allowed: bool,
 ) -> Result<Vec<&'a Record>, ExecError> {
     let candidates = filter_by_glob(records.collect(), q.from_glob.as_deref())?;
     Ok(candidates
@@ -358,7 +411,7 @@ fn filter_records<'a>(
             // SQL 3VL: a row is kept only when the predicate is definitely
             // true; both `Some(false)` and `None` (unknown, i.e. a NULL was
             // involved) exclude it.
-            Some(pred) => eval_predicate(record, pred) == Some(true),
+            Some(pred) => eval_predicate(record, pred, disk_reads_allowed) == Some(true),
             None => true,
         })
         .collect())
@@ -368,8 +421,9 @@ fn filter_records<'a>(
 fn execute_ungrouped<'a>(
     q: &Query,
     records: impl Iterator<Item = &'a Record>,
+    disk_reads_allowed: bool,
 ) -> Result<ResultTable, ExecError> {
-    let filtered = filter_records(q, records)?;
+    let filtered = filter_records(q, records, disk_reads_allowed)?;
     let columns = expand_select(q, &filtered);
     let headers: Vec<String> = columns.iter().map(|(header, _)| header.clone()).collect();
     let mut rows: Vec<(&Record, Vec<Value>)> = filtered
@@ -377,7 +431,7 @@ fn execute_ungrouped<'a>(
         .map(|record| {
             let row = columns
                 .iter()
-                .map(|(_, expr)| eval_expr(record, expr))
+                .map(|(_, expr)| eval_expr(record, expr, disk_reads_allowed))
                 .collect();
             (record, row)
         })
@@ -392,8 +446,8 @@ fn execute_ungrouped<'a>(
         order
             .iter()
             .map(|(target, desc)| {
-                let va = order_key_value(target, ra, rowa);
-                let vb = order_key_value(target, rb, rowb);
+                let va = order_key_value(target, ra, rowa, disk_reads_allowed);
+                let vb = order_key_value(target, rb, rowb, disk_reads_allowed);
                 order_cmp(&va, &vb, *desc)
             })
             .find(|ord| *ord != Ordering::Equal)
@@ -484,13 +538,14 @@ fn dedup_rows(rows: &mut Vec<(&Record, Vec<Value>)>) {
 fn execute_grouped<'a>(
     q: &Query,
     records: impl Iterator<Item = &'a Record>,
+    disk_reads_allowed: bool,
 ) -> Result<ResultTable, ExecError> {
-    let filtered = filter_records(q, records)?;
+    let filtered = filter_records(q, records, disk_reads_allowed)?;
 
     let items = validate_grouped_select(q)?;
     let headers: Vec<String> = q.select.iter().map(|item| item.header()).collect();
 
-    let mut groups = group_rows(&filtered, &q.group_by);
+    let mut groups = group_rows(&filtered, &q.group_by, disk_reads_allowed);
     groups.sort_by(|a, b| compare_key_tuple(&a.key, &b.key));
 
     let order = resolve_group_order_targets(&q.order_by, &headers, &q.group_by)?;
@@ -502,17 +557,19 @@ fn execute_grouped<'a>(
     let mut rows: Vec<(Vec<Value>, Vec<Value>)> = groups
         .into_iter()
         .map(|group| {
-            let row = project_group(&group, &items);
+            let row = project_group(&group, &items, disk_reads_allowed);
             let order_keys: Vec<Value> = order
                 .iter()
-                .map(|(target, _)| group_order_key_value(target, &group, &row))
+                .map(|(target, _)| group_order_key_value(target, &group, &row, disk_reads_allowed))
                 .collect();
             (group, row, order_keys)
         })
         .filter(|(group, _, _)| match &q.having {
             // SQL 3VL, same rule as WHERE: a group is kept only when HAVING
             // is definitely true; unknown/false both drop it.
-            Some(having) => eval_having(having, group, &q.group_by) == Some(true),
+            Some(having) => {
+                eval_having(having, group, &q.group_by, disk_reads_allowed) == Some(true)
+            }
             None => true,
         })
         .map(|(_, row, order_keys)| (row, order_keys))
@@ -632,12 +689,77 @@ fn predicate_columns(pred: &Predicate) -> Vec<&ColRef> {
         Predicate::Like(col, _, _) | Predicate::In(col, _, _) | Predicate::IsNull(col, _) => {
             vec![col]
         }
+        Predicate::Regexp(expr, _, _) => expr_columns(expr),
         Predicate::MemberOf(_, col, _) => vec![col],
         Predicate::And(a, b) | Predicate::Or(a, b) => predicate_columns(a)
             .into_iter()
             .chain(predicate_columns(b))
             .collect(),
         Predicate::Not(inner) => predicate_columns(inner),
+    }
+}
+
+/// Whether `q` references `file.body` in any position it could be
+/// evaluated: `SELECT`, `WHERE`, `GROUP BY`, `ORDER BY`, or `HAVING`. Checked
+/// once, up front, by [`execute_with_schema_at`] (mirroring the
+/// unknown-column validation just above it), so a `--force-cache` query that
+/// can never produce a real body fails fast with one clear diagnostic
+/// instead of silently NULLing every row it touches (design W56).
+fn references_body(q: &Query) -> bool {
+    let select_hit = q.select.iter().any(|item| match &item.expr {
+        SelectExpr::Star => false,
+        SelectExpr::Expr(expr) => expr_columns(expr).into_iter().any(is_body_col),
+        SelectExpr::Agg(agg) => aggregate_col(agg).is_some_and(is_body_col),
+    });
+    let where_hit = q
+        .filter
+        .as_ref()
+        .is_some_and(|pred| predicate_columns(pred).into_iter().any(is_body_col));
+    let group_hit = q.group_by.iter().any(is_body_col);
+    let order_hit = q.order_by.iter().any(|key| match &key.target {
+        OrderTarget::Alias(_) => false,
+        OrderTarget::Col(col) => is_body_col(col),
+        OrderTarget::Agg(agg) => aggregate_col(agg).is_some_and(is_body_col),
+        OrderTarget::Expr(expr) => expr_columns(expr).into_iter().any(is_body_col),
+    });
+    let having_hit = q.having.as_ref().is_some_and(having_references_body);
+
+    select_hit || where_hit || group_hit || order_hit || having_hit
+}
+
+/// True for `file.body`'s `ColRef`; every other column (a frontmatter field
+/// or any other `file.*` attribute) is fine to evaluate regardless of the
+/// disk-read gate.
+fn is_body_col(col: &ColRef) -> bool {
+    matches!(col, ColRef::File(FileAttr::Body))
+}
+
+/// The single column an aggregate's argument names, if any (`CountStar`
+/// takes none).
+fn aggregate_col(agg: &Aggregate) -> Option<&ColRef> {
+    match agg {
+        Aggregate::CountStar => None,
+        Aggregate::Count(col, _)
+        | Aggregate::Min(col)
+        | Aggregate::Max(col)
+        | Aggregate::Sum(col)
+        | Aggregate::Avg(col)
+        | Aggregate::GroupConcat(col) => Some(col),
+    }
+}
+
+/// Walks a `HAVING` tree for a `file.body` reference, mirroring
+/// [`references_body`]'s other clauses.
+fn having_references_body(having: &Having) -> bool {
+    match having {
+        Having::Compare(leaf, _, _) => match leaf {
+            HavingLeaf::Group(col) => is_body_col(col),
+            HavingLeaf::Agg(agg) => aggregate_col(agg).is_some_and(is_body_col),
+        },
+        Having::And(a, b) | Having::Or(a, b) => {
+            having_references_body(a) || having_references_body(b)
+        }
+        Having::Not(inner) => having_references_body(inner),
     }
 }
 
@@ -675,7 +797,11 @@ struct Group<'a> {
 /// An empty `group_by` means "aggregate over everything": every record —
 /// including none at all — falls into the single group keyed by `[]`, so a
 /// bare `count(*)` still returns one row for an empty input, matching SQL.
-fn group_rows<'a>(records: &[&'a Record], group_by: &[ColRef]) -> Vec<Group<'a>> {
+fn group_rows<'a>(
+    records: &[&'a Record],
+    group_by: &[ColRef],
+    disk_reads_allowed: bool,
+) -> Vec<Group<'a>> {
     if group_by.is_empty() {
         return vec![Group {
             key: Vec::new(),
@@ -687,7 +813,7 @@ fn group_rows<'a>(records: &[&'a Record], group_by: &[ColRef]) -> Vec<Group<'a>>
     for &record in records {
         let key: Vec<Value> = group_by
             .iter()
-            .map(|col| resolve_col(record, col))
+            .map(|col| resolve_col(record, col, disk_reads_allowed))
             .collect();
         let hash_key: Vec<String> = key.iter().map(hashable_cell_key).collect();
         match index.entry(hash_key) {
@@ -808,7 +934,11 @@ enum ProjectedItem<'a> {
 /// the group on its own (which is what calling [`compute_aggregate`] once
 /// per item would do). The more aggregates a query projects, the more this
 /// saves.
-fn project_group(group: &Group<'_>, items: &[GroupedSelectItem]) -> Vec<Value> {
+fn project_group(
+    group: &Group<'_>,
+    items: &[GroupedSelectItem],
+    disk_reads_allowed: bool,
+) -> Vec<Value> {
     let mut projected: Vec<ProjectedItem<'_>> = items
         .iter()
         .map(|item| match item {
@@ -820,7 +950,7 @@ fn project_group(group: &Group<'_>, items: &[GroupedSelectItem]) -> Vec<Value> {
     for record in &group.rows {
         for item in &mut projected {
             if let ProjectedItem::Agg(state) = item {
-                state.update(record);
+                state.update(record, disk_reads_allowed);
             }
         }
     }
@@ -828,7 +958,7 @@ fn project_group(group: &Group<'_>, items: &[GroupedSelectItem]) -> Vec<Value> {
     projected
         .into_iter()
         .map(|item| match item {
-            ProjectedItem::Expr(expr) => eval_group_expr(&group.rows, expr),
+            ProjectedItem::Expr(expr) => eval_group_expr(&group.rows, expr, disk_reads_allowed),
             ProjectedItem::Agg(state) => state.finish(),
         })
         .collect()
@@ -840,10 +970,10 @@ fn project_group(group: &Group<'_>, items: &[GroupedSelectItem]) -> Vec<Value> {
 /// records — see [`group_rows`]); [`validate_grouped_select`] guarantees a
 /// `SELECT` expression surviving that bucket references no columns, so
 /// evaluating it against a fieldless stand-in record is safe.
-fn eval_group_expr(rows: &[&Record], expr: &Expr) -> Value {
+fn eval_group_expr(rows: &[&Record], expr: &Expr, disk_reads_allowed: bool) -> Value {
     match rows.first() {
-        Some(record) => eval_expr(record, expr),
-        None => eval_expr(&empty_record(), expr),
+        Some(record) => eval_expr(record, expr, disk_reads_allowed),
+        None => eval_expr(&empty_record(), expr, disk_reads_allowed),
     }
 }
 
@@ -855,6 +985,7 @@ fn empty_record() -> Record {
         Path::new(""),
         IndexMap::new(),
         SystemTime::UNIX_EPOCH,
+        0,
         0,
     )
 }
@@ -943,33 +1074,33 @@ impl<'a> AggState<'a> {
 
     /// Folds one more row into the running state. Call once per row in the
     /// group, in row order — order matters for `GROUP_CONCAT`.
-    fn update(&mut self, record: &Record) {
+    fn update(&mut self, record: &Record, disk_reads_allowed: bool) {
         match self {
             AggState::CountStar(count) => *count += 1,
             AggState::Count { col, count } => {
-                if !resolve_col(record, col).is_null() {
+                if !resolve_col(record, col, disk_reads_allowed).is_null() {
                     *count += 1;
                 }
             }
             AggState::CountDistinct { col, seen } => {
-                let value = resolve_col(record, col);
+                let value = resolve_col(record, col, disk_reads_allowed);
                 if !value.is_null() {
                     seen.insert(value.to_cmp_string());
                 }
             }
             AggState::Sum { col, sum } => {
-                if let Some(n) = resolve_col(record, col).as_number() {
+                if let Some(n) = resolve_col(record, col, disk_reads_allowed).as_number() {
                     *sum += n;
                 }
             }
             AggState::Avg { col, sum, count } => {
-                if let Some(n) = resolve_col(record, col).as_number() {
+                if let Some(n) = resolve_col(record, col, disk_reads_allowed).as_number() {
                     *sum += n;
                     *count += 1;
                 }
             }
             AggState::Extreme { col, want, best } => {
-                let value = resolve_col(record, col);
+                let value = resolve_col(record, col, disk_reads_allowed);
                 if !value.is_null() {
                     match compare_values(&value, best) {
                         Some(ord) if ord == *want => *best = value,
@@ -980,7 +1111,7 @@ impl<'a> AggState<'a> {
                 }
             }
             AggState::GroupConcat { col, parts } => {
-                let value = resolve_col(record, col);
+                let value = resolve_col(record, col, disk_reads_allowed);
                 if !value.is_null() {
                     parts.push(value.display());
                 }
@@ -1013,10 +1144,10 @@ impl<'a> AggState<'a> {
 /// single [`AggState`] and folds every row into it. See [`AggState`]'s doc
 /// for why this and [`project_group`] share the same accumulator instead of
 /// each re-implementing per-aggregate NULL handling.
-fn compute_aggregate(agg: &Aggregate, rows: &[&Record]) -> Value {
+fn compute_aggregate(agg: &Aggregate, rows: &[&Record], disk_reads_allowed: bool) -> Value {
     let mut state = AggState::new(agg);
     for record in rows {
-        state.update(record);
+        state.update(record, disk_reads_allowed);
     }
     state.finish()
 }
@@ -1026,21 +1157,28 @@ fn compute_aggregate(agg: &Aggregate, rows: &[&Record]) -> Value {
 /// `WHERE`. `group_by` is `q.group_by`, needed to resolve a
 /// [`HavingLeaf::Group`] leaf's value from the group's key tuple by
 /// position — see [`eval_having_leaf`].
-fn eval_having(having: &Having, group: &Group<'_>, group_by: &[ColRef]) -> Option<bool> {
+fn eval_having(
+    having: &Having,
+    group: &Group<'_>,
+    group_by: &[ColRef],
+    disk_reads_allowed: bool,
+) -> Option<bool> {
     match having {
         Having::Compare(leaf, op, lit) => {
-            let value = eval_having_leaf(leaf, group, group_by);
+            let value = eval_having_leaf(leaf, group, group_by, disk_reads_allowed);
             eval_compare(&value, op, &literal_value(lit))
         }
         Having::And(a, b) => three_valued_and(
-            eval_having(a, group, group_by),
-            eval_having(b, group, group_by),
+            eval_having(a, group, group_by, disk_reads_allowed),
+            eval_having(b, group, group_by, disk_reads_allowed),
         ),
         Having::Or(a, b) => three_valued_or(
-            eval_having(a, group, group_by),
-            eval_having(b, group, group_by),
+            eval_having(a, group, group_by, disk_reads_allowed),
+            eval_having(b, group, group_by, disk_reads_allowed),
         ),
-        Having::Not(inner) => three_valued_not(eval_having(inner, group, group_by)),
+        Having::Not(inner) => {
+            three_valued_not(eval_having(inner, group, group_by, disk_reads_allowed))
+        }
     }
 }
 
@@ -1052,9 +1190,14 @@ fn eval_having(having: &Having, group: &Group<'_>, group_by: &[ColRef]) -> Optio
 /// is one of `group_by`'s keys, so the position lookup always succeeds for a
 /// query built by the parser; `Value::Null` is a defensive fallback only
 /// reachable from a hand-built AST that bypasses that guarantee.
-fn eval_having_leaf(leaf: &HavingLeaf, group: &Group<'_>, group_by: &[ColRef]) -> Value {
+fn eval_having_leaf(
+    leaf: &HavingLeaf,
+    group: &Group<'_>,
+    group_by: &[ColRef],
+    disk_reads_allowed: bool,
+) -> Value {
     match leaf {
-        HavingLeaf::Agg(agg) => compute_aggregate(agg, &group.rows),
+        HavingLeaf::Agg(agg) => compute_aggregate(agg, &group.rows, disk_reads_allowed),
         HavingLeaf::Group(col) => group_by
             .iter()
             .position(|g| g == col)
@@ -1156,12 +1299,17 @@ fn group_order_key_value(
     target: &ResolvedGroupOrderTarget,
     group: &Group<'_>,
     row: &[Value],
+    disk_reads_allowed: bool,
 ) -> Value {
     match target {
         ResolvedGroupOrderTarget::Row(idx) => row[*idx].clone(),
         ResolvedGroupOrderTarget::GroupKey(idx) => group.key[*idx].clone(),
-        ResolvedGroupOrderTarget::Agg(agg) => compute_aggregate(agg, &group.rows),
-        ResolvedGroupOrderTarget::Expr(expr) => eval_group_expr(&group.rows, expr),
+        ResolvedGroupOrderTarget::Agg(agg) => {
+            compute_aggregate(agg, &group.rows, disk_reads_allowed)
+        }
+        ResolvedGroupOrderTarget::Expr(expr) => {
+            eval_group_expr(&group.rows, expr, disk_reads_allowed)
+        }
     }
 }
 
@@ -1216,10 +1364,45 @@ fn sorted_field_union(records: &[&Record]) -> Vec<String> {
 }
 
 /// Looks up a column reference's value on `record`.
-fn resolve_col(record: &Record, col: &ColRef) -> Value {
+///
+/// `ColRef::File(FileAttr::Body)` is special-cased here rather than falling
+/// through to [`Record::file_attr`] (which is pure and can only return its
+/// `Null` sentinel for `Body` — see its doc comment): it's the one column
+/// that needs a real disk read, gated by `disk_reads_allowed` (design W56;
+/// `false` under `Freshness::ForceCache`) — see [`read_body`].
+fn resolve_col(record: &Record, col: &ColRef, disk_reads_allowed: bool) -> Value {
     match col {
         ColRef::Field(path) => record.field(path),
+        ColRef::File(FileAttr::Body) => read_body(record, disk_reads_allowed),
         ColRef::File(attr) => record.file_attr(*attr),
+    }
+}
+
+/// Reads `record`'s Markdown body fresh from disk — the on-disk cache never
+/// stores body text (design W56), only its word count, so this always hits
+/// the filesystem when `disk_reads_allowed` permits it.
+///
+/// Returns `Value::Null` whenever a real body can't be produced: disk reads
+/// disallowed (`--force-cache`; under `--lenient` this is the ONLY signal the
+/// caller gets — strict mode instead fails the whole query up front via
+/// [`references_body`]/[`ExecError::BodyUnavailable`] before this is ever
+/// called), the file is unreadable (moved/deleted/permission-denied since it
+/// was cached), or its frontmatter fence is no longer valid YAML (see
+/// [`crate::frontmatter::body`]). Every one of these is indistinguishable
+/// from "no value" elsewhere in the query engine (a missing/invalid
+/// frontmatter field is `Null` too), so `Null` — never a panic — is the
+/// right total answer for a per-row condition that can't be predicted ahead
+/// of time.
+fn read_body(record: &Record, disk_reads_allowed: bool) -> Value {
+    if !disk_reads_allowed {
+        return Value::Null;
+    }
+    match fs::read_to_string(record.abs_path()) {
+        Ok(content) => match frontmatter::body(&content) {
+            Some(body) => Value::Str(body),
+            None => Value::Null,
+        },
+        Err(_) => Value::Null,
     }
 }
 
@@ -1239,22 +1422,25 @@ fn resolve_col(record: &Record, col: &ColRef) -> Value {
 /// (`operand: Some`) returns the first arm whose value equals the operand
 /// (via [`eval_compare`], the same equality `IN`/`MEMBER OF` use). Neither
 /// matching falls through to `else_expr`, or `Value::Null` with no `ELSE`.
-pub(crate) fn eval_expr(record: &Record, expr: &Expr) -> Value {
+pub(crate) fn eval_expr(record: &Record, expr: &Expr, disk_reads_allowed: bool) -> Value {
     match expr {
-        Expr::Col(col) => resolve_col(record, col),
+        Expr::Col(col) => resolve_col(record, col, disk_reads_allowed),
         Expr::Lit(lit) => literal_value(lit),
         Expr::Scalar(f, args) => {
-            let values: Vec<Value> = args.iter().map(|arg| eval_expr(record, arg)).collect();
+            let values: Vec<Value> = args
+                .iter()
+                .map(|arg| eval_expr(record, arg, disk_reads_allowed))
+                .collect();
             apply_scalar(f.clone(), &values)
         }
         Expr::Binary(op, left, right) => {
-            let l = eval_expr(record, left);
-            let r = eval_expr(record, right);
+            let l = eval_expr(record, left, disk_reads_allowed);
+            let r = eval_expr(record, right, disk_reads_allowed);
             apply_binary(op.clone(), &l, &r)
         }
         Expr::Coalesce(args) => args
             .iter()
-            .map(|arg| eval_expr(record, arg))
+            .map(|arg| eval_expr(record, arg, disk_reads_allowed))
             .find(|v| !v.is_null())
             .unwrap_or(Value::Null),
         Expr::Case {
@@ -1265,26 +1451,28 @@ pub(crate) fn eval_expr(record: &Record, expr: &Expr) -> Value {
             match operand {
                 None => {
                     for (cond, then) in whens {
-                        if is_truthy(&eval_expr(record, cond)) {
-                            return eval_expr(record, then);
+                        if is_truthy(&eval_expr(record, cond, disk_reads_allowed)) {
+                            return eval_expr(record, then, disk_reads_allowed);
                         }
                     }
                 }
                 Some(op) => {
-                    let target = eval_expr(record, op);
+                    let target = eval_expr(record, op, disk_reads_allowed);
                     for (val, then) in whens {
-                        let candidate = eval_expr(record, val);
+                        let candidate = eval_expr(record, val, disk_reads_allowed);
                         if eval_compare(&target, &CmpOp::Eq, &candidate) == Some(true) {
-                            return eval_expr(record, then);
+                            return eval_expr(record, then, disk_reads_allowed);
                         }
                     }
                 }
             }
             else_expr
                 .as_deref()
-                .map_or(Value::Null, |e| eval_expr(record, e))
+                .map_or(Value::Null, |e| eval_expr(record, e, disk_reads_allowed))
         }
-        Expr::Predicate(pred) => eval_predicate(record, pred).map_or(Value::Null, Value::Bool),
+        Expr::Predicate(pred) => {
+            eval_predicate(record, pred, disk_reads_allowed).map_or(Value::Null, Value::Bool)
+        }
     }
 }
 
@@ -1327,6 +1515,11 @@ fn literal_value(lit: &Literal) -> Value {
 /// (`parse::check_scalar_arity`), so a mismatch reaching here can only come
 /// from an in-crate caller building a bad-arity `Expr::Scalar` directly —
 /// that falls back to `Null` rather than panicking.
+///
+/// `ScalarFn::Date` is the one exception to the stringify-first rule (see
+/// [`cast_date`]): a non-string, non-`Date`/`DateTime` first argument yields
+/// `Null` instead of stringifying, since there's no sensible date to parse
+/// out of e.g. an `Int`.
 pub(crate) fn apply_scalar(f: ScalarFn, args: &[Value]) -> Value {
     if args.iter().any(Value::is_null) {
         return Value::Null;
@@ -1343,6 +1536,8 @@ pub(crate) fn apply_scalar(f: ScalarFn, args: &[Value]) -> Value {
         (ScalarFn::Replace, [s, from, to]) => {
             Value::Str(s.display().replace(&from.display(), &to.display()))
         }
+        (ScalarFn::Date, [s]) => cast_date(s, None),
+        (ScalarFn::Date, [s, fmt]) => cast_date(s, Some(fmt)),
         // Wrong arity can't come from the parser (see doc comment above);
         // return `Null` rather than panicking on a hand-built bad call.
         _ => Value::Null,
@@ -1378,6 +1573,35 @@ fn substr(s: &str, start: &Value, len: Option<&Value>) -> Value {
         },
     };
     Value::Str(chars[from..to.max(from)].iter().collect())
+}
+
+/// `date(s[, fmt])`: casts `s` to a [`Value::Date`]/[`Value::DateTime`]. A
+/// `s` that's already a `Date`/`DateTime` passes through unchanged. A `fmt`
+/// argument parses `s` as a [`NaiveDate`] with that chrono format string;
+/// without one, `s` tries strict `%Y-%m-%d` then RFC3339 — the same
+/// detection frontmatter ingest applies to auto-classify a string field.
+/// Anything else — a non-string `s`, or a string chrono can't parse —
+/// yields `Value::Null`.
+fn cast_date(s: &Value, fmt: Option<&Value>) -> Value {
+    if matches!(s, Value::Date(_) | Value::DateTime(_)) {
+        return s.clone();
+    }
+    let Value::Str(s) = s else {
+        return Value::Null;
+    };
+    if let Some(fmt) = fmt {
+        return match NaiveDate::parse_from_str(s, &fmt.display()) {
+            Ok(d) => Value::Date(d),
+            Err(_) => Value::Null,
+        };
+    }
+    if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return Value::Date(d);
+    }
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Value::DateTime(dt.with_timezone(&Utc));
+    }
+    Value::Null
 }
 
 /// Applies an arithmetic or concatenation operator to two already-evaluated
@@ -1450,21 +1674,31 @@ fn numeric_result(v: f64, is_float: bool) -> Value {
 /// the spec's "any comparison where a side is Null yields 'not true'" rule
 /// (§4). Only `IS NULL` / `IS NOT NULL` are ever determinate for a NULL
 /// field.
-fn eval_predicate(record: &Record, pred: &Predicate) -> Option<bool> {
+fn eval_predicate(record: &Record, pred: &Predicate, disk_reads_allowed: bool) -> Option<bool> {
     match pred {
-        Predicate::Compare(left, op, right) => {
-            eval_compare(&eval_expr(record, left), op, &eval_expr(record, right))
-        }
+        Predicate::Compare(left, op, right) => eval_compare(
+            &eval_expr(record, left, disk_reads_allowed),
+            op,
+            &eval_expr(record, right, disk_reads_allowed),
+        ),
         Predicate::Like(col, pattern, negated) => {
-            let value = resolve_col(record, col);
+            let value = resolve_col(record, col, disk_reads_allowed);
             if value.is_null() {
                 return None;
             }
             let base = Some(like_matches(&value.to_cmp_string(), pattern));
             maybe_negate(base, *negated)
         }
+        Predicate::Regexp(expr, pattern, negated) => {
+            let value = eval_expr(record, expr, disk_reads_allowed);
+            if value.is_null() {
+                return None;
+            }
+            let base = Some(regexp_matches(&value.display(), pattern));
+            maybe_negate(base, *negated)
+        }
         Predicate::In(col, literals, negated) => {
-            let value = resolve_col(record, col);
+            let value = resolve_col(record, col, disk_reads_allowed);
             if value.is_null() {
                 return None;
             }
@@ -1472,7 +1706,7 @@ fn eval_predicate(record: &Record, pred: &Predicate) -> Option<bool> {
             maybe_negate(base, *negated)
         }
         Predicate::MemberOf(lit, col, negated) => {
-            let value = resolve_col(record, col);
+            let value = resolve_col(record, col, disk_reads_allowed);
             let Value::List(items) = &value else {
                 // Unknown for both a `Null` field and a non-list value —
                 // never a hard `false` — mirroring `In`'s null-column rule.
@@ -1482,14 +1716,20 @@ fn eval_predicate(record: &Record, pred: &Predicate) -> Option<bool> {
             maybe_negate(base, *negated)
         }
         // The only predicate that is determinate — and true — for a NULL field.
-        Predicate::IsNull(col, negated) => Some(resolve_col(record, col).is_null() != *negated),
-        Predicate::And(a, b) => {
-            three_valued_and(eval_predicate(record, a), eval_predicate(record, b))
+        Predicate::IsNull(col, negated) => {
+            Some(resolve_col(record, col, disk_reads_allowed).is_null() != *negated)
         }
-        Predicate::Or(a, b) => {
-            three_valued_or(eval_predicate(record, a), eval_predicate(record, b))
+        Predicate::And(a, b) => three_valued_and(
+            eval_predicate(record, a, disk_reads_allowed),
+            eval_predicate(record, b, disk_reads_allowed),
+        ),
+        Predicate::Or(a, b) => three_valued_or(
+            eval_predicate(record, a, disk_reads_allowed),
+            eval_predicate(record, b, disk_reads_allowed),
+        ),
+        Predicate::Not(inner) => {
+            three_valued_not(eval_predicate(record, inner, disk_reads_allowed))
         }
-        Predicate::Not(inner) => three_valued_not(eval_predicate(record, inner)),
     }
 }
 
@@ -1575,6 +1815,15 @@ fn like_matches(value: &str, pattern: &str) -> bool {
     re.is_match(value)
 }
 
+/// Matches `value` against a `REGEXP` pattern. `parse::lower_regexp` already
+/// confirmed `pattern` compiles at parse time, so recompiling it here can't
+/// fail — mirroring [`like_matches`], it's recompiled fresh per call rather
+/// than cached.
+fn regexp_matches(value: &str, pattern: &str) -> bool {
+    let re = Regex::new(pattern).expect("REGEXP pattern validated to compile at parse time");
+    re.is_match(value)
+}
+
 /// An `ORDER BY` target resolved against the projection, so sorting doesn't
 /// need to re-resolve an alias (or fail) on every comparison.
 enum ResolvedOrderTarget {
@@ -1619,11 +1868,16 @@ fn resolve_order_targets(
 
 /// Reads the sort key's value for one row, given its source record and
 /// already-projected row.
-fn order_key_value(target: &ResolvedOrderTarget, record: &Record, row: &[Value]) -> Value {
+fn order_key_value(
+    target: &ResolvedOrderTarget,
+    record: &Record,
+    row: &[Value],
+    disk_reads_allowed: bool,
+) -> Value {
     match target {
         ResolvedOrderTarget::AliasIndex(idx) => row[*idx].clone(),
-        ResolvedOrderTarget::Col(col) => resolve_col(record, col),
-        ResolvedOrderTarget::Expr(expr) => eval_expr(record, expr),
+        ResolvedOrderTarget::Col(col) => resolve_col(record, col, disk_reads_allowed),
+        ResolvedOrderTarget::Expr(expr) => eval_expr(record, expr, disk_reads_allowed),
     }
 }
 
@@ -1660,6 +1914,7 @@ mod tests {
             Path::new(path),
             m,
             SystemTime::UNIX_EPOCH,
+            0,
             0,
         )
     }
@@ -1795,6 +2050,34 @@ mod tests {
     }
 
     #[test]
+    fn date_cast_passes_through_date_and_datetime_and_defaults_to_rfc3339() {
+        use chrono::TimeZone;
+        use std::slice;
+
+        let s = |t: &str| Value::Str(t.into());
+        let d = Value::Date(NaiveDate::from_ymd_opt(2026, 7, 24).unwrap());
+        let dt = Value::DateTime(Utc.with_ymd_and_hms(2026, 7, 24, 9, 30, 0).unwrap());
+
+        // Already a Date/DateTime: passes through unchanged, no re-parse.
+        assert_eq!(apply_scalar(ScalarFn::Date, slice::from_ref(&d)), d);
+        assert_eq!(apply_scalar(ScalarFn::Date, slice::from_ref(&dt)), dt);
+
+        // No fmt arg: tries `%Y-%m-%d`, then falls back to RFC3339.
+        assert_eq!(
+            apply_scalar(ScalarFn::Date, &[s("2026-07-24T09:30:00Z")]),
+            dt
+        );
+
+        // A value that isn't a string, `Date`, or `DateTime` has no sensible
+        // date to parse out of it — `Null`, not a stringify-then-parse
+        // attempt (see the `apply_scalar` doc comment).
+        assert_eq!(
+            apply_scalar(ScalarFn::Date, &[Value::Int(20260724)]),
+            Value::Null
+        );
+    }
+
+    #[test]
     fn substr_select_survives_extreme_literals_without_panicking() {
         // Same regression as `substr_overflow_safe_for_extreme_start_and_len`,
         // pinned at the actual seam the bug was reported against: a real SQL
@@ -1917,6 +2200,30 @@ mod tests {
         assert_eq!(
             execute(&concat, rows.iter(), false).unwrap().rows,
             vec![vec![Value::Str("3-Draft".into())]]
+        );
+    }
+
+    #[test]
+    fn date_cast_parses_iso_and_custom_format() {
+        let rows = [rec("s", "s/a.md", &[])];
+        let expected = NaiveDate::from_ymd_opt(2026, 7, 24).unwrap();
+
+        let iso = parse("SELECT date('2026-07-24')").unwrap();
+        assert_eq!(
+            execute(&iso, rows.iter(), false).unwrap().rows,
+            vec![vec![Value::Date(expected)]]
+        );
+
+        let custom = parse("SELECT date('07/24/2026', '%m/%d/%Y')").unwrap();
+        assert_eq!(
+            execute(&custom, rows.iter(), false).unwrap().rows,
+            vec![vec![Value::Date(expected)]]
+        );
+
+        let unparseable = parse("SELECT date('nonsense')").unwrap();
+        assert_eq!(
+            execute(&unparseable, rows.iter(), false).unwrap().rows,
+            vec![vec![Value::Null]]
         );
     }
 
@@ -2267,6 +2574,58 @@ mod tests {
     fn not_like_excludes_null_field_row() {
         let all = recs_with_null_status();
         let q = parse("SELECT file.name WHERE status NOT LIKE 'dr%'").unwrap();
+        let t = execute(&q, all.iter(), false).unwrap();
+        assert_eq!(t.rows, vec![vec![Value::Str("b.md".into())]]);
+    }
+    #[test]
+    fn regexp_matches_and_negates_and_over_scalar_fn() {
+        let rows = [
+            rec(
+                "s",
+                "s/a.md",
+                &[
+                    ("jira", Value::Str("DCP-459".into())),
+                    ("status", Value::Str("Draft".into())),
+                ],
+            ),
+            rec(
+                "s",
+                "s/b.md",
+                &[
+                    ("jira", Value::Str("NOPE-1".into())),
+                    ("status", Value::Str("synced".into())),
+                ],
+            ),
+        ];
+
+        let matches = parse("SELECT jira WHERE jira REGEXP '^DCP-[0-9]+$'").unwrap();
+        assert_eq!(
+            execute(&matches, rows.iter(), false).unwrap().rows,
+            vec![vec![Value::Str("DCP-459".into())]]
+        );
+
+        let excludes = parse("SELECT jira WHERE jira NOT REGEXP '^DCP-'").unwrap();
+        assert_eq!(
+            execute(&excludes, rows.iter(), false).unwrap().rows,
+            vec![vec![Value::Str("NOPE-1".into())]]
+        );
+
+        // The operand is a general `Expr`: a scalar-fn call works as the
+        // left side, unlike `LIKE`'s column-only left side. `status` is
+        // mixed-case (`Draft`); `REGEXP` itself stays case-sensitive, so
+        // matching `'draft'` only works once `lower()` normalizes it first.
+        let via_scalar = parse("SELECT jira WHERE lower(status) REGEXP 'draft'").unwrap();
+        assert_eq!(
+            execute(&via_scalar, rows.iter(), false).unwrap().rows,
+            vec![vec![Value::Str("DCP-459".into())]]
+        );
+    }
+    #[test]
+    fn not_regexp_excludes_null_field_row() {
+        // Mirrors `not_like_excludes_null_field_row`: a NULL operand is
+        // "unknown" under 3VL, so `NOT REGEXP` must not resurrect it either.
+        let all = recs_with_null_status();
+        let q = parse("SELECT file.name WHERE status NOT REGEXP 'dr.*'").unwrap();
         let t = execute(&q, all.iter(), false).unwrap();
         assert_eq!(t.rows, vec![vec![Value::Str("b.md".into())]]);
     }
@@ -2661,6 +3020,7 @@ mod tests {
             std::iter::once(&in_range),
             &["created".to_string()],
             false,
+            true,
             now,
         )
         .unwrap();
@@ -2676,6 +3036,7 @@ mod tests {
             std::iter::once(&out_of_range),
             &["created".to_string()],
             false,
+            true,
             now,
         )
         .unwrap();
@@ -2740,6 +3101,7 @@ mod tests {
             std::iter::once(&matching),
             &["created".to_string()],
             false,
+            true,
             now,
         )
         .unwrap();
@@ -2755,6 +3117,7 @@ mod tests {
             std::iter::once(&non_matching),
             &["created".to_string()],
             false,
+            true,
             now,
         )
         .unwrap();
@@ -2778,6 +3141,7 @@ mod tests {
             std::iter::once(&has_date),
             &["dates".to_string()],
             false,
+            true,
             now,
         )
         .unwrap();
@@ -2793,6 +3157,7 @@ mod tests {
             std::iter::once(&missing_date),
             &["dates".to_string()],
             false,
+            true,
             now,
         )
         .unwrap();
@@ -2829,6 +3194,7 @@ mod tests {
             rows.iter(),
             &["status".to_string(), "created".to_string()],
             false,
+            true,
             now,
         )
         .unwrap();
@@ -2842,7 +3208,7 @@ mod tests {
         let now = fixed_now();
         let row = rec("s", "s/a.md", &[]);
         let q = parse("SELECT '-7d' AS d").unwrap();
-        let t = execute_with_schema_at(&q, std::iter::once(&row), &[], false, now).unwrap();
+        let t = execute_with_schema_at(&q, std::iter::once(&row), &[], false, true, now).unwrap();
         assert_eq!(t.rows, vec![vec![Value::Str("2026-07-17".into())]]);
     }
 
@@ -2861,7 +3227,7 @@ mod tests {
         let now = fixed_now();
         let row = rec("s", "s/a.md", &[]);
         let q = parse("SELECT COALESCE(epic, '-7d') AS d").unwrap();
-        let t = execute_with_schema_at(&q, std::iter::once(&row), &[], false, now).unwrap();
+        let t = execute_with_schema_at(&q, std::iter::once(&row), &[], false, true, now).unwrap();
         assert_eq!(t.rows, vec![vec![Value::Str("2026-07-17".into())]]);
     }
 
@@ -2917,6 +3283,7 @@ mod tests {
             [&old, &recent].into_iter(),
             &["created".to_string()],
             false,
+            true,
             now,
         )
         .unwrap();
@@ -2969,6 +3336,111 @@ mod tests {
             assert!(t.rows.is_empty(), "{token} should match no rows");
         }
     }
+
+    #[test]
+    fn order_by_date_field_is_chronological_with_nulls_last() {
+        // I3 (W57 characterization): now that a strict-ISO `created` field
+        // auto-detects to `Value::Date` at ingest, `ORDER BY created` must
+        // still sort chronologically (== lexically for ISO dates) and place
+        // a record with no `created` field (`Value::Null`) last — for both
+        // directions — exactly as it did back when the field was a plain
+        // `Value::Str` (see `null_field_sorts_last_asc_and_desc` above).
+        let rows = [
+            rec(
+                "s",
+                "s/a.md",
+                &[(
+                    "created",
+                    Value::Date(NaiveDate::from_ymd_opt(2026, 7, 24).unwrap()),
+                )],
+            ),
+            rec(
+                "s",
+                "s/b.md",
+                &[(
+                    "created",
+                    Value::Date(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()),
+                )],
+            ),
+            rec(
+                "s",
+                "s/c.md",
+                &[(
+                    "created",
+                    Value::Date(NaiveDate::from_ymd_opt(2026, 12, 31).unwrap()),
+                )],
+            ),
+            rec("s", "s/d.md", &[]), // no `created` field -> Value::Null
+        ];
+
+        let asc = parse("SELECT file.name ORDER BY created ASC").unwrap();
+        let t_asc = execute(&asc, rows.iter(), false).unwrap();
+        assert_eq!(
+            t_asc.rows,
+            vec![
+                vec![Value::Str("b.md".into())],
+                vec![Value::Str("a.md".into())],
+                vec![Value::Str("c.md".into())],
+                vec![Value::Str("d.md".into())],
+            ]
+        );
+
+        // NULL stays last under DESC too — only the non-null comparison
+        // reverses (see `order_cmp`).
+        let desc = parse("SELECT file.name ORDER BY created DESC").unwrap();
+        let t_desc = execute(&desc, rows.iter(), false).unwrap();
+        assert_eq!(
+            t_desc.rows,
+            vec![
+                vec![Value::Str("c.md".into())],
+                vec![Value::Str("a.md".into())],
+                vec![Value::Str("b.md".into())],
+                vec![Value::Str("d.md".into())],
+            ]
+        );
+    }
+
+    #[test]
+    fn order_by_mixed_date_and_string_column_is_panic_free_with_defined_order() {
+        // I4 (W57 characterization): a field that auto-detected to
+        // `Value::Date` on some records but stayed `Value::Str` on another
+        // (e.g. a non-ISO value like "someday") must still sort without
+        // panicking, via `model::compare_dates`'s ISO-text fallback for any
+        // pairing that mixes `Date` with `Str`.
+        let rows = [
+            rec(
+                "s",
+                "s/a.md",
+                &[(
+                    "created",
+                    Value::Date(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()),
+                )],
+            ),
+            rec("s", "s/b.md", &[("created", Value::Str("someday".into()))]),
+            rec(
+                "s",
+                "s/c.md",
+                &[(
+                    "created",
+                    Value::Date(NaiveDate::from_ymd_opt(2026, 6, 1).unwrap()),
+                )],
+            ),
+        ];
+        let q = parse("SELECT file.name ORDER BY created ASC").unwrap();
+        // Must not panic (a non-transitive comparator would corrupt the sort
+        // or panic outright); "2026-01-01" < "2026-06-01" < "someday"
+        // lexically, so the two dated rows sort first, in date order, and
+        // the non-date string sorts last — a defined total order.
+        let t = execute(&q, rows.iter(), false).unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec![Value::Str("a.md".into())],
+                vec![Value::Str("c.md".into())],
+                vec![Value::Str("b.md".into())],
+            ]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2988,6 +3460,7 @@ mod agg_tests {
             Path::new(path),
             m,
             SystemTime::UNIX_EPOCH,
+            0,
             0,
         )
     }
@@ -3009,6 +3482,7 @@ mod agg_tests {
             Path::new(path),
             m,
             SystemTime::UNIX_EPOCH,
+            0,
             0,
         )
     }
@@ -3234,6 +3708,38 @@ mod agg_tests {
         let q = parse("SELECT min(n) AS lo, max(n) AS hi").unwrap();
         let t = execute(&q, rows.iter(), false).unwrap();
         assert_eq!(t.rows, vec![vec![Value::Null, Value::Null]]);
+    }
+    #[test]
+    fn min_and_max_over_date_column() {
+        // I3 (W57 characterization): MIN/MAX over a `Value::Date` column
+        // must resolve chronologically (== lexically for ISO dates), just
+        // as `min_and_max_over_column` above pins for an `Int` column.
+        let rows = [
+            rec_n(
+                "s/a.md",
+                "draft",
+                Value::Date(NaiveDate::from_ymd_opt(2026, 7, 24).unwrap()),
+            ),
+            rec_n(
+                "s/b.md",
+                "draft",
+                Value::Date(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()),
+            ),
+            rec_n(
+                "s/c.md",
+                "draft",
+                Value::Date(NaiveDate::from_ymd_opt(2026, 12, 31).unwrap()),
+            ),
+        ];
+        let q = parse("SELECT min(n) AS lo, max(n) AS hi").unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
+        assert_eq!(
+            t.rows,
+            vec![vec![
+                Value::Date(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()),
+                Value::Date(NaiveDate::from_ymd_opt(2026, 12, 31).unwrap()),
+            ]]
+        );
     }
     #[test]
     fn count_col_counts_non_null_only() {
@@ -3675,5 +4181,171 @@ mod agg_tests {
             t.rows
                 .contains(&vec![Value::Str("dup".into()), Value::Int(500)])
         );
+    }
+
+    /// Task 7 (W56 part 2): `file.body` lazy eval-time disk read.
+    mod file_body {
+        use super::*;
+        use tempfile::TempDir;
+
+        /// Writes `content` to `dir`/`rel` (creating parent directories as
+        /// needed) and returns a [`Record`] whose `abs_path` points at that
+        /// real file — unlike [`super::rec`]'s fake root/path, `file.body`
+        /// needs a file that's actually readable from disk.
+        fn rec_on_disk(dir: &Path, rel: &str, content: &str, kv: &[(&str, Value)]) -> Record {
+            let path = dir.join(rel);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(&path, content).unwrap();
+            let mut fields = IndexMap::new();
+            for (k, v) in kv {
+                fields.insert((*k).to_string(), v.clone());
+            }
+            Record::new(dir, &path, fields, SystemTime::UNIX_EPOCH, 0, 0)
+        }
+
+        /// Test 1 (brief): `WHERE file.body LIKE '%TODO%'` matches a fixture
+        /// whose body contains it, end to end through `execute` (disk reads
+        /// allowed by default there).
+        #[test]
+        fn like_matches_a_body_containing_the_pattern() {
+            let td = TempDir::new().unwrap();
+            let has_todo = rec_on_disk(
+                td.path(),
+                "a.md",
+                "---\nstatus: draft\n---\nTODO fix this\n",
+                &[("status", Value::Str("draft".into()))],
+            );
+            let no_todo = rec_on_disk(
+                td.path(),
+                "b.md",
+                "---\nstatus: draft\n---\nall done\n",
+                &[("status", Value::Str("draft".into()))],
+            );
+
+            let q = parse("SELECT file.name WHERE file.body LIKE '%TODO%'").unwrap();
+            let t = execute(&q, [&has_todo, &no_todo].into_iter(), false).unwrap();
+            assert_eq!(t.rows, vec![vec![Value::Str("a.md".into())]]);
+        }
+
+        /// `SELECT file.body` returns the text after the frontmatter fence —
+        /// not the raw file (fence included) — matching what `word_count`
+        /// already counts (design W56).
+        #[test]
+        fn select_file_body_returns_text_after_the_fence() {
+            let td = TempDir::new().unwrap();
+            let r = rec_on_disk(
+                td.path(),
+                "a.md",
+                "---\nstatus: draft\n---\nhello world\n",
+                &[],
+            );
+
+            let q = parse("SELECT file.body").unwrap();
+            let t = execute(&q, std::iter::once(&r), false).unwrap();
+            assert_eq!(t.rows, vec![vec![Value::Str("hello world".into())]]);
+        }
+
+        /// Test 2 (brief), lenient half: under `--force-cache`
+        /// (`disk_reads_allowed = false`), `file.body` resolves to `Null` per
+        /// row rather than a wrong/stale answer — `--lenient` set.
+        #[test]
+        fn force_cache_lenient_yields_null() {
+            let td = TempDir::new().unwrap();
+            let r = rec_on_disk(td.path(), "a.md", "---\nstatus: draft\n---\nTODO\n", &[]);
+
+            let q = parse("SELECT file.body").unwrap();
+            let t = execute_with_schema_at(
+                &q,
+                std::iter::once(&r),
+                &[],
+                true,  // lenient
+                false, // disk_reads_allowed
+                SystemTime::now(),
+            )
+            .unwrap();
+            assert_eq!(t.rows, vec![vec![Value::Null]]);
+        }
+
+        /// Test 2 (brief), strict half: under `--force-cache` WITHOUT
+        /// `--lenient`, a `file.body` reference fails the whole query with a
+        /// clear diagnostic rather than silently returning `Null` rows — the
+        /// "never a silent wrong answer" invariant (design W56).
+        #[test]
+        fn force_cache_strict_is_a_clear_diagnostic_not_null() {
+            let td = TempDir::new().unwrap();
+            let r = rec_on_disk(td.path(), "a.md", "---\nstatus: draft\n---\nTODO\n", &[]);
+
+            let q = parse("SELECT file.body").unwrap();
+            let err = execute_with_schema_at(
+                &q,
+                std::iter::once(&r),
+                &[],
+                false, // strict
+                false, // disk_reads_allowed
+                SystemTime::now(),
+            )
+            .unwrap_err();
+            assert!(matches!(err, ExecError::BodyUnavailable));
+            assert!(err.to_string().contains("force-cache"));
+        }
+
+        /// `file.body` referenced only inside `WHERE` (not `SELECT`) must
+        /// still trip the strict `--force-cache` diagnostic — `references_body`
+        /// walks every clause, not just the projection.
+        #[test]
+        fn force_cache_strict_catches_a_where_only_reference() {
+            let td = TempDir::new().unwrap();
+            let r = rec_on_disk(td.path(), "a.md", "---\nstatus: draft\n---\nTODO\n", &[]);
+
+            let q = parse("SELECT file.name WHERE file.body LIKE '%TODO%'").unwrap();
+            let err = execute_with_schema_at(
+                &q,
+                std::iter::once(&r),
+                &[],
+                false,
+                false,
+                SystemTime::now(),
+            )
+            .unwrap_err();
+            assert!(matches!(err, ExecError::BodyUnavailable));
+        }
+
+        /// Test 3 (brief): the I/O-regression guard. Same on-disk record used
+        /// two ways after its file is deleted:
+        /// - a query that does NOT reference `file.body` (`SELECT status`)
+        ///   must still succeed with the correct in-memory field value —
+        ///   proving evaluation never touched the now-missing file for this
+        ///   query, since `resolve_col` only special-cases `FileAttr::Body`
+        ///   and every other column resolves straight off the `Record`'s
+        ///   already-parsed fields.
+        /// - the SAME record's `file.body`, evaluated separately, resolves to
+        ///   `Null` — proving the deleted file really is unreadable now, so
+        ///   the first query's success isn't a coincidence of the delete
+        ///   being a no-op.
+        #[test]
+        fn frontmatter_only_query_succeeds_after_the_file_is_deleted() {
+            let td = TempDir::new().unwrap();
+            let r = rec_on_disk(
+                td.path(),
+                "a.md",
+                "---\nstatus: draft\n---\nTODO fix this\n",
+                &[("status", Value::Str("draft".into()))],
+            );
+            fs::remove_file(r.abs_path()).unwrap();
+
+            // No `file.body` reference anywhere in this query: must succeed,
+            // reading `status` straight from the in-memory `Record`.
+            let no_body_ref = parse("SELECT status WHERE status = 'draft'").unwrap();
+            let t = execute(&no_body_ref, std::iter::once(&r), false).unwrap();
+            assert_eq!(t.rows, vec![vec![Value::Str("draft".into())]]);
+
+            // Contrast: the same (now-deleted) file's body really is
+            // unreadable — confirming the delete above was real, not a no-op.
+            let body_ref = parse("SELECT file.body").unwrap();
+            let t = execute(&body_ref, std::iter::once(&r), false).unwrap();
+            assert_eq!(t.rows, vec![vec![Value::Null]]);
+        }
     }
 }
