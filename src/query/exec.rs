@@ -207,9 +207,11 @@ fn rewrite_expr_literals(expr: &mut Expr, now: SystemTime) {
 
 /// Walks a `WHERE` predicate tree's literal positions for
 /// [`rewrite_relative_dates`]: both `Compare` operands, every `IN` list
-/// element, and `MEMBER OF`'s literal. `Like`'s pattern is a plain `String`
-/// (never a `Literal`) and `IsNull` carries no literal at all, so neither
-/// needs a rewrite.
+/// element, `MEMBER OF`'s literal, and `Regexp`'s `Expr` operand (mirroring
+/// `Compare`, since that operand is just as general). `Like`'s pattern is a
+/// plain `String` (never a `Literal`) and `IsNull` carries no literal at
+/// all, so neither needs a rewrite — `Regexp`'s pattern is the same plain
+/// `String` as `Like`'s, for the same reason.
 fn rewrite_predicate_literals(pred: &mut Predicate, now: SystemTime) {
     match pred {
         Predicate::Compare(l, _, r) => {
@@ -222,6 +224,7 @@ fn rewrite_predicate_literals(pred: &mut Predicate, now: SystemTime) {
             }
         }
         Predicate::MemberOf(lit, _, _) => rewrite_literal(lit, now),
+        Predicate::Regexp(expr, _, _) => rewrite_expr_literals(expr, now),
         Predicate::Like(..) | Predicate::IsNull(..) => {}
         Predicate::And(a, b) | Predicate::Or(a, b) => {
             rewrite_predicate_literals(a, now);
@@ -632,6 +635,7 @@ fn predicate_columns(pred: &Predicate) -> Vec<&ColRef> {
         Predicate::Like(col, _, _) | Predicate::In(col, _, _) | Predicate::IsNull(col, _) => {
             vec![col]
         }
+        Predicate::Regexp(expr, _, _) => expr_columns(expr),
         Predicate::MemberOf(_, col, _) => vec![col],
         Predicate::And(a, b) | Predicate::Or(a, b) => predicate_columns(a)
             .into_iter()
@@ -1499,6 +1503,14 @@ fn eval_predicate(record: &Record, pred: &Predicate) -> Option<bool> {
             let base = Some(like_matches(&value.to_cmp_string(), pattern));
             maybe_negate(base, *negated)
         }
+        Predicate::Regexp(expr, pattern, negated) => {
+            let value = eval_expr(record, expr);
+            if value.is_null() {
+                return None;
+            }
+            let base = Some(regexp_matches(&value.display(), pattern));
+            maybe_negate(base, *negated)
+        }
         Predicate::In(col, literals, negated) => {
             let value = resolve_col(record, col);
             if value.is_null() {
@@ -1608,6 +1620,15 @@ fn like_matches(value: &str, pattern: &str) -> bool {
     // in, so wrapping it in `^…$` is always a valid regex.
     let re = Regex::new(&format!("^{translated}$"))
         .expect("LIKE pattern translates to a well-formed regex");
+    re.is_match(value)
+}
+
+/// Matches `value` against a `REGEXP` pattern. `parse::lower_regexp` already
+/// confirmed `pattern` compiles at parse time, so recompiling it here can't
+/// fail — mirroring [`like_matches`], it's recompiled fresh per call rather
+/// than cached.
+fn regexp_matches(value: &str, pattern: &str) -> bool {
+    let re = Regex::new(pattern).expect("REGEXP pattern validated to compile at parse time");
     re.is_match(value)
 }
 
@@ -2355,6 +2376,58 @@ mod tests {
     fn not_like_excludes_null_field_row() {
         let all = recs_with_null_status();
         let q = parse("SELECT file.name WHERE status NOT LIKE 'dr%'").unwrap();
+        let t = execute(&q, all.iter(), false).unwrap();
+        assert_eq!(t.rows, vec![vec![Value::Str("b.md".into())]]);
+    }
+    #[test]
+    fn regexp_matches_and_negates_and_over_scalar_fn() {
+        let rows = [
+            rec(
+                "s",
+                "s/a.md",
+                &[
+                    ("jira", Value::Str("DCP-459".into())),
+                    ("status", Value::Str("Draft".into())),
+                ],
+            ),
+            rec(
+                "s",
+                "s/b.md",
+                &[
+                    ("jira", Value::Str("NOPE-1".into())),
+                    ("status", Value::Str("synced".into())),
+                ],
+            ),
+        ];
+
+        let matches = parse("SELECT jira WHERE jira REGEXP '^DCP-[0-9]+$'").unwrap();
+        assert_eq!(
+            execute(&matches, rows.iter(), false).unwrap().rows,
+            vec![vec![Value::Str("DCP-459".into())]]
+        );
+
+        let excludes = parse("SELECT jira WHERE jira NOT REGEXP '^DCP-'").unwrap();
+        assert_eq!(
+            execute(&excludes, rows.iter(), false).unwrap().rows,
+            vec![vec![Value::Str("NOPE-1".into())]]
+        );
+
+        // The operand is a general `Expr`: a scalar-fn call works as the
+        // left side, unlike `LIKE`'s column-only left side. `status` is
+        // mixed-case (`Draft`); `REGEXP` itself stays case-sensitive, so
+        // matching `'draft'` only works once `lower()` normalizes it first.
+        let via_scalar = parse("SELECT jira WHERE lower(status) REGEXP 'draft'").unwrap();
+        assert_eq!(
+            execute(&via_scalar, rows.iter(), false).unwrap().rows,
+            vec![vec![Value::Str("DCP-459".into())]]
+        );
+    }
+    #[test]
+    fn not_regexp_excludes_null_field_row() {
+        // Mirrors `not_like_excludes_null_field_row`: a NULL operand is
+        // "unknown" under 3VL, so `NOT REGEXP` must not resurrect it either.
+        let all = recs_with_null_status();
+        let q = parse("SELECT file.name WHERE status NOT REGEXP 'dr.*'").unwrap();
         let t = execute(&q, all.iter(), false).unwrap();
         assert_eq!(t.rows, vec![vec![Value::Str("b.md".into())]]);
     }

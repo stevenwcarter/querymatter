@@ -17,6 +17,7 @@
 //! understand — is rejected with a [`ParseError`] rather than silently
 //! ignored.
 
+use regex::Regex;
 use sqlparser::ast as sql;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -647,9 +648,15 @@ fn lower_predicate(expr: &sql::Expr) -> Result<Predicate, ParseError> {
             ..
         } => Ok(Predicate::Like(
             lower_col_ref(expr)?,
-            string_literal(pattern)?,
+            string_literal(pattern, "LIKE")?,
             *negated,
         )),
+        sql::Expr::RLike {
+            negated,
+            expr,
+            pattern,
+            ..
+        } => lower_regexp(expr, pattern, *negated),
         sql::Expr::InList {
             expr,
             list,
@@ -668,6 +675,23 @@ fn lower_predicate(expr: &sql::Expr) -> Result<Predicate, ParseError> {
         } => lower_not(expr),
         _ => Err(unsupported("this WHERE expression")),
     }
+}
+
+/// Lowers `<expr> [NOT] REGEXP '<pattern>'` (sqlparser's `RLike` node also
+/// covers the `RLIKE` keyword alias — identical semantics, see
+/// [`Predicate::Regexp`]). The pattern is compiled here purely to reject an
+/// invalid regex at parse time rather than on every row at evaluation time;
+/// the compiled `Regex` itself is discarded — `exec::eval_predicate`
+/// recompiles it against each record.
+fn lower_regexp(
+    expr: &sql::Expr,
+    pattern: &sql::Expr,
+    negated: bool,
+) -> Result<Predicate, ParseError> {
+    let operand = lower_expr(expr)?;
+    let pat = string_literal(pattern, "REGEXP")?;
+    Regex::new(&pat).map_err(|e| unsupported(format!("invalid regex `{pat}`: {e}")))?;
+    Ok(Predicate::Regexp(operand, pat, negated))
 }
 
 /// Lowers `NOT <expr>`. sqlparser 0.62 rejects the postfix `<value> NOT
@@ -809,18 +833,19 @@ fn parse_number(n: &str) -> Result<Literal, ParseError> {
 }
 
 /// Extracts a string literal's raw text, rejecting non-string values (used
-/// for `LIKE` patterns). This bypasses [`lower_string_literal`]'s
-/// relative-date check deliberately: `Predicate::Like`'s pattern is a plain
+/// for `LIKE`/`REGEXP` patterns — `what` names the caller's construct for
+/// the error message, e.g. `"LIKE"`). This bypasses [`lower_string_literal`]'s
+/// relative-date check deliberately: a `LIKE`/`REGEXP` pattern is a plain
 /// `String`, never a [`Literal`], so a pattern that happens to match the
 /// relative-date grammar (e.g. `LIKE '-7d'`) must still match literally,
 /// not be rejected as "not a string".
-fn string_literal(expr: &sql::Expr) -> Result<String, ParseError> {
+fn string_literal(expr: &sql::Expr, what: &str) -> Result<String, ParseError> {
     let sql::Expr::Value(value) = expr else {
-        return Err(unsupported("LIKE pattern must be a string"));
+        return Err(unsupported(format!("{what} pattern must be a string")));
     };
     raw_string(&value.value)
         .map(str::to_string)
-        .ok_or_else(|| unsupported("LIKE pattern must be a string"))
+        .ok_or_else(|| unsupported(format!("{what} pattern must be a string")))
 }
 
 /// Extracts a quoted string literal's raw text from a `sqlparser` value
@@ -1314,6 +1339,64 @@ mod tests {
             parse("SELECT jira WHERE epic IS NOT NULL").unwrap().filter,
             Some(Predicate::IsNull(ColRef::Field(vec!["epic".into()]), true))
         );
+    }
+    #[test]
+    fn regexp_shape() {
+        // REGEXP and NOT REGEXP carry the operand (a general `Expr`, not
+        // just a `ColRef`), the pattern, and the negation flag.
+        assert_eq!(
+            parse("SELECT jira WHERE jira REGEXP '^DCP-[0-9]+$'")
+                .unwrap()
+                .filter,
+            Some(Predicate::Regexp(
+                Expr::Col(ColRef::Field(vec!["jira".into()])),
+                "^DCP-[0-9]+$".into(),
+                false
+            ))
+        );
+        assert_eq!(
+            parse("SELECT jira WHERE jira NOT REGEXP '^DCP-'")
+                .unwrap()
+                .filter,
+            Some(Predicate::Regexp(
+                Expr::Col(ColRef::Field(vec!["jira".into()])),
+                "^DCP-".into(),
+                true
+            ))
+        );
+        // The left side lowers through the full `Expr` grammar, so a
+        // scalar-fn call works as the operand, unlike `LIKE`'s column-only
+        // left side.
+        assert_eq!(
+            parse("SELECT jira WHERE lower(status) REGEXP 'draft'")
+                .unwrap()
+                .filter,
+            Some(Predicate::Regexp(
+                Expr::Scalar(
+                    ScalarFn::Lower,
+                    vec![Expr::Col(ColRef::Field(vec!["status".into()]))]
+                ),
+                "draft".into(),
+                false
+            ))
+        );
+        // `RLIKE` is sqlparser's alias for the same node (identical
+        // semantics), so it lowers the same way.
+        assert_eq!(
+            parse("SELECT jira WHERE jira RLIKE '^DCP-'")
+                .unwrap()
+                .filter,
+            Some(Predicate::Regexp(
+                Expr::Col(ColRef::Field(vec!["jira".into()])),
+                "^DCP-".into(),
+                false
+            ))
+        );
+    }
+    #[test]
+    fn regexp_bad_pattern_rejected_at_parse_time() {
+        let err = parse("SELECT jira WHERE jira REGEXP '('").unwrap_err();
+        assert!(matches!(err, ParseError::Unsupported(_)), "{err:?}");
     }
     #[test]
     fn member_of_shape() {

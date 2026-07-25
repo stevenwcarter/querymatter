@@ -194,6 +194,15 @@ pub enum Predicate {
     Compare(Expr, CmpOp, Expr),
     /// `col [NOT] LIKE '<pattern>'`; the `bool` is `true` when negated.
     Like(ColRef, String, /* negated */ bool),
+    /// `<expr> [NOT] REGEXP '<pattern>'` (`RLIKE` is sqlparser's alias for
+    /// the same node — identical semantics); the `bool` is `true` when
+    /// negated. Unlike `Like`, the left side is a general [`Expr`] (e.g.
+    /// `lower(status) REGEXP 'draft'`), not just a column reference. The
+    /// pattern is validated to compile at parse time
+    /// (`parse::lower_regexp`), so evaluation never sees an invalid regex.
+    /// Matching is always case-sensitive — the user opts into
+    /// case-insensitivity with an inline `(?i)` flag.
+    Regexp(Expr, String, /* negated */ bool),
     /// `col [NOT] IN (<literals>)`; the `bool` is `true` when negated.
     In(ColRef, Vec<Literal>, /* negated */ bool),
     /// `<lit> MEMBER OF(col)` / `NOT <lit> MEMBER OF(col)`; the `bool` is
@@ -538,6 +547,7 @@ fn collect_predicate_fields(pred: &Predicate, fields: &mut BTreeSet<String>) {
         Predicate::Like(col, _, _) | Predicate::In(col, _, _) | Predicate::IsNull(col, _) => {
             collect_col_field(col, fields);
         }
+        Predicate::Regexp(expr, _, _) => collect_expr_fields(expr, fields),
         Predicate::MemberOf(_, col, _) => collect_col_field(col, fields),
         Predicate::And(a, b) | Predicate::Or(a, b) => {
             collect_predicate_fields(a, fields);
@@ -682,6 +692,11 @@ fn predicate_label(pred: &Predicate) -> String {
         Predicate::Like(col, pattern, negated) => format!(
             "{} {}like '{pattern}'",
             col.label(),
+            if *negated { "not " } else { "" }
+        ),
+        Predicate::Regexp(expr, pattern, negated) => format!(
+            "{} {}regexp '{pattern}'",
+            expr_label(expr),
             if *negated { "not " } else { "" }
         ),
         Predicate::In(col, lits, negated) => {
