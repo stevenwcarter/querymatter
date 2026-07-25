@@ -1026,7 +1026,9 @@ fn flip_cmp_op(op: CmpOp) -> CmpOp {
 
 /// Lowers an `ORDER BY` clause, resolving identifiers that match a projection
 /// alias to [`OrderTarget::Alias`], a bare aggregate call to
-/// [`OrderTarget::Agg`], and everything else to a column.
+/// [`OrderTarget::Agg`], a bare column to [`OrderTarget::Col`], and anything
+/// else (arithmetic, a scalar-fn call, `CASE`, …) to [`OrderTarget::Expr`]
+/// via [`lower_expr`].
 fn lower_order_by(
     order_by: Option<&sql::OrderBy>,
     aliases: &[&str],
@@ -1047,7 +1049,7 @@ fn lower_order_by(
 
 /// Lowers a single `ORDER BY` term. A `Function` expression is a bare
 /// aggregate call (e.g. `ORDER BY count(*) DESC`, no `AS` alias needed) —
-/// checked before the alias/[`lower_col_ref`] fallback, and only valid
+/// checked before the alias/column/expression fallbacks, and only valid
 /// alongside a non-empty `group_by`, mirroring how [`lower_having`] rejects
 /// an aggregate on an ungrouped query (including the implicit single-group
 /// case, where `group_by` is empty too).
@@ -1056,7 +1058,12 @@ fn lower_order_by(
 /// rejects a non-aggregate function name (e.g. `ORDER BY upper(status)`)
 /// with a clean "function `upper`" message, so that case must never be
 /// misreported as "requires GROUP BY" — a message that only makes sense once
-/// the function is confirmed to actually be an aggregate.
+/// the function is confirmed to actually be an aggregate. A bare identifier
+/// or compound identifier lowers to a plain column via [`lower_col_ref`],
+/// exactly as before this generalized to expressions; everything else
+/// (arithmetic, `CASE`, a scalar-fn call, …) lowers through [`lower_expr`]
+/// into [`OrderTarget::Expr`], so `ORDER BY` accepts the same expression
+/// grammar a `SELECT` item does.
 fn lower_order_expr(
     order: &sql::OrderByExpr,
     aliases: &[&str],
@@ -1074,7 +1081,10 @@ fn lower_order_expr(
         sql::Expr::Identifier(ident) if aliases.contains(&ident.value.as_str()) => {
             OrderTarget::Alias(ident.value.clone())
         }
-        other => OrderTarget::Col(lower_col_ref(other)?),
+        sql::Expr::Identifier(_) | sql::Expr::CompoundIdentifier(_) => {
+            OrderTarget::Col(lower_col_ref(&order.expr)?)
+        }
+        other => OrderTarget::Expr(lower_expr(other)?),
     };
     Ok(OrderKey { target, desc })
 }
@@ -1308,6 +1318,33 @@ mod tests {
             vec![OrderKey {
                 target: OrderTarget::Agg(Aggregate::CountStar),
                 desc: true
+            }]
+        );
+    }
+    #[test]
+    fn order_by_arbitrary_expr_lowers_to_expr_target() {
+        // Anything beyond a bare alias/column/aggregate — arithmetic, a
+        // scalar-fn call, `CASE`, … — lowers through `lower_expr` into
+        // `OrderTarget::Expr`, generalizing `ORDER BY` to the same
+        // expression grammar a `SELECT` item accepts.
+        let q =
+            parse("SELECT status ORDER BY CASE WHEN status = 'draft' THEN 0 ELSE 1 END").unwrap();
+        assert_eq!(
+            q.order_by,
+            vec![OrderKey {
+                target: OrderTarget::Expr(Expr::Case {
+                    operand: None,
+                    whens: vec![(
+                        Expr::Predicate(Box::new(Predicate::Compare(
+                            Expr::Col(ColRef::Field(vec!["status".into()])),
+                            CmpOp::Eq,
+                            Expr::Lit(Literal::Str("draft".into()))
+                        ))),
+                        Expr::Lit(Literal::Int(0))
+                    )],
+                    else_expr: Some(Box::new(Expr::Lit(Literal::Int(1)))),
+                }),
+                desc: false
             }]
         );
     }

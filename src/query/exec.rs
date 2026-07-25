@@ -142,9 +142,9 @@ fn execute_with_schema_at<'a>(
 /// ISO-8601 date/datetime it resolves to against `now` (see
 /// [`resolve_reldate`]). Walks every literal position in the query tree —
 /// `SELECT` expressions, the `WHERE` predicate (comparison operands, `IN`
-/// lists, `MEMBER OF`'s literal), and `HAVING` — so no relative-date literal
-/// can reach evaluation unresolved, regardless of where in the query it
-/// appears.
+/// lists, `MEMBER OF`'s literal), `ORDER BY`'s computed-expression target,
+/// and `HAVING` — so no relative-date literal can reach evaluation
+/// unresolved, regardless of where in the query it appears.
 fn rewrite_relative_dates(q: &mut Query, now: SystemTime) {
     for item in &mut q.select {
         if let SelectExpr::Expr(expr) = &mut item.expr {
@@ -153,6 +153,11 @@ fn rewrite_relative_dates(q: &mut Query, now: SystemTime) {
     }
     if let Some(pred) = &mut q.filter {
         rewrite_predicate_literals(pred, now);
+    }
+    for key in &mut q.order_by {
+        if let OrderTarget::Expr(expr) = &mut key.target {
+            rewrite_expr_literals(expr, now);
+        }
     }
     if let Some(having) = &mut q.having {
         rewrite_having_literals(having, now);
@@ -878,6 +883,11 @@ enum ResolvedGroupOrderTarget {
     /// — it need not appear in `SELECT`, mirroring how `HAVING` may
     /// reference an unselected aggregate (see [`HavingLeaf::Agg`]).
     Agg(Aggregate),
+    /// A computed expression (`CASE`, arithmetic, a scalar-fn call, …) built
+    /// entirely from `group_by` columns — the same restriction
+    /// [`validate_grouped_select`] applies to a non-aggregate `SELECT` item,
+    /// since it likewise must reduce to one value per group.
+    Expr(Expr),
 }
 
 /// Resolves each `ORDER BY` key's target for the grouped path: an explicit
@@ -885,7 +895,10 @@ enum ResolvedGroupOrderTarget {
 /// bare column must be one of `group_by`'s keys — referencing anything else
 /// is as invalid as selecting it, so it's rejected the same way; a bare
 /// aggregate always resolves, since it's computed fresh per group rather
-/// than looked up in the projection or the grouping keys.
+/// than looked up in the projection or the grouping keys; a computed
+/// expression is checked the same way a grouped `SELECT` expression is (see
+/// [`validate_grouped_select`]) — every column it references must be one of
+/// `group_by`'s keys.
 fn resolve_group_order_targets(
     order_by: &[OrderKey],
     headers: &[String],
@@ -906,25 +919,46 @@ fn resolve_group_order_targets(
                     .map(ResolvedGroupOrderTarget::GroupKey)
                     .ok_or_else(|| ExecError::NonGroupedColumn(col_header(col)))?,
                 OrderTarget::Agg(agg) => ResolvedGroupOrderTarget::Agg(agg.clone()),
+                OrderTarget::Expr(expr) => {
+                    if expr_columns(expr)
+                        .into_iter()
+                        .all(|col| group_by.contains(col))
+                    {
+                        ResolvedGroupOrderTarget::Expr(expr.clone())
+                    } else {
+                        return Err(ExecError::NonGroupedColumn(expr_header(expr)));
+                    }
+                }
             };
             Ok((target, key.desc))
         })
         .collect()
 }
 
-/// Renders a bare `ColRef` the way it would appear as a default `SELECT`
-/// header, for a `NonGroupedColumn` message about an `ORDER BY` column.
-fn col_header(col: &ColRef) -> String {
+/// Renders an arbitrary `Expr` the way it would appear as a default `SELECT`
+/// header, for a `NonGroupedColumn` message about an `ORDER BY` expression
+/// (or, via [`col_header`], a bare `ORDER BY` column).
+fn expr_header(expr: &Expr) -> String {
     SelectItem {
-        expr: SelectExpr::Expr(Expr::Col(col.clone())),
+        expr: SelectExpr::Expr(expr.clone()),
         alias: None,
     }
     .header()
 }
 
+/// Renders a bare `ColRef` the way it would appear as a default `SELECT`
+/// header, for a `NonGroupedColumn` message about an `ORDER BY` column.
+fn col_header(col: &ColRef) -> String {
+    expr_header(&Expr::Col(col.clone()))
+}
+
 /// Reads the sort key's value for one group, given its already-projected
 /// row. An aggregate target is computed fresh from `group.rows` — it need
-/// not be one of `group`'s already-projected `SELECT` cells.
+/// not be one of `group`'s already-projected `SELECT` cells. An expression
+/// target is likewise evaluated fresh, over the group's representative row
+/// (see [`eval_group_expr`]) — [`resolve_group_order_targets`] guarantees it
+/// references only `group_by` columns, so any row in the group yields the
+/// same value.
 fn group_order_key_value(
     target: &ResolvedGroupOrderTarget,
     group: &Group<'_>,
@@ -934,6 +968,7 @@ fn group_order_key_value(
         ResolvedGroupOrderTarget::Row(idx) => row[*idx].clone(),
         ResolvedGroupOrderTarget::GroupKey(idx) => group.key[*idx].clone(),
         ResolvedGroupOrderTarget::Agg(agg) => compute_aggregate(agg, &group.rows),
+        ResolvedGroupOrderTarget::Expr(expr) => eval_group_expr(&group.rows, expr),
     }
 }
 
@@ -1354,6 +1389,9 @@ enum ResolvedOrderTarget {
     AliasIndex(usize),
     /// A fresh column lookup on the source record.
     Col(ColRef),
+    /// A computed expression (arithmetic, `CASE`, a scalar-fn call, …),
+    /// evaluated fresh per row via [`eval_expr`].
+    Expr(Expr),
 }
 
 /// Resolves each `ORDER BY` key's target once, up front, returning the
@@ -1379,6 +1417,7 @@ fn resolve_order_targets(
                 }
                 OrderTarget::Col(col) => ResolvedOrderTarget::Col(col.clone()),
                 OrderTarget::Agg(_) => return Err(ExecError::AggregateOrderWithoutGroupBy),
+                OrderTarget::Expr(expr) => ResolvedOrderTarget::Expr(expr.clone()),
             };
             Ok((target, key.desc))
         })
@@ -1391,6 +1430,7 @@ fn order_key_value(target: &ResolvedOrderTarget, record: &Record, row: &[Value])
     match target {
         ResolvedOrderTarget::AliasIndex(idx) => row[*idx].clone(),
         ResolvedOrderTarget::Col(col) => resolve_col(record, col),
+        ResolvedOrderTarget::Expr(expr) => eval_expr(record, expr),
     }
 }
 
@@ -1758,6 +1798,42 @@ mod tests {
             // "done" matches the second WHEN; "other" matches no WHEN and
             // there's no ELSE, so it falls back to `Value::Null`.
             vec![vec![Value::Str("Z".into())], vec![Value::Null]]
+        );
+    }
+
+    #[test]
+    fn case_usable_in_where_and_order_by() {
+        let rows = [
+            rec("s", "s/b.md", &[("status", Value::Str("synced".into()))]),
+            rec("s", "s/a.md", &[("status", Value::Str("draft".into()))]),
+            rec("s", "s/c.md", &[("status", Value::Str("synced".into()))]),
+        ];
+
+        // `WHERE (CASE WHEN status = 'draft' THEN 1 ELSE 0 END) = 1` keeps
+        // only the draft row — proves a searched CASE evaluates as a
+        // comparison operand inside a WHERE predicate.
+        let where_q =
+            parse("SELECT file.name WHERE (CASE WHEN status = 'draft' THEN 1 ELSE 0 END) = 1")
+                .unwrap();
+        let t = execute(&where_q, rows.iter(), false).unwrap();
+        assert_eq!(t.rows, vec![vec![Value::Str("a.md".into())]]);
+
+        // `ORDER BY CASE WHEN status = 'draft' THEN 0 ELSE 1 END` puts
+        // drafts first even though "a.md" is neither first in scan order
+        // nor first alphabetically — proves the `ORDER BY <expr>` path.
+        // `file.name` is a tiebreaker, pinning multi-key ORDER BY semantics.
+        let order_q = parse(
+            "SELECT file.name ORDER BY CASE WHEN status = 'draft' THEN 0 ELSE 1 END, file.name",
+        )
+        .unwrap();
+        let t = execute(&order_q, rows.iter(), false).unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec![Value::Str("a.md".into())],
+                vec![Value::Str("b.md".into())],
+                vec![Value::Str("c.md".into())],
+            ]
         );
     }
 
@@ -2259,6 +2335,27 @@ mod tests {
     }
 
     #[test]
+    fn unknown_column_inside_case_arm_is_caught_strict_and_nulled_lenient() {
+        // Validation must walk into a CASE arm's condition too, proving
+        // `Query::referenced_fields`/`expr_columns` descend into
+        // `Expr::Case` the same as they do a scalar-fn argument (see
+        // `typo_inside_scalar_and_having_is_caught` above).
+        let q = parse("SELECT CASE WHEN bogus_col = 'x' THEN 1 END").unwrap();
+        assert!(matches!(
+            execute(&q, recs().iter(), false),
+            Err(ExecError::UnknownColumn { .. })
+        ));
+
+        // Under `--lenient`, validation is skipped entirely: `bogus_col`
+        // resolves to `Value::Null` at every row, no WHEN arm's condition is
+        // ever truthy, and (with no ELSE) the whole CASE evaluates to
+        // `Value::Null`.
+        let all = recs();
+        let t = execute(&q, all.iter(), true).unwrap();
+        assert_eq!(t.rows, vec![vec![Value::Null]; all.len()]);
+    }
+
+    #[test]
     fn dotted_path_select_and_filter_reads_nested_map() {
         // End-to-end wiring check: parse's `ColRef::Field(path)` lowering,
         // schema validation's top-level-only check, `resolve_col`, and
@@ -2505,6 +2602,28 @@ mod tests {
     }
 
     #[test]
+    fn relative_date_rewrite_recurses_into_case_arm() {
+        // Regression, mirroring `relative_date_resolves_inside_coalesce_argument`
+        // above: `rewrite_expr_literals` must recurse into `Expr::Case`'s
+        // WHEN/THEN arms (and its ELSE), not just `Coalesce`/`Scalar`/
+        // `Binary`. Pinned directly against the rewritten AST rather than
+        // through execution — the arm's literal must become a resolved
+        // `Literal::Str`, never survive the rewrite as a
+        // `Literal::RelativeDate` (which would panic in `literal_value` once
+        // evaluation reached it).
+        let mut q = parse("SELECT CASE WHEN status = 'draft' THEN '-7d' ELSE 'none' END").unwrap();
+        rewrite_relative_dates(&mut q, fixed_now());
+
+        let SelectExpr::Expr(Expr::Case { whens, .. }) = &q.select[0].expr else {
+            panic!("expected the SELECT item to lower to a CASE expression");
+        };
+        let [(_, then)] = whens.as_slice() else {
+            panic!("expected exactly one WHEN arm");
+        };
+        assert_eq!(then, &Expr::Lit(Literal::Str("2026-07-17".into())));
+    }
+
+    #[test]
     fn extreme_offset_magnitude_falls_back_to_str_and_does_not_panic() {
         // Each of these is malformed/out-of-bound enough that
         // `RelDate::parse` must reject it, so it stays a plain
@@ -2683,6 +2802,69 @@ mod agg_tests {
             execute(&q, recs().iter(), false),
             Err(ExecError::NonGroupedColumn(_))
         ));
+    }
+    #[test]
+    fn grouped_select_case_over_grouping_key() {
+        // `CASE WHEN status = ... END` is valid because it references only
+        // `status` (a GROUP BY key); evaluated over each group's
+        // representative row, mirroring `grouped_select_expr_over_grouping_key`
+        // for `lower(...)` and `grouped_coalesce_over_grouping_key` for
+        // `COALESCE(...)` — the grouped-CASE interaction Task 9's reviewer
+        // flagged as wired but untested.
+        let q = parse(
+            "SELECT CASE WHEN status = 'draft' THEN 'D' ELSE 'S' END AS c, count(*) AS n \
+             GROUP BY status ORDER BY status",
+        )
+        .unwrap();
+        let t = execute(&q, recs().iter(), false).unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec![Value::Str("D".into()), Value::Int(1)],
+                vec![Value::Str("S".into()), Value::Int(2)],
+            ]
+        );
+    }
+    #[test]
+    fn grouped_select_case_referencing_non_group_key_errors() {
+        // `prd` isn't a GROUP BY key; referencing it inside a CASE arm must
+        // still be rejected — validation walks into CASE conditions/results
+        // the same as any other nested expression (`expr_columns`'s `Case`
+        // arm), mirroring `grouped_coalesce_referencing_non_group_key_errors`.
+        let q = parse("SELECT CASE WHEN prd = '010' THEN 1 ELSE 0 END, count(*) GROUP BY status")
+            .unwrap();
+        assert!(matches!(
+            execute(&q, recs().iter(), false),
+            Err(ExecError::NonGroupedColumn(_))
+        ));
+    }
+    #[test]
+    fn grouped_order_by_case_puts_target_group_first() {
+        // Alphabetically "approved" sorts before "draft", so the
+        // deterministic pre-`ORDER BY` group sort (`compare_key_tuple`)
+        // would put "approved" first; `ORDER BY CASE WHEN status = 'draft'
+        // THEN 0 ELSE 1 END` must override that and put "draft" first
+        // instead — proving the grouped path resolves `OrderTarget::Expr`
+        // (via `eval_group_expr`) rather than silently falling back to the
+        // pre-sort's alphabetical order.
+        let rows = [
+            rec("s/a.md", "approved", "010"),
+            rec("s/b.md", "draft", "010"),
+            rec("s/c.md", "draft", "011"),
+        ];
+        let q = parse(
+            "SELECT status, count(*) AS n GROUP BY status \
+             ORDER BY CASE WHEN status = 'draft' THEN 0 ELSE 1 END",
+        )
+        .unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec![Value::Str("draft".into()), Value::Int(2)],
+                vec![Value::Str("approved".into()), Value::Int(1)],
+            ]
+        );
     }
     #[test]
     fn grouped_literal_expr_survives_zero_row_aggregate_bucket() {

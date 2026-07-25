@@ -382,8 +382,8 @@ pub struct OrderKey {
     pub desc: bool,
 }
 
-/// The sort key of an `ORDER BY` clause: a projection alias, a column, or a
-/// bare aggregate call.
+/// The sort key of an `ORDER BY` clause: a projection alias, a column, a
+/// bare aggregate call, or an arbitrary computed expression.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OrderTarget {
     /// An identifier that matched a `SELECT` alias.
@@ -396,6 +396,13 @@ pub enum OrderTarget {
     /// single-group case, where `group_by` is empty too) rather than
     /// leaving that combination representable.
     Agg(Aggregate),
+    /// Any other computed expression, e.g. `ORDER BY CASE WHEN status =
+    /// 'draft' THEN 0 ELSE 1 END` or `ORDER BY n + 1`. Evaluated per row
+    /// (ungrouped) or over a group's representative row (grouped, only
+    /// valid when built entirely from `GROUP BY` keys — see
+    /// `exec::resolve_group_order_targets`), the same as an
+    /// `Expr` `SELECT` item.
+    Expr(Expr),
 }
 
 impl Query {
@@ -404,10 +411,11 @@ impl Query {
     /// never checked against the schema, see spec §3.4), across every
     /// column position: `SELECT` (including a column nested inside a
     /// `Expr::Scalar`/`Expr::Binary` argument or an aggregate's argument),
-    /// `WHERE`, `GROUP BY`, `ORDER BY` (a bare column or an aggregate
-    /// target — an alias is not a field reference, since it names a
-    /// `SELECT` item rather than a column), `HAVING`, and `MEMBER OF`'s
-    /// column. A `file.*` pseudo-column is never included (its validity is
+    /// `WHERE`, `GROUP BY`, `ORDER BY` (a bare column, an aggregate target,
+    /// or every column inside a computed expression target — an alias is
+    /// not a field reference, since it names a `SELECT` item rather than a
+    /// column), `HAVING`, and `MEMBER OF`'s column. A `file.*` pseudo-column
+    /// is never included (its validity is
     /// checked at parse time, not against the schema), and neither is the
     /// `*` wildcard, which names no specific field.
     ///
@@ -436,6 +444,7 @@ impl Query {
                 OrderTarget::Alias(_) => {}
                 OrderTarget::Col(col) => collect_col_field(col, &mut fields),
                 OrderTarget::Agg(agg) => collect_aggregate_fields(agg, &mut fields),
+                OrderTarget::Expr(expr) => collect_expr_fields(expr, &mut fields),
             }
         }
         if let Some(having) = &self.having {
