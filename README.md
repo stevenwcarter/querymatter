@@ -51,21 +51,27 @@ SELECT [DISTINCT] cols [AS alias] [FROM 'glob'] [WHERE ...] [GROUP BY ...] [HAVI
 ```
 
 - **SELECT** — a comma-separated list of items, each optionally `AS <alias>`:
-  a frontmatter field name, `file.*` pseudo-column (below), `*` (every
-  frontmatter key seen, in sorted order), a scalar expression (below), or an
-  aggregate: `count(*)`, `count(col)`, `count(distinct col)`, `min`, `max`,
-  `sum`, `avg`, `group_concat`. `SELECT DISTINCT` drops duplicate output rows
-  (after projection, before `ORDER BY`); it cannot be combined with `GROUP
-  BY` (a grouped query already yields one row per distinct key).
+  a frontmatter field name (a dotted path like `estimate.low` reads into a
+  nested mapping — see [Nested (dotted-path)
+  columns](#nested-dotted-path-columns) below), `file.*` pseudo-column
+  (below), `*` (every frontmatter key seen, in sorted order), a scalar
+  expression (below), or an aggregate: `count(*)`, `count(col)`, `count(distinct
+  col)`, `min`, `max`, `sum`, `avg`, `group_concat`. `SELECT DISTINCT` drops
+  duplicate output rows (after projection, before `ORDER BY`); it cannot be
+  combined with `GROUP BY` (a grouped query already yields one row per
+  distinct key).
 - **Scalar expressions** — usable in `SELECT` and on either side of a `WHERE`
   comparison: arithmetic `+ - * / %`, string concat `||`, and the functions
   `lower(s)`, `upper(s)` (both Unicode-aware, not ASCII-only), `length(s)`,
   `trim(s)`, `ltrim(s)`, `rtrim(s)`, `substr(s, start[, len])` (1-based,
-  clamped), `replace(s, from, to)`. A `Null` or non-numeric operand to
-  arithmetic, and divide/mod by zero, all yield `Null` rather than an error.
-  Arithmetic is computed in `f64`, so an integer field beyond `f64`'s 53-bit
-  exact range loses precision. An expression *containing* an aggregate (e.g.
-  `count(*) + 1`) is not supported — mix them via `HAVING` instead.
+  clamped), `replace(s, from, to)`. `COALESCE(a, b, ...)` is also supported —
+  variadic, returning the first non-null argument (columns, literals, and
+  nested expressions can all be arguments), e.g. `SELECT jira, COALESCE(epic,
+  'none') AS epic`. A `Null` or non-numeric operand to arithmetic, and
+  divide/mod by zero, all yield `Null` rather than an error. Arithmetic is
+  computed in `f64`, so an integer field beyond `f64`'s 53-bit exact range
+  loses precision. An expression *containing* an aggregate (e.g. `count(*) +
+  1`) is not supported — mix them via `HAVING` instead.
 - **FROM** — optional; when present its value is a path glob applied within
   the scanned directories (e.g. `FROM 'plans/**'`). Omit it and every
   discovered record is in scope.
@@ -75,7 +81,10 @@ SELECT [DISTINCT] cols [AS alias] [FROM 'glob'] [WHERE ...] [GROUP BY ...] [HAVI
   (...)`, `IS NULL`/`IS NOT NULL`, and `[NOT] '<value>' MEMBER OF(<col>)` for
   a list-valued field (e.g. `WHERE 'mobile' MEMBER OF(tags)`) — combined with
   `AND`, `OR`, `NOT`, and parentheses. A quoted string literal forces string
-  comparison; a bare numeric literal compares numerically.
+  comparison — unless it matches the [relative-date
+  grammar](#relative-date-literals) (`'-7d'`, `'today'`, `'now'`, …), in
+  which case it's resolved to a concrete date/timestamp before comparing; a
+  bare numeric literal compares numerically.
 - **GROUP BY** — one or more grouping keys, each a column or a `SELECT AS`
   alias that resolves to one (`GROUP BY <alias>`); every non-aggregate
   `SELECT` item must be composed entirely of grouping-key columns.
@@ -119,6 +128,24 @@ SELECT status, count(*) AS Count WHERE prd = '010' GROUP BY status ORDER BY Coun
 | draft  | 1     |
 ```
 
+### Nested (dotted-path) columns
+
+A dotted identifier walks into a nested YAML mapping, one segment per level:
+
+```sql
+SELECT estimate.low WHERE estimate.high > 10
+```
+
+It works anywhere a column is valid: `SELECT`, `WHERE`, `GROUP BY`, `ORDER
+BY`, `HAVING`. A missing key, or a non-map value partway down the path,
+resolves to `NULL` rather than erroring. Nested maps render as a compact
+`{high: 10, low: 5}` string under `table`/`csv`/`tsv`/`md` output, and as a
+real nested JSON object under `--format json`.
+
+[Unknown-column validation](#unknown-column-validation) (below) checks only
+the **top-level** segment (`estimate`) — sub-keys vary file to file and
+aren't validated.
+
 ### `file.*` pseudo-columns
 
 Resolved from the file path itself, independent of frontmatter, and always
@@ -130,6 +157,38 @@ available alongside frontmatter fields:
 | `file.path` | path as discovered, relative to the scan root it was found under |
 | `file.folder` | the parent-directory portion of `file.path` |
 | `file.ext` | extension without the dot, e.g. `md` |
+| `file.mtime` | modification time as an ISO-8601 UTC string, e.g. `2026-07-20T10:30:00Z` (sorts and compares lexicographically) |
+| `file.size` | file size in bytes, as an integer |
+
+`file.mtime` and `file.size` come from the same stat querymatter already
+performs for cache freshness — reading them costs no extra I/O.
+
+```sql
+SELECT file.name WHERE file.mtime >= '-7d' ORDER BY file.mtime DESC
+```
+
+### Relative-date literals
+
+A quoted string literal in a comparison may be a **relative date**, resolved
+against the current date/time when the query runs, instead of an ordinary
+string:
+
+- `'today'` — today's date, `YYYY-MM-DD`.
+- `'now'` — the current instant, full `YYYY-MM-DDTHH:MM:SSZ` timestamp.
+- `'[+-]<int>(d|w|mo|y)'` — an offset from today: `'-7d'` (7 days ago),
+  `'+3w'` (3 weeks from now), `'-2mo'` (2 calendar months ago — calendar
+  arithmetic, not a fixed 30-day span), `'-1y'`. The sign is required.
+
+```sql
+WHERE created >= '-7d'
+WHERE updated < 'today'
+```
+
+This assumes frontmatter dates are stored as ISO-8601 strings, so they sort
+and compare correctly against these forms — the same string space
+`file.mtime` (above) lives in. A quoted string that doesn't match this
+grammar (`'draft'`) stays an ordinary string literal — no change in
+behavior.
 
 ### Unknown-column validation
 
@@ -151,6 +210,20 @@ and `MEMBER OF`'s column — against the schema (the union of frontmatter field
 names across the scanned records). An empty schema (a fresh or empty vault,
 or one whose only records have an explicit-but-empty frontmatter mapping)
 skips the check entirely, so it can't fail every query on that account alone.
+
+**Subtree-scoped queries validate against the subtree's schema, not the
+vault's.** When a `.querymatter`-backed query names a subtree — a positional
+`[DIRS]` argument (not the SQL `FROM 'glob'` clause, which filters after
+loading) — in one-shot (`-e`), piped-batch, or `query run` mode, querymatter
+loads only that subtree from the cache, so query cost tracks the subtree's
+size rather than the whole vault's. The tradeoff: the schema used for
+validation (and the did-you-mean suggestion) is built from that subtree
+alone, so `SELECT foo` against `plans/` errors as unknown if `foo` exists
+only under `product/`, even though the vault as a whole has it. This is
+intentional — the query only reads that subtree. `--lenient` still bypasses
+validation entirely if you'd rather not deal with it. The REPL is
+unaffected: it keeps a whole-vault store across queries, so it always
+validates against the whole vault regardless of subtree.
 
 Pass `--lenient` (or set the `lenient` config key) to restore the old
 behavior — an unknown column silently reads as `NULL` throughout. `--no-lenient`
@@ -447,6 +520,11 @@ path-sorted order regardless of thread timing. And a narrow one-shot/batch/
 count(*)` or `SELECT status` — materializes only the frontmatter fields it
 actually references, skipping the rest; the full schema (every field name, for
 column validation and `SELECT *`) is still tracked regardless.
+
+A third optimization, subtree-scoped cache loading (a positional `[DIRS]`
+argument in one-shot/batch/`query run` mode), is deliberately **not** listed
+as transparent above — it changes what unknown-column validation sees. See
+[Unknown-column validation](#unknown-column-validation) for that tradeoff.
 
 ## Configuration
 

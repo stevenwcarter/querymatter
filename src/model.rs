@@ -1,6 +1,8 @@
+use chrono::{DateTime, SecondsFormat, Utc};
 use indexmap::IndexMap;
 use std::cmp::Ordering;
 use std::path::Path;
+use std::time::SystemTime;
 
 /// A dynamically-typed value read from Markdown YAML frontmatter.
 ///
@@ -15,6 +17,7 @@ pub enum Value {
     Float(f64),
     Str(String),
     List(Vec<Value>),
+    Map(IndexMap<String, Value>),
 }
 
 impl Value {
@@ -39,6 +42,7 @@ impl Value {
                 .map(Value::display)
                 .collect::<Vec<_>>()
                 .join(", "),
+            Value::Map(_) => compact_value(self),
         }
     }
 
@@ -53,6 +57,7 @@ impl Value {
             Value::Float(_) => "Float",
             Value::Str(_) => "Str",
             Value::List(_) => "List",
+            Value::Map(_) => "Map",
         }
     }
 
@@ -66,13 +71,40 @@ impl Value {
             Value::Int(i) => Some(*i as f64),
             Value::Float(f) => Some(*f),
             Value::Str(s) => s.trim().parse::<f64>().ok(),
-            Value::Bool(_) | Value::Null | Value::List(_) => None,
+            Value::Bool(_) | Value::Null | Value::List(_) | Value::Map(_) => None,
         }
     }
 
     /// Canonical string form used for lexicographic comparison.
     pub fn to_cmp_string(&self) -> String {
         self.display()
+    }
+}
+
+/// Compact, deterministic string for a `Value` used when a `Map` (or a map
+/// nested in one) is rendered flat (table/CSV): lists render WITH brackets,
+/// maps with braces, map keys sorted. This is intentionally different from
+/// `Value::display(List)` (bracket-less) — see spec §9.
+fn compact_value(v: &Value) -> String {
+    match v {
+        Value::Null => "null".to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Str(s) => s.clone(),
+        Value::List(items) => {
+            let rendered: Vec<_> = items.iter().map(compact_value).collect();
+            format!("[{}]", rendered.join(", "))
+        }
+        Value::Map(map) => {
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            let rendered: Vec<_> = entries
+                .iter()
+                .map(|(k, v)| format!("{k}: {}", compact_value(v)))
+                .collect();
+            format!("{{{}}}", rendered.join(", "))
+        }
     }
 }
 
@@ -100,6 +132,8 @@ pub enum FileAttr {
     Path,
     Folder,
     Ext,
+    Mtime,
+    Size,
 }
 
 /// One queryable row: a Markdown file's YAML frontmatter fields, plus its
@@ -111,6 +145,8 @@ pub struct Record {
     path: String,
     folder: String,
     ext: String,
+    mtime: SystemTime,
+    size: u64,
 }
 
 impl Record {
@@ -121,8 +157,16 @@ impl Record {
     /// to the full path when `path` isn't under `root`); `folder` is the
     /// parent of that relative path, or an empty string when there is none.
     /// Path separators are normalized to `/` so output is stable across
-    /// platforms.
-    pub fn new(root: &Path, path: &Path, fields: IndexMap<String, Value>) -> Self {
+    /// platforms. `mtime`/`size` are the file's on-disk stat, already read
+    /// by the caller for cache-freshness purposes — this is zero extra I/O,
+    /// not a fresh stat.
+    pub fn new(
+        root: &Path,
+        path: &Path,
+        fields: IndexMap<String, Value>,
+        mtime: SystemTime,
+        size: u64,
+    ) -> Self {
         let relative = path.strip_prefix(root).unwrap_or(path);
         let name = path
             .file_name()
@@ -140,23 +184,40 @@ impl Record {
             path: join_components(relative),
             folder,
             ext,
+            mtime,
+            size,
         }
     }
 
-    /// The value of frontmatter field `name`, or `Value::Null` if absent.
-    pub fn field(&self, name: &str) -> Value {
-        self.fields.get(name).cloned().unwrap_or(Value::Null)
+    /// The value at `path` (segment 0 = frontmatter field, each next segment
+    /// indexes into a `Value::Map`). Missing key or non-map intermediate →
+    /// `Null`. A single-segment path is a plain top-level field lookup.
+    pub fn field(&self, path: &[String]) -> Value {
+        let Some((head, rest)) = path.split_first() else {
+            return Value::Null;
+        };
+        let mut cur = self.fields.get(head).cloned().unwrap_or(Value::Null);
+        for seg in rest {
+            cur = match cur {
+                Value::Map(m) => m.get(seg).cloned().unwrap_or(Value::Null),
+                _ => return Value::Null,
+            };
+        }
+        cur
     }
 
-    /// Resolves a `file.*` pseudo-column to its string value.
+    /// Resolves a `file.*` pseudo-column to its value: `Name`/`Path`/`Folder`/
+    /// `Ext` are strings, `Mtime` is an RFC3339 UTC string, and `Size` is an
+    /// integer byte count.
     pub fn file_attr(&self, attr: FileAttr) -> Value {
-        let s = match attr {
-            FileAttr::Name => &self.name,
-            FileAttr::Path => &self.path,
-            FileAttr::Folder => &self.folder,
-            FileAttr::Ext => &self.ext,
-        };
-        Value::Str(s.clone())
+        match attr {
+            FileAttr::Name => Value::Str(self.name.clone()),
+            FileAttr::Path => Value::Str(self.path.clone()),
+            FileAttr::Folder => Value::Str(self.folder.clone()),
+            FileAttr::Ext => Value::Str(self.ext.clone()),
+            FileAttr::Mtime => Value::Str(system_time_to_iso(self.mtime)),
+            FileAttr::Size => Value::Int(self.size as i64),
+        }
     }
 
     /// The frontmatter field names for this record.
@@ -168,6 +229,13 @@ impl Record {
     pub fn field_names(&self) -> impl Iterator<Item = &str> {
         self.fields.keys().map(String::as_str)
     }
+}
+
+/// An `mtime` as an RFC3339 UTC string (`2021-01-01T00:00:00Z`), seconds
+/// precision. Pre-epoch times format to their real negative timestamp; never
+/// panics.
+pub fn system_time_to_iso(t: SystemTime) -> String {
+    DateTime::<Utc>::from(t).to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
 /// Joins a path's components with `/`, independent of the host platform's
@@ -240,6 +308,47 @@ mod tests {
         assert_eq!(compare_values(&Value::Null, &Value::Int(1)), None);
         assert_eq!(compare_values(&Value::Int(1), &Value::Null), None);
     }
+    #[test]
+    fn map_display_uses_compact_value_form() {
+        // keys sorted; a nested LIST inside a map renders WITH brackets, per
+        // `compact_value` (NOT `Value::display`'s bracket-less list).
+        let mut inner = IndexMap::new();
+        inner.insert("low".to_string(), Value::Int(5));
+        inner.insert("high".to_string(), Value::Int(10));
+        inner.insert(
+            "tags".to_string(),
+            Value::List(vec![Value::Str("a".into()), Value::Str("b".into())]),
+        );
+        let v = Value::Map(inner);
+        assert_eq!(v.display(), "{high: 10, low: 5, tags: [a, b]}");
+    }
+    #[test]
+    fn map_variant_name_and_as_number() {
+        let v = Value::Map(IndexMap::new());
+        assert_eq!(v.variant_name(), "Map");
+        assert_eq!(v.as_number(), None);
+    }
+    #[test]
+    fn nested_map_display_is_recursive() {
+        let mut inner = IndexMap::new();
+        inner.insert("x".to_string(), Value::Int(1));
+        let mut outer = IndexMap::new();
+        outer.insert("a".to_string(), Value::Map(inner));
+        assert_eq!(Value::Map(outer).display(), "{a: {x: 1}}");
+    }
+    #[test]
+    fn system_time_to_iso_is_rfc3339_utc() {
+        use std::time::Duration;
+        // 2021-01-01T00:00:00Z == 1609459200 secs
+        let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_609_459_200);
+        assert_eq!(system_time_to_iso(t), "2021-01-01T00:00:00Z");
+    }
+    #[test]
+    fn pre_epoch_mtime_does_not_panic() {
+        use std::time::Duration;
+        let t = SystemTime::UNIX_EPOCH - Duration::from_secs(60);
+        let _ = system_time_to_iso(t); // must not panic
+    }
 }
 
 #[cfg(test)]
@@ -255,6 +364,8 @@ mod record_tests {
             Path::new("samples"),
             Path::new("samples/plans/DCP-459.md"),
             f,
+            SystemTime::UNIX_EPOCH,
+            0,
         )
     }
     #[test]
@@ -269,10 +380,45 @@ mod record_tests {
         assert_eq!(r.file_attr(FileAttr::Ext), Value::Str("md".into()));
     }
     #[test]
+    fn file_attr_mtime_and_size() {
+        use std::time::Duration;
+        let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_609_459_200);
+        let r = Record::new(Path::new("v"), Path::new("v/a.md"), IndexMap::new(), t, 42);
+        assert_eq!(r.file_attr(FileAttr::Size), Value::Int(42));
+        assert_eq!(
+            r.file_attr(FileAttr::Mtime),
+            Value::Str("2021-01-01T00:00:00Z".into())
+        );
+    }
+    #[test]
     fn field_present_and_missing() {
         let r = rec();
-        assert_eq!(r.field("status"), Value::Str("draft".into()));
-        assert_eq!(r.field("nope"), Value::Null);
+        assert_eq!(r.field(&["status".into()]), Value::Str("draft".into()));
+        assert_eq!(r.field(&["nope".into()]), Value::Null);
+    }
+    #[test]
+    fn field_walks_dotted_path_into_map() {
+        let mut inner = IndexMap::new();
+        inner.insert("low".to_string(), Value::Int(5));
+        let mut f = IndexMap::new();
+        f.insert("estimate".to_string(), Value::Map(inner));
+        let r = Record::new(
+            Path::new("v"),
+            Path::new("v/a.md"),
+            f,
+            SystemTime::UNIX_EPOCH,
+            0,
+        );
+        assert_eq!(r.field(&["estimate".into(), "low".into()]), Value::Int(5));
+        // missing sub-key -> Null
+        assert_eq!(r.field(&["estimate".into(), "nope".into()]), Value::Null);
+        // non-map intermediate -> Null
+        assert_eq!(
+            r.field(&["estimate".into(), "low".into(), "x".into()]),
+            Value::Null
+        );
+        // single segment == today's behavior
+        assert_eq!(r.field(&["estimate".into()]).variant_name(), "Map");
     }
     #[test]
     fn field_names_lists_keys() {

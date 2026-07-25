@@ -24,7 +24,7 @@ use sqlparser::parser::Parser;
 use crate::model::FileAttr;
 use crate::query::ast::{
     Aggregate, BinOp, CmpOp, ColRef, Expr, Having, HavingLeaf, Literal, OrderKey, OrderTarget,
-    Predicate, Query, ScalarFn, SelectExpr, SelectItem,
+    Predicate, Query, RelDate, ScalarFn, SelectExpr, SelectItem,
 };
 
 /// An error produced while parsing or lowering a query.
@@ -302,10 +302,10 @@ fn lower_expr(expr: &sql::Expr) -> Result<Expr, ParseError> {
 }
 
 /// Lowers a scalar-function call (`lower(...)`, `ltrim(...)`, `replace(...)`,
-/// …). An aggregate name here means an aggregate nested inside a larger
-/// expression (e.g. `count(*) + 1`), which this batch does not support —
-/// mixing agg and scalar in one tree needs group-context threading beyond
-/// this scope.
+/// …), or `coalesce(...)`. An aggregate name here means an aggregate nested
+/// inside a larger expression (e.g. `count(*) + 1`), which this batch does
+/// not support — mixing agg and scalar in one tree needs group-context
+/// threading beyond this scope.
 ///
 /// `trim`/`substr` never reach this function: `sqlparser` intercepts those
 /// keywords as the dedicated [`sql::Expr::Trim`]/[`sql::Expr::Substring`]
@@ -320,6 +320,10 @@ fn lower_scalar_call(func: &sql::Function) -> Result<Expr, ParseError> {
     }
 
     let name = object_name_to_string(&func.name).to_ascii_lowercase();
+    if name == "coalesce" {
+        return lower_coalesce(func, &name);
+    }
+
     let Some(scalar) = scalar_fn_from_name(&name) else {
         if is_aggregate_name(&name) {
             return Err(unsupported("an aggregate inside an expression"));
@@ -338,6 +342,27 @@ fn lower_scalar_call(func: &sql::Function) -> Result<Expr, ParseError> {
         .collect::<Result<Vec<_>, _>>()?;
     check_scalar_arity(&scalar, &name, args.len())?;
     Ok(Expr::Scalar(scalar, args))
+}
+
+/// Lowers a `COALESCE(...)` call: every argument lowers via [`lower_expr`]
+/// (through [`scalar_arg`]), so a nested aggregate (`COALESCE(count(*), 0)`)
+/// is rejected by the same "aggregate inside an expression" path as any
+/// other scalar-call argument (see [`lower_scalar_call`]). At least one
+/// argument is required — `COALESCE()` is a parse-time arity error.
+fn lower_coalesce(func: &sql::Function, name: &str) -> Result<Expr, ParseError> {
+    let list = arg_list(func, name)?;
+    if list.duplicate_treatment.is_some() {
+        return Err(unsupported(format!("DISTINCT inside {name}(...)")));
+    }
+    let args = list
+        .args
+        .iter()
+        .map(scalar_arg)
+        .collect::<Result<Vec<_>, _>>()?;
+    if args.is_empty() {
+        return Err(unsupported("coalesce() requires at least one argument"));
+    }
+    Ok(Expr::Coalesce(args))
 }
 
 /// Maps a lowercased function name to the [`ScalarFn`] it calls, or `None`
@@ -503,11 +528,13 @@ fn arg_list<'a>(
     }
 }
 
-/// Lowers a column reference: a bare identifier (a frontmatter field) or a
-/// `file.<attr>` compound identifier (a pseudo-column).
+/// Lowers a column reference: a bare identifier (a single-segment
+/// frontmatter field) or a compound identifier — either a `file.<attr>`
+/// pseudo-column or a dotted frontmatter field path (a multi-segment
+/// [`ColRef::Field`] indexing into a nested `Value::Map`).
 fn lower_col_ref(expr: &sql::Expr) -> Result<ColRef, ParseError> {
     match expr {
-        sql::Expr::Identifier(ident) => Ok(ColRef::Field(ident.value.clone())),
+        sql::Expr::Identifier(ident) => Ok(ColRef::Field(vec![ident.value.clone()])),
         sql::Expr::CompoundIdentifier(parts) => lower_compound(parts),
         other => Err(ParseError::BadColumn(format!(
             "expected a column reference, found unsupported expression `{other}`"
@@ -515,21 +542,29 @@ fn lower_col_ref(expr: &sql::Expr) -> Result<ColRef, ParseError> {
     }
 }
 
-/// Lowers a compound identifier; only the `file.<attr>` form is supported.
+/// Lowers a compound identifier. A `file`-prefixed one must be exactly
+/// `file.<attr>` — `file.*` has no nesting, so any other length under that
+/// prefix is rejected. Everything else lowers to a dotted
+/// `ColRef::Field` path, letting later segments index into a `Value::Map`.
 fn lower_compound(parts: &[sql::Ident]) -> Result<ColRef, ParseError> {
-    if let [prefix, attr] = parts
-        && prefix.value.eq_ignore_ascii_case("file")
+    if let [first, ..] = parts
+        && first.value.eq_ignore_ascii_case("file")
     {
+        let [_, attr] = parts else {
+            let joined = parts
+                .iter()
+                .map(|p| p.value.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            return Err(ParseError::BadColumn(format!(
+                "`file.*` has no nesting: `{joined}`"
+            )));
+        };
         return Ok(ColRef::File(file_attr_from_str(&attr.value)?));
     }
-    let joined = parts
-        .iter()
-        .map(|p| p.value.as_str())
-        .collect::<Vec<_>>()
-        .join(".");
-    Err(ParseError::BadColumn(format!(
-        "unsupported compound column `{joined}`"
-    )))
+    Ok(ColRef::Field(
+        parts.iter().map(|p| p.value.clone()).collect(),
+    ))
 }
 
 /// Parses a `file.*` attribute name into a [`FileAttr`].
@@ -539,6 +574,8 @@ fn file_attr_from_str(name: &str) -> Result<FileAttr, ParseError> {
         "path" => Ok(FileAttr::Path),
         "folder" => Ok(FileAttr::Folder),
         "ext" => Ok(FileAttr::Ext),
+        "mtime" => Ok(FileAttr::Mtime),
+        "size" => Ok(FileAttr::Size),
         other => Err(ParseError::BadColumn(format!(
             "unknown file attribute `file.{other}`"
         ))),
@@ -682,18 +719,27 @@ fn negate_literal(expr: &sql::Expr) -> Result<Literal, ParseError> {
 
 /// Maps a `sqlparser` value literal to a querymatter [`Literal`].
 fn value_to_literal(value: &sql::Value) -> Result<Literal, ParseError> {
+    if let Some(s) = raw_string(value) {
+        return Ok(lower_string_literal(s));
+    }
     match value {
         sql::Value::Number(n, _) => parse_number(n),
-        sql::Value::SingleQuotedString(s)
-        | sql::Value::DoubleQuotedString(s)
-        | sql::Value::TripleSingleQuotedString(s)
-        | sql::Value::TripleDoubleQuotedString(s)
-        | sql::Value::EscapedStringLiteral(s)
-        | sql::Value::UnicodeStringLiteral(s)
-        | sql::Value::NationalStringLiteral(s) => Ok(Literal::Str(s.clone())),
         sql::Value::Boolean(b) => Ok(Literal::Bool(*b)),
         sql::Value::Null => Ok(Literal::Null),
         _ => Err(unsupported("this literal value")),
+    }
+}
+
+/// Lowers a quoted string literal's text, resolving it to
+/// [`Literal::RelativeDate`] when it matches the strict relative-date
+/// grammar (`today`/`now`/`[+-]<int>(d|w|mo|y)`, see [`RelDate::parse`]); any
+/// other string — the overwhelming majority — stays a plain `Literal::Str`,
+/// e.g. `'draft'` (spec §9: no pre-existing string literal is
+/// reinterpreted).
+fn lower_string_literal(s: &str) -> Literal {
+    match RelDate::parse(s) {
+        Some(rd) => Literal::RelativeDate(rd),
+        None => Literal::Str(s.to_string()),
     }
 }
 
@@ -708,12 +754,36 @@ fn parse_number(n: &str) -> Result<Literal, ParseError> {
     }
 }
 
-/// Extracts a string literal, rejecting non-string values (used for `LIKE`
-/// patterns).
+/// Extracts a string literal's raw text, rejecting non-string values (used
+/// for `LIKE` patterns). This bypasses [`lower_string_literal`]'s
+/// relative-date check deliberately: `Predicate::Like`'s pattern is a plain
+/// `String`, never a [`Literal`], so a pattern that happens to match the
+/// relative-date grammar (e.g. `LIKE '-7d'`) must still match literally,
+/// not be rejected as "not a string".
 fn string_literal(expr: &sql::Expr) -> Result<String, ParseError> {
-    match lower_literal(expr)? {
-        Literal::Str(s) => Ok(s),
-        _ => Err(unsupported("LIKE pattern must be a string")),
+    let sql::Expr::Value(value) = expr else {
+        return Err(unsupported("LIKE pattern must be a string"));
+    };
+    raw_string(&value.value)
+        .map(str::to_string)
+        .ok_or_else(|| unsupported("LIKE pattern must be a string"))
+}
+
+/// Extracts a quoted string literal's raw text from a `sqlparser` value
+/// node, or `None` for anything else (a number, boolean, `NULL`, …). Shared
+/// between [`lower_string_literal`] (general literal lowering, which
+/// additionally checks the relative-date grammar) and [`string_literal`]
+/// (`LIKE` patterns, which must not).
+fn raw_string(value: &sql::Value) -> Option<&str> {
+    match value {
+        sql::Value::SingleQuotedString(s)
+        | sql::Value::DoubleQuotedString(s)
+        | sql::Value::TripleSingleQuotedString(s)
+        | sql::Value::TripleDoubleQuotedString(s)
+        | sql::Value::EscapedStringLiteral(s)
+        | sql::Value::UnicodeStringLiteral(s)
+        | sql::Value::NationalStringLiteral(s) => Some(s),
+        _ => None,
     }
 }
 
@@ -1021,7 +1091,7 @@ mod tests {
         assert_eq!(
             q.select[0],
             SelectItem {
-                expr: SelectExpr::Expr(Expr::Col(ColRef::Field("status".into()))),
+                expr: SelectExpr::Expr(Expr::Col(ColRef::Field(vec!["status".into()]))),
                 alias: None
             }
         );
@@ -1032,7 +1102,7 @@ mod tests {
                 alias: Some("Count".into())
             }
         );
-        assert_eq!(q.group_by, vec![ColRef::Field("status".into())]);
+        assert_eq!(q.group_by, vec![ColRef::Field(vec!["status".into()])]);
         assert_eq!(q.from_glob, None);
     }
     #[test]
@@ -1071,7 +1141,7 @@ mod tests {
                 .unwrap()
                 .filter,
             Some(Predicate::In(
-                ColRef::Field("status".into()),
+                ColRef::Field(vec!["status".into()]),
                 vec![Literal::Str("a".into()), Literal::Str("b".into())],
                 false
             ))
@@ -1081,7 +1151,7 @@ mod tests {
                 .unwrap()
                 .filter,
             Some(Predicate::In(
-                ColRef::Field("status".into()),
+                ColRef::Field(vec!["status".into()]),
                 vec![Literal::Str("a".into()), Literal::Str("b".into())],
                 true
             ))
@@ -1093,7 +1163,7 @@ mod tests {
                 .unwrap()
                 .filter,
             Some(Predicate::Like(
-                ColRef::Field("slice".into()),
+                ColRef::Field(vec!["slice".into()]),
                 "mobile%".into(),
                 false
             ))
@@ -1103,7 +1173,7 @@ mod tests {
                 .unwrap()
                 .filter,
             Some(Predicate::Like(
-                ColRef::Field("slice".into()),
+                ColRef::Field(vec!["slice".into()]),
                 "mobile%".into(),
                 true
             ))
@@ -1112,11 +1182,11 @@ mod tests {
         // IS NULL / IS NOT NULL carry the negation flag.
         assert_eq!(
             parse("SELECT jira WHERE epic IS NULL").unwrap().filter,
-            Some(Predicate::IsNull(ColRef::Field("epic".into()), false))
+            Some(Predicate::IsNull(ColRef::Field(vec!["epic".into()]), false))
         );
         assert_eq!(
             parse("SELECT jira WHERE epic IS NOT NULL").unwrap().filter,
-            Some(Predicate::IsNull(ColRef::Field("epic".into()), true))
+            Some(Predicate::IsNull(ColRef::Field(vec!["epic".into()]), true))
         );
     }
     #[test]
@@ -1133,7 +1203,7 @@ mod tests {
                 .filter,
             Some(Predicate::MemberOf(
                 Literal::Str("mobile".into()),
-                ColRef::Field("tags".into()),
+                ColRef::Field(vec!["tags".into()]),
                 false
             ))
         );
@@ -1143,7 +1213,7 @@ mod tests {
                 .filter,
             Some(Predicate::MemberOf(
                 Literal::Str("mobile".into()),
-                ColRef::Field("tags".into()),
+                ColRef::Field(vec!["tags".into()]),
                 true
             ))
         );
@@ -1215,14 +1285,14 @@ mod tests {
         // GROUP BY s resolves through the `status AS s` alias, exactly as
         // `GROUP BY status` would.
         let q = parse("SELECT status AS s, count(*) AS n GROUP BY s ORDER BY s").unwrap();
-        assert_eq!(q.group_by, vec![ColRef::Field("status".into())]);
+        assert_eq!(q.group_by, vec![ColRef::Field(vec!["status".into()])]);
     }
     #[test]
     fn group_by_alias_precedence_over_same_named_field() {
         // A name that is both a real field and a SELECT alias resolves to
         // the alias, matching how ORDER BY resolves the same ambiguity.
         let q = parse("SELECT jira AS status, count(*) AS n GROUP BY status").unwrap();
-        assert_eq!(q.group_by, vec![ColRef::Field("jira".into())]);
+        assert_eq!(q.group_by, vec![ColRef::Field(vec!["jira".into()])]);
     }
     #[test]
     fn group_by_alias_on_aggregate_or_expr_is_rejected() {
@@ -1254,7 +1324,7 @@ mod tests {
             "SELECT min(prd), max(prd), sum(prd), avg(prd), group_concat(jira), count(distinct status) GROUP BY epic",
         )
         .unwrap();
-        let prd = ColRef::Field("prd".into());
+        let prd = ColRef::Field(vec!["prd".into()]);
         assert_eq!(
             q.select[0].expr,
             SelectExpr::Agg(Aggregate::Min(prd.clone()))
@@ -1270,13 +1340,13 @@ mod tests {
         assert_eq!(q.select[3].expr, SelectExpr::Agg(Aggregate::Avg(prd)));
         assert_eq!(
             q.select[4].expr,
-            SelectExpr::Agg(Aggregate::GroupConcat(ColRef::Field("jira".into())))
+            SelectExpr::Agg(Aggregate::GroupConcat(ColRef::Field(vec!["jira".into()])))
         );
         assert_eq!(
             q.select[5].expr,
-            SelectExpr::Agg(Aggregate::Count(ColRef::Field("status".into()), true))
+            SelectExpr::Agg(Aggregate::Count(ColRef::Field(vec!["status".into()]), true))
         );
-        assert_eq!(q.group_by, vec![ColRef::Field("epic".into())]);
+        assert_eq!(q.group_by, vec![ColRef::Field(vec!["epic".into()])]);
     }
     #[test]
     fn unsupported_join_errors() {
@@ -1316,21 +1386,32 @@ mod tests {
     }
 
     #[test]
+    fn header_derivation_for_relative_date_literal() {
+        // A bare relative-date literal in the SELECT list renders back to
+        // its source token, not a resolved date (rendering has no clock —
+        // resolution only happens in `exec`).
+        let header = |sql: &str| parse(sql).unwrap().select[0].header();
+        assert_eq!(header("SELECT '-7d'"), "'-7d'");
+        assert_eq!(header("SELECT 'today'"), "'today'");
+        assert_eq!(header("SELECT '+3w'"), "'+3w'");
+    }
+
+    #[test]
     fn lower_expr_scalar_and_arithmetic_shapes() {
         let q = parse("SELECT lower(status), a + b, a || '-' || status").unwrap();
         assert_eq!(
             q.select[0].expr,
             SelectExpr::Expr(Expr::Scalar(
                 ScalarFn::Lower,
-                vec![Expr::Col(ColRef::Field("status".into()))]
+                vec![Expr::Col(ColRef::Field(vec!["status".into()]))]
             ))
         );
         assert_eq!(
             q.select[1].expr,
             SelectExpr::Expr(Expr::Binary(
                 BinOp::Add,
-                Box::new(Expr::Col(ColRef::Field("a".into()))),
-                Box::new(Expr::Col(ColRef::Field("b".into())))
+                Box::new(Expr::Col(ColRef::Field(vec!["a".into()]))),
+                Box::new(Expr::Col(ColRef::Field(vec!["b".into()])))
             ))
         );
         assert_eq!(
@@ -1339,10 +1420,10 @@ mod tests {
                 BinOp::Concat,
                 Box::new(Expr::Binary(
                     BinOp::Concat,
-                    Box::new(Expr::Col(ColRef::Field("a".into()))),
+                    Box::new(Expr::Col(ColRef::Field(vec!["a".into()]))),
                     Box::new(Expr::Lit(Literal::Str("-".into())))
                 )),
-                Box::new(Expr::Col(ColRef::Field("status".into())))
+                Box::new(Expr::Col(ColRef::Field(vec!["status".into()])))
             ))
         );
     }
@@ -1353,7 +1434,7 @@ mod tests {
         // sqlparser AST shape (a plain `Function`, or the dedicated
         // `Trim`/`Substring` nodes) — pin that all four land on the right
         // `ScalarFn`.
-        let col = || Expr::Col(ColRef::Field("status".into()));
+        let col = || Expr::Col(ColRef::Field(vec!["status".into()]));
         assert_eq!(
             parse("SELECT trim(status)").unwrap().select[0].expr,
             SelectExpr::Expr(Expr::Scalar(ScalarFn::Trim, vec![col()]))
@@ -1414,6 +1495,23 @@ mod tests {
     }
 
     #[test]
+    fn coalesce_parses_and_references_all_columns() {
+        let q = parse("SELECT COALESCE(epic, 'none') AS e").unwrap();
+        assert!(q.referenced_fields().contains("epic"));
+        assert_eq!(q.select[0].header(), "e");
+        // zero-arg is an error
+        assert!(parse("SELECT COALESCE() AS e").is_err());
+        // aggregate inside coalesce rejected
+        assert!(parse("SELECT COALESCE(count(*), 0)").is_err());
+    }
+
+    #[test]
+    fn coalesce_default_header() {
+        let q = parse("SELECT COALESCE(epic, 'none')").unwrap();
+        assert_eq!(q.select[0].header(), "coalesce(epic, 'none')");
+    }
+
+    #[test]
     fn unknown_scalar_function_is_unsupported() {
         assert!(matches!(
             parse("SELECT frobnicate(status)"),
@@ -1466,7 +1564,7 @@ mod tests {
         assert_eq!(
             q.filter,
             Some(Predicate::Compare(
-                Expr::Col(ColRef::Field("title".into())),
+                Expr::Col(ColRef::Field(vec!["title".into()])),
                 CmpOp::Eq,
                 Expr::Lit(Literal::Str("imported from \"archive\"".into()))
             ))
@@ -1491,7 +1589,7 @@ mod tests {
         assert_eq!(
             q.having,
             Some(Having::Compare(
-                HavingLeaf::Group(ColRef::Field("status".into())),
+                HavingLeaf::Group(ColRef::Field(vec!["status".into()])),
                 CmpOp::Eq,
                 Literal::Str("draft".into())
             ))
@@ -1638,5 +1736,65 @@ mod tests {
                 "message should say what isn't supported for {sql:?}: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn dotted_identifier_lowers_to_path() {
+        let q = parse("SELECT estimate.low WHERE estimate.high > 10").unwrap();
+        assert!(q.referenced_fields().contains("estimate"));
+        // referenced_fields returns the TOP-LEVEL segment only
+        assert!(!q.referenced_fields().contains("high"));
+        assert!(!q.referenced_fields().contains("low"));
+    }
+
+    #[test]
+    fn file_attr_still_special_and_no_nesting() {
+        assert!(parse("SELECT file.name").is_ok());
+        assert!(parse("SELECT file.name.x").is_err()); // file.* has no nesting
+    }
+
+    #[test]
+    fn relative_date_string_lowers_to_reldate_literal() {
+        use crate::query::ast::{DateUnit, RelDate};
+        let q = parse("SELECT file.name WHERE created >= '-7d'").unwrap();
+        assert_eq!(
+            q.filter,
+            Some(Predicate::Compare(
+                Expr::Col(ColRef::Field(vec!["created".into()])),
+                CmpOp::Ge,
+                Expr::Lit(Literal::RelativeDate(RelDate::Offset {
+                    n: -7,
+                    unit: DateUnit::Day
+                }))
+            ))
+        );
+
+        // A non-matching string stays a plain `Str` literal — no
+        // pre-existing string literal is reinterpreted (spec §9).
+        let q2 = parse("SELECT file.name WHERE status = 'draft'").unwrap();
+        assert_eq!(
+            q2.filter,
+            Some(Predicate::Compare(
+                Expr::Col(ColRef::Field(vec!["status".into()])),
+                CmpOp::Eq,
+                Expr::Lit(Literal::Str("draft".into()))
+            ))
+        );
+    }
+
+    #[test]
+    fn like_pattern_resembling_reldate_stays_literal_text() {
+        // `Predicate::Like`'s pattern is a plain `String`, never a
+        // `Literal` — it must never be reinterpreted as a relative date
+        // even when the pattern text happens to match the grammar.
+        let q = parse("SELECT file.name WHERE jira LIKE '-7d'").unwrap();
+        assert_eq!(
+            q.filter,
+            Some(Predicate::Like(
+                ColRef::Field(vec!["jira".into()]),
+                "-7d".into(),
+                false
+            ))
+        );
     }
 }

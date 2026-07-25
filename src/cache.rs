@@ -39,7 +39,7 @@ pub const MAGIC: [u8; 4] = *b"QMDB";
 /// Bumped whenever any cached struct's shape changes. Together with `MAGIC`
 /// this is the only safe "format changed → discard the cache" mechanism,
 /// since bincode itself has no schema versioning.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// One cached Markdown file: its frontmatter fields plus enough metadata
 /// (`mtime`, `size`) to detect that it has changed on disk.
@@ -231,6 +231,18 @@ pub fn save_cache(vault_dir: &Path, dirs: &[CachedDir], ttl_secs: u64) -> anyhow
     Ok(())
 }
 
+/// True when `path` lies at or under at least one directory in `scope`, or
+/// when `scope` is `None` (unscoped — every path qualifies). The single
+/// definition of "within the queried subtree(s)" shared by the scoped cache
+/// load ([`load_cache_under`]) and the scoped freshness walk
+/// ([`refresh_against_cache_scoped`]), so the blobs decoded and the files
+/// re-walked are always the same set. Mirrors [`refresh_subtree`]'s
+/// `starts_with` scoping, generalized to several subtrees since positional
+/// `[DIRS]` may name more than one.
+fn in_scope(path: &Path, scope: Option<&[PathBuf]>) -> bool {
+    scope.is_none_or(|dirs| dirs.iter().any(|dir| path.starts_with(dir)))
+}
+
 /// Loads the cache saved by [`save_cache`], or `None` if `vault_dir` has no
 /// usable one: no `manifest.bin`, or one whose header doesn't match
 /// [`MAGIC`]/[`SCHEMA_VERSION`] (see [`read_manifest_bytes`]).
@@ -240,6 +252,23 @@ pub fn save_cache(vault_dir: &Path, dirs: &[CachedDir], ttl_secs: u64) -> anyhow
 /// from the returned `Vec`, and the caller re-scans it — rather than
 /// discarding the whole cache over one corrupt file.
 pub fn load_cache(vault_dir: &Path) -> Option<(ManifestBody, Vec<CachedDir>)> {
+    load_cache_under(vault_dir, None)
+}
+
+/// Like [`load_cache`], but when `scope` is `Some`, only manifest entries
+/// whose directory lies at or under one of the scoped subtrees are read and
+/// decoded — out-of-subtree blob files are never touched (design W26 /
+/// spec §7). The manifest is read once (cheaply) and filtered by
+/// [`in_scope`] *before* any per-blob `fs::read`/`decode`, so a query scoped
+/// to one subtree pays blob I/O only for that subtree, not the whole vault.
+///
+/// `scope` of `None` reads every blob, i.e. exactly [`load_cache`]; the two
+/// share this one implementation. Blob-level fault tolerance is unchanged: a
+/// missing or corrupt in-scope blob is skipped, not fatal.
+pub fn load_cache_under(
+    vault_dir: &Path,
+    scope: Option<&[PathBuf]>,
+) -> Option<(ManifestBody, Vec<CachedDir>)> {
     let cache_dir = vault_dir.join(CACHE_DIR_NAME);
     let manifest_bytes = fs::read(cache_dir.join(MANIFEST_FILE_NAME)).ok()?;
     let body = read_manifest_bytes(&manifest_bytes)?;
@@ -247,6 +276,7 @@ pub fn load_cache(vault_dir: &Path) -> Option<(ManifestBody, Vec<CachedDir>)> {
     let loaded = body
         .dirs
         .iter()
+        .filter(|entry| in_scope(&entry.dir, scope))
         .filter_map(|entry| {
             let bytes = fs::read(cache_dir.join(&entry.blob)).ok()?;
             decode::<CachedDir>(&bytes)
@@ -409,10 +439,33 @@ pub fn refresh_against_cache(
     mode: Freshness,
     ttl_secs: u64,
 ) -> (Vec<CachedDir>, LoadReport, bool) {
+    refresh_against_cache_scoped(vault, cached, opts, mode, ttl_secs, None)
+}
+
+/// Like [`refresh_against_cache`], but when `scope` is `Some`, the freshness
+/// re-walk is bounded to the requested subtree(s): every discovered file is
+/// filtered through [`in_scope`] before it is stat'd or (re)parsed, so the
+/// walk's cost tracks the subtree, not the whole vault (design W26 /
+/// spec §7). This is what makes a subtree-scoped query O(subtree) rather than
+/// O(vault) — scoping only the blob decode ([`load_cache_under`]) without
+/// scoping this walk would leave the whole-vault cost in place.
+///
+/// The freshness *semantics* are untouched: `PerFile`/`Fast`/`ForceCache`
+/// behave exactly as unscoped, just over a smaller file set — unlike
+/// [`refresh_subtree`], which forces a full re-parse. `scope` of `None` is
+/// exactly [`refresh_against_cache`].
+pub fn refresh_against_cache_scoped(
+    vault: &Path,
+    cached: &[CachedDir],
+    opts: &WalkOpts,
+    mode: Freshness,
+    ttl_secs: u64,
+    scope: Option<&[PathBuf]>,
+) -> (Vec<CachedDir>, LoadReport, bool) {
     match mode {
         Freshness::ForceCache => (cached.to_vec(), LoadReport::default(), false),
-        Freshness::PerFile => refresh_per_file(vault, cached, opts),
-        Freshness::Fast => refresh_fast(vault, cached, opts, ttl_secs),
+        Freshness::PerFile => refresh_per_file(vault, cached, opts, scope),
+        Freshness::Fast => refresh_fast(vault, cached, opts, ttl_secs, scope),
     }
 }
 
@@ -438,6 +491,7 @@ fn refresh_per_file(
     vault: &Path,
     cached: &[CachedDir],
     opts: &WalkOpts,
+    scope: Option<&[PathBuf]>,
 ) -> (Vec<CachedDir>, LoadReport, bool) {
     let cached_by_path: BTreeMap<PathBuf, &CachedFile> = cached
         .iter()
@@ -449,7 +503,10 @@ fn refresh_per_file(
         })
         .collect();
 
-    let paths = discover::discover(vault, opts);
+    let paths: Vec<PathBuf> = discover::discover(vault, opts)
+        .into_iter()
+        .filter(|path| in_scope(path, scope))
+        .collect();
     let outcomes = parallel::map_paths(paths, |path| {
         let dir = file_dir(vault, path);
         let previous = cached_by_path.get(path).copied();
@@ -561,6 +618,7 @@ fn refresh_fast(
     cached: &[CachedDir],
     opts: &WalkOpts,
     ttl_secs: u64,
+    scope: Option<&[PathBuf]>,
 ) -> (Vec<CachedDir>, LoadReport, bool) {
     let cached_by_dir: BTreeMap<PathBuf, &CachedDir> =
         cached.iter().map(|dir| (dir.dir.clone(), dir)).collect();
@@ -576,6 +634,9 @@ fn refresh_fast(
 
     let mut paths_by_dir: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
     for path in discover::discover(vault, opts) {
+        if !in_scope(&path, scope) {
+            continue;
+        }
         paths_by_dir
             .entry(file_dir(vault, &path))
             .or_default()
@@ -683,7 +744,7 @@ pub fn records_from(
                             .map(|(name, value)| (name.clone(), value.clone()))
                             .collect(),
                     };
-                    Record::new(root, &path, fields)
+                    Record::new(root, &path, fields, file.mtime, file.size)
                 })
                 .collect();
             (cached_dir.dir.clone(), records, field_names)
@@ -870,6 +931,68 @@ mod tests {
         let (body, loaded) = load_cache(td.path()).unwrap();
         assert_eq!(body.ttl_secs, 300);
         assert_eq!(loaded, dirs);
+    }
+
+    /// W26 (spec §7): a scoped load reads and decodes ONLY the blobs whose
+    /// directory is at/under a requested subtree — out-of-subtree blob files
+    /// are never touched. Two proofs in one:
+    ///
+    /// 1. With BOTH blobs valid, `load_cache_under(vault, Some([plans]))` must
+    ///    return exactly the `plans/` `CachedDir` — if the loader had read and
+    ///    decoded the (valid) `product/` blob it would appear here; its
+    ///    absence proves out-of-subtree entries are filtered before the read.
+    /// 2. Corrupting the `product/` blob on disk must not perturb the scoped
+    ///    load at all: it still succeeds and returns only `plans/`, so the
+    ///    scoped result never depended on the out-of-subtree blob being
+    ///    readable.
+    #[test]
+    fn load_cache_under_skips_out_of_subtree_blobs() {
+        let td = TempDir::new().unwrap();
+        let plans = td.path().join("plans");
+        let product = td.path().join("product");
+        let dirs = vec![sample_dir_at(plans.clone()), sample_dir_at(product.clone())];
+        save_cache(td.path(), &dirs, 300).unwrap();
+
+        let scope = [plans.clone()];
+        let (_body, loaded) = load_cache_under(td.path(), Some(&scope)).unwrap();
+        assert_eq!(
+            loaded,
+            vec![sample_dir_at(plans.clone())],
+            "a plans-scoped load must decode only the plans/ blob"
+        );
+
+        // Corrupt the product/ blob: a correctly scoped load never reads it,
+        // so this is a no-op for a plans-scoped load.
+        let (body, _) = load_cache(td.path()).unwrap();
+        let product_entry = body.dirs.iter().find(|e| e.dir == product).unwrap();
+        fs::write(
+            td.path().join(".querymatter").join(&product_entry.blob),
+            b"corrupt, must never be read by a plans-scoped load",
+        )
+        .unwrap();
+
+        let (_body, loaded) = load_cache_under(td.path(), Some(&scope)).unwrap();
+        assert_eq!(
+            loaded,
+            vec![sample_dir_at(plans)],
+            "a plans-scoped load must succeed and stay plans-only even with a corrupt product/ blob"
+        );
+    }
+
+    /// `load_cache_under(vault, None)` is exactly `load_cache` — every blob,
+    /// no filtering — so the whole-vault path is unchanged by W26.
+    #[test]
+    fn load_cache_under_none_loads_every_blob() {
+        let td = TempDir::new().unwrap();
+        let dirs = vec![
+            sample_dir_at(td.path().join("plans")),
+            sample_dir_at(td.path().join("product")),
+        ];
+        save_cache(td.path(), &dirs, 300).unwrap();
+
+        let (_body, loaded) = load_cache_under(td.path(), None).unwrap();
+        assert_eq!(loaded.len(), 2, "an unscoped load must decode every blob");
+        assert_eq!(load_cache(td.path()).unwrap().1, loaded);
     }
 
     #[test]

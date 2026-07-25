@@ -244,6 +244,9 @@ fn to_json(value: &Value) -> JsonValue {
         }
         Value::Str(s) => JsonValue::String(s.clone()),
         Value::List(items) => JsonValue::Array(items.iter().map(to_json).collect()),
+        Value::Map(m) => {
+            JsonValue::Object(m.iter().map(|(k, v)| (k.clone(), to_json(v))).collect())
+        }
     }
 }
 
@@ -426,6 +429,18 @@ mod tests {
                 Value::List(vec![Value::Str("a".into()), Value::Str("b".into())]),
             ]],
         }
+    }
+
+    #[test]
+    fn json_export_emits_nested_object_for_map() {
+        use crate::model::Value;
+        use indexmap::IndexMap;
+        let mut inner = IndexMap::new();
+        inner.insert("low".to_string(), Value::Int(5));
+        let v = Value::Map(inner);
+        // to_json is module-private; assert via the JsonValue it builds.
+        let j = super::to_json(&v);
+        assert_eq!(j, serde_json::json!({ "low": 5 }));
     }
 
     #[test]

@@ -51,9 +51,10 @@ pub fn extract(content: &str) -> Extract {
 
 /// Converts gray_matter's dynamic `Pod` into our `Value`.
 ///
-/// Scalars map directly; arrays recurse into `Value::List`. A nested
-/// mapping has no `Value` variant of its own, so it collapses to its
-/// compact string form via [`compact_pod`].
+/// Scalars map directly; arrays recurse into `Value::List`; a nested mapping
+/// recurses into `Value::Map`, preserving its structure rather than
+/// collapsing it to a string (its compact string form is available on demand
+/// via [`Value::display`]).
 fn pod_to_value(pod: Pod) -> Value {
     match pod {
         Pod::Null => Value::Null,
@@ -62,34 +63,7 @@ fn pod_to_value(pod: Pod) -> Value {
         Pod::Float(f) => Value::Float(f),
         Pod::Boolean(b) => Value::Bool(b),
         Pod::Array(items) => Value::List(items.into_iter().map(pod_to_value).collect()),
-        Pod::Hash(_) => Value::Str(compact_pod(&pod)),
-    }
-}
-
-/// Renders a `Pod` as a compact, deterministic string — used for values
-/// that are themselves nested YAML mappings, which `Value` can't represent.
-/// Hash keys are sorted before rendering, since gray_matter stores them in
-/// a plain `HashMap` whose natural iteration order isn't stable.
-fn compact_pod(pod: &Pod) -> String {
-    match pod {
-        Pod::Null => "null".to_string(),
-        Pod::String(s) => s.clone(),
-        Pod::Integer(i) => i.to_string(),
-        Pod::Float(f) => f.to_string(),
-        Pod::Boolean(b) => b.to_string(),
-        Pod::Array(items) => {
-            let rendered: Vec<_> = items.iter().map(compact_pod).collect();
-            format!("[{}]", rendered.join(", "))
-        }
-        Pod::Hash(map) => {
-            let mut entries: Vec<_> = map.iter().collect();
-            entries.sort_by(|a, b| a.0.cmp(b.0));
-            let rendered: Vec<_> = entries
-                .iter()
-                .map(|(key, value)| format!("{key}: {}", compact_pod(value)))
-                .collect();
-            format!("{{{}}}", rendered.join(", "))
-        }
+        Pod::Hash(map) => Value::Map(map.into_iter().map(|(k, v)| (k, pod_to_value(v))).collect()),
     }
 }
 
@@ -158,5 +132,21 @@ mod tests {
             panic!("expected Fields")
         };
         assert_eq!(m.get("prd"), Some(&Value::Str("010".into())));
+    }
+    #[test]
+    fn nested_mapping_becomes_value_map() {
+        let c = "---\nestimate:\n  low: 5\n  high: 10\n---\n";
+        let Extract::Fields(m) = extract(c) else {
+            panic!("expected Fields")
+        };
+        let mut expected = IndexMap::new();
+        expected.insert("low".to_string(), Value::Int(5));
+        expected.insert("high".to_string(), Value::Int(10));
+        // Compare structurally regardless of key order (Pod::Hash is unordered).
+        let Some(Value::Map(got)) = m.get("estimate") else {
+            panic!("expected Map")
+        };
+        assert_eq!(got.get("low"), expected.get("low"));
+        assert_eq!(got.get("high"), expected.get("high"));
     }
 }

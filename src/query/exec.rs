@@ -11,7 +11,9 @@ use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
+use std::time::SystemTime;
 
+use chrono::{DateTime, Duration, Months, SecondsFormat, Utc};
 use globset::Glob;
 use indexmap::IndexMap;
 use regex::Regex;
@@ -19,8 +21,8 @@ use regex::Regex;
 use crate::model::{FileAttr, Record, Value, compare_values};
 use crate::query::ResultTable;
 use crate::query::ast::{
-    Aggregate, BinOp, CmpOp, ColRef, Expr, Having, HavingLeaf, Literal, OrderKey, OrderTarget,
-    Predicate, Query, ScalarFn, SelectExpr, SelectItem,
+    Aggregate, BinOp, CmpOp, ColRef, DateUnit, Expr, Having, HavingLeaf, Literal, OrderKey,
+    OrderTarget, Predicate, Query, RelDate, ScalarFn, SelectExpr, SelectItem,
 };
 
 /// An error that can occur while executing a parsed [`Query`].
@@ -78,7 +80,7 @@ pub fn execute<'a>(
 ) -> Result<ResultTable, ExecError> {
     let records: Vec<&Record> = records.collect();
     let schema = sorted_field_union(&records);
-    execute_with_schema(q, records.into_iter(), &schema, lenient)
+    execute_with_schema_at(q, records.into_iter(), &schema, lenient, SystemTime::now())
 }
 
 /// Like [`execute`], but validates against an explicit `schema` instead of
@@ -101,6 +103,31 @@ pub fn execute_with_schema<'a>(
     schema: &[String],
     lenient: bool,
 ) -> Result<ResultTable, ExecError> {
+    execute_with_schema_at(q, records, schema, lenient, SystemTime::now())
+}
+
+/// Like [`execute_with_schema`], but resolves relative-date literals
+/// (`'today'`, `'-7d'`, …) against an explicit `now` instead of the wall
+/// clock.
+///
+/// This is the seam both public entry points ([`execute`] and
+/// [`execute_with_schema`]) delegate through — the earliest point they
+/// share — so a relative-date literal is resolved to a concrete
+/// `Literal::Str` date (see [`rewrite_relative_dates`]) before column
+/// validation and the filter/group pipeline ever run; `eval_expr` and
+/// `eval_having` never see a `Literal::RelativeDate`. Tests call this
+/// directly to pin resolution against a fixed instant.
+fn execute_with_schema_at<'a>(
+    q: &Query,
+    records: impl Iterator<Item = &'a Record>,
+    schema: &[String],
+    lenient: bool,
+    now: SystemTime,
+) -> Result<ResultTable, ExecError> {
+    let mut resolved = q.clone();
+    rewrite_relative_dates(&mut resolved, now);
+    let q = &resolved;
+
     let records: Vec<&Record> = records.collect();
     if !lenient && !schema.is_empty() {
         validate_columns(q, schema)?;
@@ -109,6 +136,125 @@ pub fn execute_with_schema<'a>(
         return execute_grouped(q, records.into_iter());
     }
     execute_ungrouped(q, records.into_iter())
+}
+
+/// Replaces every `Literal::RelativeDate` in `q` with the `Literal::Str`
+/// ISO-8601 date/datetime it resolves to against `now` (see
+/// [`resolve_reldate`]). Walks every literal position in the query tree —
+/// `SELECT` expressions, the `WHERE` predicate (comparison operands, `IN`
+/// lists, `MEMBER OF`'s literal), and `HAVING` — so no relative-date literal
+/// can reach evaluation unresolved, regardless of where in the query it
+/// appears.
+fn rewrite_relative_dates(q: &mut Query, now: SystemTime) {
+    for item in &mut q.select {
+        if let SelectExpr::Expr(expr) = &mut item.expr {
+            rewrite_expr_literals(expr, now);
+        }
+    }
+    if let Some(pred) = &mut q.filter {
+        rewrite_predicate_literals(pred, now);
+    }
+    if let Some(having) = &mut q.having {
+        rewrite_having_literals(having, now);
+    }
+}
+
+/// Walks `expr`'s literal positions for [`rewrite_relative_dates`]: a bare
+/// literal resolves directly, and a scalar/binary expression recurses into
+/// its arguments/operands.
+fn rewrite_expr_literals(expr: &mut Expr, now: SystemTime) {
+    match expr {
+        Expr::Lit(lit) => rewrite_literal(lit, now),
+        Expr::Col(_) => {}
+        Expr::Scalar(_, args) => {
+            for arg in args {
+                rewrite_expr_literals(arg, now);
+            }
+        }
+        Expr::Binary(_, l, r) => {
+            rewrite_expr_literals(l, now);
+            rewrite_expr_literals(r, now);
+        }
+        Expr::Coalesce(args) => {
+            for arg in args {
+                rewrite_expr_literals(arg, now);
+            }
+        }
+    }
+}
+
+/// Walks a `WHERE` predicate tree's literal positions for
+/// [`rewrite_relative_dates`]: both `Compare` operands, every `IN` list
+/// element, and `MEMBER OF`'s literal. `Like`'s pattern is a plain `String`
+/// (never a `Literal`) and `IsNull` carries no literal at all, so neither
+/// needs a rewrite.
+fn rewrite_predicate_literals(pred: &mut Predicate, now: SystemTime) {
+    match pred {
+        Predicate::Compare(l, _, r) => {
+            rewrite_expr_literals(l, now);
+            rewrite_expr_literals(r, now);
+        }
+        Predicate::In(_, literals, _) => {
+            for lit in literals {
+                rewrite_literal(lit, now);
+            }
+        }
+        Predicate::MemberOf(lit, _, _) => rewrite_literal(lit, now),
+        Predicate::Like(..) | Predicate::IsNull(..) => {}
+        Predicate::And(a, b) | Predicate::Or(a, b) => {
+            rewrite_predicate_literals(a, now);
+            rewrite_predicate_literals(b, now);
+        }
+        Predicate::Not(inner) => rewrite_predicate_literals(inner, now),
+    }
+}
+
+/// Walks a `HAVING` predicate tree's literal positions for
+/// [`rewrite_relative_dates`].
+fn rewrite_having_literals(having: &mut Having, now: SystemTime) {
+    match having {
+        Having::Compare(_, _, lit) => rewrite_literal(lit, now),
+        Having::And(a, b) | Having::Or(a, b) => {
+            rewrite_having_literals(a, now);
+            rewrite_having_literals(b, now);
+        }
+        Having::Not(inner) => rewrite_having_literals(inner, now),
+    }
+}
+
+/// Resolves `lit` in place when it's a `Literal::RelativeDate`; any other
+/// literal is left untouched.
+fn rewrite_literal(lit: &mut Literal, now: SystemTime) {
+    if let Literal::RelativeDate(rd) = lit {
+        *lit = Literal::Str(resolve_reldate(*rd, now));
+    }
+}
+
+/// Resolves a [`RelDate`] to its concrete ISO-8601 rendering, anchored at
+/// `now`. `today` and an offset resolve to a plain `%Y-%m-%d` date, so they
+/// compare lexicographically against a frontmatter date field of the same
+/// shape; `now` resolves to a full RFC3339 instant. `mo`/`y` offsets use
+/// calendar-aware arithmetic ([`Months`]), since a fixed 30/365-day
+/// [`Duration`] would drift across month/year boundaries; `d`/`w` use
+/// [`Duration`] directly, since those units are already fixed-length.
+fn resolve_reldate(rd: RelDate, now: SystemTime) -> String {
+    let now_utc = DateTime::<Utc>::from(now);
+    match rd {
+        RelDate::Now => now_utc.to_rfc3339_opts(SecondsFormat::Secs, true),
+        RelDate::Today => now_utc.date_naive().format("%Y-%m-%d").to_string(),
+        RelDate::Offset { n, unit } => {
+            let d = now_utc.date_naive();
+            let shifted = match unit {
+                DateUnit::Day => d + Duration::days(n),
+                DateUnit::Week => d + Duration::weeks(n),
+                DateUnit::Month if n >= 0 => d + Months::new(n as u32),
+                DateUnit::Month => d - Months::new((-n) as u32),
+                DateUnit::Year if n >= 0 => d + Months::new(12 * n as u32),
+                DateUnit::Year => d - Months::new(12 * (-n) as u32),
+            };
+            shifted.format("%Y-%m-%d").to_string()
+        }
+    }
 }
 
 /// Checks every column `q.referenced_fields()` touches against `schema`,
@@ -374,6 +520,7 @@ fn expr_columns(expr: &Expr) -> Vec<&ColRef> {
         Expr::Lit(_) => Vec::new(),
         Expr::Scalar(_, args) => args.iter().flat_map(expr_columns).collect(),
         Expr::Binary(_, l, r) => expr_columns(l).into_iter().chain(expr_columns(r)).collect(),
+        Expr::Coalesce(args) => args.iter().flat_map(expr_columns).collect(),
     }
 }
 
@@ -467,6 +614,19 @@ fn group_rows<'a>(records: &[&'a Record], group_by: &[ColRef]) -> Vec<Group<'a>>
 /// concatenation collision-free regardless of what characters an element's
 /// own key contains: decoding never needs to guess where one element's key
 /// ends and the next begins.
+///
+/// `Map(entries)` recurses the same way, for the same reason — its compact
+/// `{k: v}` `to_cmp_string()` form is just as lossy as `List`'s `", "` join
+/// (`{a: "x", b: "y"}` and a single-key `{a: "x, b: y"}` both render `{a: x,
+/// b: y}`). Both the field name and its recursively-keyed value are
+/// length-prefixed before being appended, so concatenation stays unambiguous
+/// regardless of what characters a name or nested key contains. Unlike
+/// `List`, the entries are sorted by key first: `IndexMap`'s `PartialEq` (and
+/// so `Value`'s derived one) is order-insensitive — `{a: 1, b: 2}` and `{b:
+/// 2, a: 1}` are structurally equal — so without sorting, two insertion
+/// orders of the same map would hash to different keys and wrongly split one
+/// group into two. `List`/`Vec` equality is order-sensitive, which is why
+/// its arm above does not sort.
 fn hashable_cell_key(value: &Value) -> String {
     match value {
         Value::List(items) => {
@@ -483,6 +643,21 @@ fn hashable_cell_key(value: &Value) -> String {
         Value::Float(f) => {
             let normalized = if *f == 0.0 { 0.0 } else { *f };
             format!("Float\u{1}{normalized}")
+        }
+        Value::Map(entries) => {
+            let mut pairs: Vec<(&String, &Value)> = entries.iter().collect();
+            pairs.sort_by(|a, b| a.0.cmp(b.0)); // order-insensitive map equality -> sort
+            let mut key = String::from("Map");
+            for (name, v) in pairs {
+                let element = hashable_cell_key(v);
+                for part in [name.as_str(), element.as_str()] {
+                    key.push('\u{1}');
+                    key.push_str(&part.len().to_string());
+                    key.push('\u{1}');
+                    key.push_str(part);
+                }
+            }
+            key
         }
         _ => format!("{}\u{1}{}", value.variant_name(), value.to_cmp_string()),
     }
@@ -528,7 +703,13 @@ fn eval_group_expr(rows: &[&Record], expr: &Expr) -> Value {
 /// A fieldless record with no `file.*` identity, used only as the
 /// evaluation context in [`eval_group_expr`]'s zero-row fallback.
 fn empty_record() -> Record {
-    Record::new(Path::new(""), Path::new(""), IndexMap::new())
+    Record::new(
+        Path::new(""),
+        Path::new(""),
+        IndexMap::new(),
+        SystemTime::UNIX_EPOCH,
+        0,
+    )
 }
 
 /// Computes one aggregate function's value over a group's rows.
@@ -735,7 +916,7 @@ fn expand_select(q: &Query, filtered: &[&Record]) -> Vec<(String, Expr)> {
         match &item.expr {
             SelectExpr::Star => {
                 for name in sorted_field_union(filtered) {
-                    columns.push((name.clone(), Expr::Col(ColRef::Field(name))));
+                    columns.push((name.clone(), Expr::Col(ColRef::Field(vec![name]))));
                 }
             }
             SelectExpr::Expr(expr) => columns.push((item.header(), expr.clone())),
@@ -756,7 +937,7 @@ fn sorted_field_union(records: &[&Record]) -> Vec<String> {
 /// Looks up a column reference's value on `record`.
 fn resolve_col(record: &Record, col: &ColRef) -> Value {
     match col {
-        ColRef::Field(name) => record.field(name),
+        ColRef::Field(path) => record.field(path),
         ColRef::File(attr) => record.file_attr(*attr),
     }
 }
@@ -764,10 +945,11 @@ fn resolve_col(record: &Record, col: &ColRef) -> Value {
 /// Evaluates a scalar expression against `record`: a column/`file.*`
 /// pseudo-column resolves via [`resolve_col`], a literal evaluates to its
 /// `Value`, a scalar-function call evaluates its arguments first then
-/// applies [`apply_scalar`], and a binary op evaluates both sides then
-/// applies [`apply_binary`]. Used by both the ungrouped projection (per row,
-/// [`expand_select`]) and the grouped projection (over a group's
-/// representative row, [`eval_group_expr`]).
+/// applies [`apply_scalar`], a binary op evaluates both sides then applies
+/// [`apply_binary`], and `COALESCE` evaluates its arguments left to right,
+/// short-circuiting on the first non-null. Used by both the ungrouped
+/// projection (per row, [`expand_select`]) and the grouped projection (over
+/// a group's representative row, [`eval_group_expr`]).
 pub(crate) fn eval_expr(record: &Record, expr: &Expr) -> Value {
     match expr {
         Expr::Col(col) => resolve_col(record, col),
@@ -781,6 +963,11 @@ pub(crate) fn eval_expr(record: &Record, expr: &Expr) -> Value {
             let r = eval_expr(record, right);
             apply_binary(op.clone(), &l, &r)
         }
+        Expr::Coalesce(args) => args
+            .iter()
+            .map(|arg| eval_expr(record, arg))
+            .find(|v| !v.is_null())
+            .unwrap_or(Value::Null),
     }
 }
 
@@ -792,6 +979,16 @@ fn literal_value(lit: &Literal) -> Value {
         Literal::Float(f) => Value::Float(*f),
         Literal::Bool(b) => Value::Bool(*b),
         Literal::Null => Value::Null,
+        // `execute_with_schema_at` runs `rewrite_relative_dates` before the
+        // filter/group pipeline (and before `HAVING` evaluation, which also
+        // calls this), resolving every `RelativeDate` to a `Literal::Str`.
+        // This function has no clock to resolve one itself, so reaching
+        // here would mean a `Literal::RelativeDate` survived the rewrite —
+        // a bug in the rewrite's traversal, not a state `eval_expr`/
+        // `eval_having` should ever see in practice.
+        Literal::RelativeDate(_) => {
+            unreachable!("relative-date literals are resolved before evaluation")
+        }
     }
 }
 
@@ -1128,7 +1325,13 @@ mod tests {
         for (k, v) in kv {
             m.insert((*k).to_string(), v.clone());
         }
-        Record::new(Path::new(root), Path::new(path), m)
+        Record::new(
+            Path::new(root),
+            Path::new(path),
+            m,
+            SystemTime::UNIX_EPOCH,
+            0,
+        )
     }
     fn recs() -> Vec<Record> {
         vec![
@@ -1398,6 +1601,38 @@ mod tests {
         assert_eq!(
             execute(&q, rows.iter(), false).unwrap().rows,
             vec![vec![Value::Float(4.5)]]
+        );
+    }
+
+    #[test]
+    fn coalesce_returns_first_non_null() {
+        let rows = [
+            rec(
+                "s",
+                "s/a.md",
+                &[("jira", Value::Str("DCP-1".into())), ("epic", Value::Null)],
+            ),
+            rec(
+                "s",
+                "s/b.md",
+                &[("jira", Value::Null), ("epic", Value::Null)],
+            ),
+        ];
+
+        let q = parse("SELECT COALESCE(epic, jira, 'none')").unwrap();
+        assert_eq!(
+            execute(&q, rows.iter(), false).unwrap().rows,
+            vec![
+                vec![Value::Str("DCP-1".into())],
+                vec![Value::Str("none".into())],
+            ]
+        );
+
+        // No fallback literal: every argument null yields Null, not 'none'.
+        let all_null = parse("SELECT COALESCE(epic, jira)").unwrap();
+        assert_eq!(
+            execute(&all_null, rows[1..2].iter(), false).unwrap().rows,
+            vec![vec![Value::Null]]
         );
     }
 
@@ -1897,6 +2132,293 @@ mod tests {
             Err(ExecError::UnknownColumn { .. })
         ));
     }
+
+    #[test]
+    fn dotted_path_select_and_filter_reads_nested_map() {
+        // End-to-end wiring check: parse's `ColRef::Field(path)` lowering,
+        // schema validation's top-level-only check, `resolve_col`, and
+        // `Record::field`'s map walk each have their own unit test, but only
+        // this pins that a real query actually threads a dotted path through
+        // all of them together.
+        let mut estimate = IndexMap::new();
+        estimate.insert("low".to_string(), Value::Int(5));
+        estimate.insert("high".to_string(), Value::Int(20));
+        let rows = [rec("s", "s/a.md", &[("estimate", Value::Map(estimate))])];
+        let q = parse("SELECT estimate.low WHERE estimate.high > 10").unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
+        assert_eq!(t.headers, vec!["estimate.low"]);
+        assert_eq!(t.rows, vec![vec![Value::Int(5)]]);
+    }
+
+    #[test]
+    fn relative_date_resolves_against_injected_now() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        // now = 2026-07-24T00:00:00Z ; '-7d' must resolve to "2026-07-17".
+        //
+        // Note: 1_784_851_200 is the correct epoch second for
+        // 2026-07-24T00:00:00Z (verified independently via `python3
+        // -c 'datetime.datetime(2026,7,24,tzinfo=timezone.utc).timestamp()'`).
+        // The task brief's suggested constant, 1_784_246_400, is actually
+        // 2026-07-17T00:00:00Z — a week earlier than its own comment claims
+        // — which would make BOTH assertions below fail (see task-5-report.md).
+        let now = UNIX_EPOCH + Duration::from_secs(1_784_851_200);
+
+        let in_range = rec(
+            "s",
+            "s/a.md",
+            &[("created", Value::Str("2026-07-20".into()))],
+        );
+        let q = parse("SELECT file.name WHERE created >= '-7d'").unwrap();
+        let t = execute_with_schema_at(
+            &q,
+            std::iter::once(&in_range),
+            &["created".to_string()],
+            false,
+            now,
+        )
+        .unwrap();
+        assert_eq!(t.rows, vec![vec![Value::Str("a.md".into())]]);
+
+        let out_of_range = rec(
+            "s",
+            "s/b.md",
+            &[("created", Value::Str("2026-07-10".into()))],
+        );
+        let t = execute_with_schema_at(
+            &q,
+            std::iter::once(&out_of_range),
+            &["created".to_string()],
+            false,
+            now,
+        )
+        .unwrap();
+        assert!(t.rows.is_empty());
+    }
+
+    #[test]
+    fn reldate_resolution_uses_calendar_arithmetic_and_now_form() {
+        // `today`/offset resolve to a plain `%Y-%m-%d`; `now` resolves to a
+        // full RFC3339 instant; `mo`/`y` use calendar (not fixed-length)
+        // arithmetic — pinned directly against the fixed instant.
+        use std::time::{Duration, UNIX_EPOCH};
+        let now = UNIX_EPOCH + Duration::from_secs(1_784_851_200); // 2026-07-24T00:00:00Z
+
+        assert_eq!(resolve_reldate(RelDate::Today, now), "2026-07-24");
+        assert_eq!(resolve_reldate(RelDate::Now, now), "2026-07-24T00:00:00Z");
+        assert_eq!(
+            resolve_reldate(
+                RelDate::Offset {
+                    n: -2,
+                    unit: DateUnit::Month
+                },
+                now
+            ),
+            "2026-05-24"
+        );
+        assert_eq!(
+            resolve_reldate(
+                RelDate::Offset {
+                    n: -1,
+                    unit: DateUnit::Year
+                },
+                now
+            ),
+            "2025-07-24"
+        );
+    }
+
+    /// The fixed instant shared by every relative-date behavioral test
+    /// below: 2026-07-24T00:00:00Z, so `'-7d'` always resolves to
+    /// `"2026-07-17"` (matching `relative_date_resolves_against_injected_now`
+    /// above).
+    fn fixed_now() -> SystemTime {
+        use std::time::{Duration, UNIX_EPOCH};
+        UNIX_EPOCH + Duration::from_secs(1_784_851_200)
+    }
+
+    #[test]
+    fn relative_date_resolves_in_in_list() {
+        // `IN (...)` carries a `Vec<Literal>`, a distinct AST position from
+        // a `Compare`'s single literal — this must be walked too.
+        let now = fixed_now();
+        let q = parse("SELECT file.name WHERE created IN ('-7d', 'draft')").unwrap();
+
+        let matching = rec(
+            "s",
+            "s/a.md",
+            &[("created", Value::Str("2026-07-17".into()))],
+        );
+        let t = execute_with_schema_at(
+            &q,
+            std::iter::once(&matching),
+            &["created".to_string()],
+            false,
+            now,
+        )
+        .unwrap();
+        assert_eq!(t.rows, vec![vec![Value::Str("a.md".into())]]);
+
+        let non_matching = rec(
+            "s",
+            "s/b.md",
+            &[("created", Value::Str("2026-07-16".into()))],
+        );
+        let t = execute_with_schema_at(
+            &q,
+            std::iter::once(&non_matching),
+            &["created".to_string()],
+            false,
+            now,
+        )
+        .unwrap();
+        assert!(t.rows.is_empty());
+    }
+
+    #[test]
+    fn relative_date_resolves_in_member_of() {
+        // `MEMBER OF`'s left-hand literal is its own AST position, separate
+        // from both `Compare` and `In`.
+        let now = fixed_now();
+        let q = parse("SELECT file.name WHERE '-7d' MEMBER OF(dates)").unwrap();
+
+        let has_date = rec(
+            "s",
+            "s/a.md",
+            &[("dates", Value::List(vec![Value::Str("2026-07-17".into())]))],
+        );
+        let t = execute_with_schema_at(
+            &q,
+            std::iter::once(&has_date),
+            &["dates".to_string()],
+            false,
+            now,
+        )
+        .unwrap();
+        assert_eq!(t.rows, vec![vec![Value::Str("a.md".into())]]);
+
+        let missing_date = rec(
+            "s",
+            "s/b.md",
+            &[("dates", Value::List(vec![Value::Str("2026-07-16".into())]))],
+        );
+        let t = execute_with_schema_at(
+            &q,
+            std::iter::once(&missing_date),
+            &["dates".to_string()],
+            false,
+            now,
+        )
+        .unwrap();
+        assert!(t.rows.is_empty());
+    }
+
+    #[test]
+    fn relative_date_resolves_in_having() {
+        // `HAVING`'s literal is resolved before `eval_having` runs, exactly
+        // like `WHERE`'s — a group whose aggregate clears the resolved
+        // date survives, one that doesn't gets dropped.
+        let now = fixed_now();
+        let rows = [
+            rec(
+                "s",
+                "s/a1.md",
+                &[
+                    ("status", Value::Str("a".into())),
+                    ("created", Value::Str("2026-07-20".into())),
+                ],
+            ),
+            rec(
+                "s",
+                "s/b1.md",
+                &[
+                    ("status", Value::Str("b".into())),
+                    ("created", Value::Str("2026-07-10".into())),
+                ],
+            ),
+        ];
+        let q = parse("SELECT status GROUP BY status HAVING min(created) >= '-7d'").unwrap();
+        let t = execute_with_schema_at(
+            &q,
+            rows.iter(),
+            &["status".to_string(), "created".to_string()],
+            false,
+            now,
+        )
+        .unwrap();
+        assert_eq!(t.rows, vec![vec![Value::Str("a".into())]]);
+    }
+
+    #[test]
+    fn relative_date_resolves_in_executed_select_projection() {
+        // Executed end-to-end (not just parsed): the projected cell must be
+        // the resolved ISO date, not the literal source text `-7d`.
+        let now = fixed_now();
+        let row = rec("s", "s/a.md", &[]);
+        let q = parse("SELECT '-7d' AS d").unwrap();
+        let t = execute_with_schema_at(&q, std::iter::once(&row), &[], false, now).unwrap();
+        assert_eq!(t.rows, vec![vec![Value::Str("2026-07-17".into())]]);
+    }
+
+    #[test]
+    fn relative_date_resolves_inside_coalesce_argument() {
+        // Regression: `rewrite_expr_literals` must recurse into
+        // `Expr::Coalesce`'s arguments, not just `Scalar`/`Binary` — a
+        // relative-date literal nested inside `COALESCE(...)` must reach
+        // evaluation already resolved to its ISO date, never the literal
+        // source text `-7d`. `epic` is absent on the row, so `COALESCE`
+        // falls through to the `'-7d'` argument, which must be the
+        // *resolved* value here (if the `Coalesce` arm were dropped from
+        // `rewrite_expr_literals`, this literal would survive the rewrite
+        // as a `Literal::RelativeDate` and panic in `literal_value`, not
+        // silently return the wrong string).
+        let now = fixed_now();
+        let row = rec("s", "s/a.md", &[]);
+        let q = parse("SELECT COALESCE(epic, '-7d') AS d").unwrap();
+        let t = execute_with_schema_at(&q, std::iter::once(&row), &[], false, now).unwrap();
+        assert_eq!(t.rows, vec![vec![Value::Str("2026-07-17".into())]]);
+    }
+
+    #[test]
+    fn extreme_offset_magnitude_falls_back_to_str_and_does_not_panic() {
+        // Each of these is malformed/out-of-bound enough that
+        // `RelDate::parse` must reject it, so it stays a plain
+        // `Literal::Str` rather than reaching `resolve_reldate` and
+        // overflowing/panicking `chrono::Duration::days`/`weeks`:
+        //
+        // - a 15-digit offset: within `i64`, but far beyond
+        //   `RelDate::parse`'s max offset magnitude;
+        // - a doubled or misplaced sign (`--…`, `-+…`, `+-…`): without the
+        //   all-digits check on `digits`, the embedded second sign would
+        //   let a huge NEGATIVE `n` sail past the `> MAX_OFFSET_MAGNITUDE`
+        //   check (which only catches large *positive* values), then get
+        //   flipped back to a huge *positive* value by `sign * n` —
+        //   bypassing the bound entirely. Reproduced end-to-end
+        //   (`TimeDelta::days out of bounds`) before the all-digits guard
+        //   was added; see task-5-report.md.
+        for token in ["-999999999999999d", "--999999999999999d", "-+7d", "+-7d"] {
+            let sql = format!("SELECT file.name WHERE created = '{token}'");
+            let q = parse(&sql).unwrap();
+            assert_eq!(
+                q.filter,
+                Some(Predicate::Compare(
+                    Expr::Col(ColRef::Field(vec!["created".into()])),
+                    CmpOp::Eq,
+                    Expr::Lit(Literal::Str(token.into()))
+                )),
+                "{token} should stay a plain string literal"
+            );
+
+            let row = rec(
+                "s",
+                "s/a.md",
+                &[("created", Value::Str("2026-07-17".into()))],
+            );
+            // Must not panic; the literal text never matches a real date.
+            let t = execute(&q, std::iter::once(&row), false).unwrap();
+            assert!(t.rows.is_empty(), "{token} should match no rows");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1911,7 +2433,13 @@ mod agg_tests {
         let mut m = IndexMap::new();
         m.insert("status".into(), Value::Str(status.into()));
         m.insert("prd".into(), Value::Str(prd.into()));
-        Record::new(Path::new("s"), Path::new(path), m)
+        Record::new(
+            Path::new("s"),
+            Path::new(path),
+            m,
+            SystemTime::UNIX_EPOCH,
+            0,
+        )
     }
     fn recs() -> Vec<Record> {
         vec![
@@ -1926,7 +2454,13 @@ mod agg_tests {
         let mut m = IndexMap::new();
         m.insert("status".into(), Value::Str(status.into()));
         m.insert("n".into(), n);
-        Record::new(Path::new("s"), Path::new(path), m)
+        Record::new(
+            Path::new("s"),
+            Path::new(path),
+            m,
+            SystemTime::UNIX_EPOCH,
+            0,
+        )
     }
 
     #[test]
@@ -1993,6 +2527,33 @@ mod agg_tests {
         // be rejected — validation walks into scalar/arithmetic
         // sub-expressions, not just bare columns.
         let q = parse("SELECT lower(prd), count(*) GROUP BY status").unwrap();
+        assert!(matches!(
+            execute(&q, recs().iter(), false),
+            Err(ExecError::NonGroupedColumn(_))
+        ));
+    }
+    #[test]
+    fn grouped_coalesce_over_grouping_key() {
+        // `COALESCE(status, 'x')` is valid because `status` is a GROUP BY
+        // key; `expr_columns` recurses into COALESCE's arguments the same
+        // as any other nested expression.
+        let q =
+            parse("SELECT COALESCE(status, 'x'), count(*) AS n GROUP BY status ORDER BY status")
+                .unwrap();
+        let t = execute(&q, recs().iter(), false).unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec![Value::Str("draft".into()), Value::Int(1)],
+                vec![Value::Str("synced".into()), Value::Int(2)],
+            ]
+        );
+    }
+    #[test]
+    fn grouped_coalesce_referencing_non_group_key_errors() {
+        // `prd` isn't a GROUP BY key; wrapping it in `COALESCE(...)` must
+        // still be rejected, mirroring `grouped_select_expr_referencing_non_group_key_errors`.
+        let q = parse("SELECT COALESCE(prd, 'x'), count(*) GROUP BY status").unwrap();
         assert!(matches!(
             execute(&q, recs().iter(), false),
             Err(ExecError::NonGroupedColumn(_))
@@ -2307,6 +2868,70 @@ mod agg_tests {
             1,
             "0.0 and -0.0 must land in the SAME group, matching main's \
              structural Value PartialEq; got: {:?}",
+            t.rows
+        );
+        assert_eq!(t.rows[0][1], Value::Int(2));
+    }
+
+    /// M1 characterization: a `Value::Map` cell used to fall through the
+    /// wildcard arm and key on its compact `{k: v}` `to_cmp_string()` form,
+    /// which is lossy the same way `List`'s `", "` join was — `{a: "x", b:
+    /// "y"}` and the single-key `{a: "x, b: y"}` both compact-render `{a: x,
+    /// b: y}`. The structural `Map` arm recurses per-entry instead, so these
+    /// two structurally-different maps must land in different groups.
+    #[test]
+    fn group_by_map_column_distinguishes_structurally_different_maps() {
+        let mut two_entries = IndexMap::new();
+        two_entries.insert("a".to_string(), Value::Str("x".into()));
+        two_entries.insert("b".to_string(), Value::Str("y".into()));
+
+        let mut one_entry = IndexMap::new();
+        one_entry.insert("a".to_string(), Value::Str("x, b: y".into()));
+
+        let rows = [
+            rec_n("s/a.md", "x", Value::Map(two_entries)),
+            rec_n("s/b.md", "x", Value::Map(one_entry)),
+        ];
+
+        let q = parse("SELECT n, count(*) AS n_count GROUP BY n").unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
+        assert_eq!(
+            t.rows.len(),
+            2,
+            "{{a: x, b: y}} and {{a: \"x, b: y\"}} must land in different \
+             groups, matching main's structural Value PartialEq; got: {:?}",
+            t.rows
+        );
+        assert!(t.rows.iter().all(|row| row[1] == Value::Int(1)));
+    }
+
+    /// M1 characterization: `IndexMap`'s `PartialEq` (and so `Value`'s
+    /// derived one) is order-insensitive, so two maps with the same entries
+    /// in different insertion order are structurally equal and must land in
+    /// the SAME group — which `hashable_cell_key`'s `Map` arm achieves by
+    /// sorting entries by key before building the key string.
+    #[test]
+    fn group_by_map_column_is_order_insensitive() {
+        let mut ab = IndexMap::new();
+        ab.insert("a".to_string(), Value::Int(1));
+        ab.insert("b".to_string(), Value::Int(2));
+
+        let mut ba = IndexMap::new();
+        ba.insert("b".to_string(), Value::Int(2));
+        ba.insert("a".to_string(), Value::Int(1));
+
+        let rows = [
+            rec_n("s/a.md", "x", Value::Map(ab)),
+            rec_n("s/b.md", "x", Value::Map(ba)),
+        ];
+
+        let q = parse("SELECT n, count(*) AS n_count GROUP BY n").unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
+        assert_eq!(
+            t.rows.len(),
+            1,
+            "{{a: 1, b: 2}} and {{b: 2, a: 1}} must land in the SAME group, \
+             matching main's structural Value PartialEq; got: {:?}",
             t.rows
         );
         assert_eq!(t.rows[0][1], Value::Int(2));

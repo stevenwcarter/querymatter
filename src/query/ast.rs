@@ -64,12 +64,15 @@ pub enum SelectExpr {
     Agg(Aggregate),
 }
 
-/// A reference to a queryable column: either a frontmatter field or a `file.*`
-/// pseudo-column.
+/// A reference to a queryable column: either a frontmatter field (possibly
+/// dotted into a nested `Value::Map`) or a `file.*` pseudo-column.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ColRef {
-    /// A YAML frontmatter field, named verbatim.
-    Field(String),
+    /// A YAML frontmatter field path: a bare field is one segment
+    /// (`status`); each further segment indexes into a nested `Value::Map`
+    /// (`estimate.low` lowers to `["estimate", "low"]`). Never empty for any
+    /// `ColRef` the parser builds.
+    Field(Vec<String>),
     /// A `file.*` pseudo-column (`file.name`, `file.path`, …).
     File(FileAttr),
 }
@@ -90,6 +93,11 @@ pub enum Expr {
     Scalar(ScalarFn, Vec<Expr>),
     /// A binary arithmetic or string-concat operation.
     Binary(BinOp, Box<Expr>, Box<Expr>),
+    /// `COALESCE(a, b, ...)` — the first non-null argument, evaluated
+    /// left to right; `Value::Null` if every argument is null. Variadic and
+    /// short-circuiting, so it doesn't fit `Scalar`'s fixed-arity shape or
+    /// `Binary`'s two-operand shape.
+    Coalesce(Vec<Expr>),
 }
 
 /// A scalar string function, as it may appear in a `SELECT` expression.
@@ -237,6 +245,109 @@ pub enum Literal {
     Bool(bool),
     /// The `NULL` literal.
     Null,
+    /// A relative-date literal (`'today'`, `'-7d'`, …), parsed but not yet
+    /// resolved to a concrete date — see [`RelDate`]. The parser produces
+    /// this straight from a quoted string that matches the grammar (see
+    /// `query::parse`'s string-literal lowering); the executor resolves it
+    /// to a plain `Literal::Str` ISO-8601 date/datetime before evaluation
+    /// ever sees it (`query::exec`'s relative-date rewrite), so this
+    /// variant is clock-free by construction.
+    RelativeDate(RelDate),
+}
+
+/// A relative-date literal, as parsed from a quoted string by
+/// [`RelDate::parse`] — clock-free: it names *what* to resolve, not the
+/// resolved value. Resolution against a concrete instant happens only in
+/// `exec::resolve_reldate`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RelDate {
+    /// `'today'` — the current date.
+    Today,
+    /// `'now'` — the current instant.
+    Now,
+    /// A signed offset from today/now, e.g. `'-7d'`, `'+3w'`, `'-2mo'`.
+    Offset {
+        /// The signed magnitude (already carries the `+`/`-` sign).
+        n: i64,
+        /// The offset's unit.
+        unit: DateUnit,
+    },
+}
+
+/// The unit of a [`RelDate::Offset`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DateUnit {
+    /// `d` — days.
+    Day,
+    /// `w` — weeks.
+    Week,
+    /// `mo` — calendar months.
+    Month,
+    /// `y` — calendar years.
+    Year,
+}
+
+/// The largest offset magnitude [`RelDate::parse`] accepts, in the offset's
+/// own unit — so up to 100,000 days, weeks, months, or years (the last of
+/// which is already 100,000 years, far beyond any plausible query). Bounds
+/// how large a value `exec::resolve_reldate` ever hands to
+/// `chrono::Duration::days`/`weeks` or `chrono::Months::new`: an unbounded
+/// offset (e.g. a 15-digit number, still well within `i64`) can overflow
+/// `Duration`'s internal range or silently truncate through the `as u32`
+/// cast feeding `Months::new`. An offset beyond this bound isn't treated as
+/// a relative date at all — it falls back to a plain string literal, the
+/// same as any other out-of-grammar input.
+const MAX_OFFSET_MAGNITUDE: i64 = 100_000;
+
+impl RelDate {
+    /// Parses a relative-date token under a strict, anchored grammar:
+    /// `today | now | [+-]<digits>(d|w|mo|y)`, case-insensitive for the bare
+    /// `today`/`now` keywords — exactly one leading sign, then only ASCII
+    /// digits. Anything else — including a sign-less offset (`7d`), a
+    /// doubled or misplaced sign (`--7d`, `-+7d`), an unrecognized unit
+    /// (`-7m`, `-7x`), a bare number (`-7`), or an offset magnitude beyond
+    /// [`MAX_OFFSET_MAGNITUDE`] — is not a relative date and returns `None`,
+    /// leaving the caller free to treat the string as a plain string
+    /// literal.
+    pub fn parse(s: &str) -> Option<RelDate> {
+        let s = s.trim();
+        match s.to_ascii_lowercase().as_str() {
+            "today" => return Some(RelDate::Today),
+            "now" => return Some(RelDate::Now),
+            _ => {}
+        }
+        let (sign, rest) = match s.strip_prefix('-') {
+            Some(r) => (-1, r),
+            None => (1, s.strip_prefix('+')?),
+        };
+        let (digits, unit) = if let Some(d) = rest.strip_suffix("mo") {
+            (d, DateUnit::Month)
+        } else if let Some(d) = rest.strip_suffix('d') {
+            (d, DateUnit::Day)
+        } else if let Some(d) = rest.strip_suffix('w') {
+            (d, DateUnit::Week)
+        } else {
+            (rest.strip_suffix('y')?, DateUnit::Year)
+        };
+        // `digits` must be a clean unsigned integer — no embedded sign, no
+        // whitespace. Without this, `i64::from_str` accepting its own
+        // leading `-`/`+` would let a *second* sign character slip through
+        // as part of `digits` (e.g. `--999999999999999d` strips only the
+        // outer `-` into `sign`, leaving `digits = "-999999999999999"`),
+        // producing a huge negative `n` that passes the `> MAX_OFFSET_MAGNITUDE`
+        // check (it's negative, not too large) only to be flipped back to a
+        // huge *positive* value by `sign * n` below — bypassing the bound
+        // entirely and reaching `resolve_reldate`'s `Duration::days`/`weeks`
+        // with a value that panics on overflow.
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let n: i64 = digits.parse().ok()?;
+        if n > MAX_OFFSET_MAGNITUDE {
+            return None;
+        }
+        Some(RelDate::Offset { n: sign * n, unit })
+    }
 }
 
 /// One `ORDER BY` key: what to sort on and in which direction.
@@ -265,7 +376,9 @@ pub enum OrderTarget {
 }
 
 impl Query {
-    /// Every `ColRef::Field` name this query references, across every
+    /// Every `ColRef::Field`'s top-level path segment this query references
+    /// (e.g. `estimate` for `estimate.low` — a sub-key is dynamic and is
+    /// never checked against the schema, see spec §3.4), across every
     /// column position: `SELECT` (including a column nested inside a
     /// `Expr::Scalar`/`Expr::Binary` argument or an aggregate's argument),
     /// `WHERE`, `GROUP BY`, `ORDER BY` (a bare column or an aggregate
@@ -309,12 +422,18 @@ impl Query {
     }
 }
 
-/// Adds `col`'s field name to `fields` when it's a frontmatter field; a
-/// `file.*` pseudo-column contributes nothing (see
-/// [`Query::referenced_fields`]).
+/// Adds `col`'s top-level field-path segment to `fields` when it's a
+/// frontmatter field; a `file.*` pseudo-column contributes nothing (see
+/// [`Query::referenced_fields`]). Only the top-level segment is added — a
+/// dotted path's sub-keys are dynamic and aren't checked against the schema
+/// (spec §3.4). `path` is always non-empty for any `ColRef::Field` the
+/// parser builds; the `first()` guard is a defensive no-op for a hand-built
+/// empty path.
 fn collect_col_field(col: &ColRef, fields: &mut BTreeSet<String>) {
-    if let ColRef::Field(name) = col {
-        fields.insert(name.clone());
+    if let ColRef::Field(path) = col
+        && let Some(top) = path.first()
+    {
+        fields.insert(top.clone());
     }
 }
 
@@ -332,6 +451,11 @@ fn collect_expr_fields(expr: &Expr, fields: &mut BTreeSet<String>) {
         Expr::Binary(_, l, r) => {
             collect_expr_fields(l, fields);
             collect_expr_fields(r, fields);
+        }
+        Expr::Coalesce(args) => {
+            for arg in args {
+                collect_expr_fields(arg, fields);
+            }
         }
     }
 }
@@ -414,11 +538,12 @@ impl SelectExpr {
 }
 
 impl ColRef {
-    /// The textual label for this column (`status`, `file.name`, …), used in
-    /// default headers, aggregate rendering, and `HAVING` error messages.
+    /// The textual label for this column (`status`, `estimate.low`,
+    /// `file.name`, …), used in default headers, aggregate rendering, and
+    /// `HAVING` error messages.
     pub(crate) fn label(&self) -> String {
         match self {
-            ColRef::Field(name) => name.clone(),
+            ColRef::Field(path) => path.join("."),
             ColRef::File(attr) => file_attr_label(*attr).to_string(),
         }
     }
@@ -456,6 +581,10 @@ fn expr_label(expr: &Expr) -> String {
         Expr::Binary(op, l, r) => {
             format!("{} {} {}", expr_label(l), bin_op_symbol(op), expr_label(r))
         }
+        Expr::Coalesce(args) => {
+            let rendered: Vec<String> = args.iter().map(expr_label).collect();
+            format!("coalesce({})", rendered.join(", "))
+        }
     }
 }
 
@@ -467,6 +596,32 @@ fn literal_label(lit: &Literal) -> String {
         Literal::Float(f) => f.to_string(),
         Literal::Bool(b) => b.to_string(),
         Literal::Null => "NULL".to_string(),
+        Literal::RelativeDate(rd) => format!("'{}'", reldate_source(rd)),
+    }
+}
+
+/// Renders a [`RelDate`] back to the source token it was parsed from
+/// (`today`, `now`, `-7d`, `+3w`, …), for [`literal_label`]'s default-header
+/// rendering.
+fn reldate_source(rd: &RelDate) -> String {
+    match rd {
+        RelDate::Today => "today".to_string(),
+        RelDate::Now => "now".to_string(),
+        RelDate::Offset { n, unit } => {
+            let sign = if *n < 0 { '-' } else { '+' };
+            format!("{sign}{}{}", n.unsigned_abs(), date_unit_suffix(*unit))
+        }
+    }
+}
+
+/// The source-grammar suffix for a [`DateUnit`] (`d`/`w`/`mo`/`y`), for
+/// [`reldate_source`].
+fn date_unit_suffix(unit: DateUnit) -> &'static str {
+    match unit {
+        DateUnit::Day => "d",
+        DateUnit::Week => "w",
+        DateUnit::Month => "mo",
+        DateUnit::Year => "y",
     }
 }
 
@@ -503,6 +658,8 @@ fn file_attr_label(attr: FileAttr) -> &'static str {
         FileAttr::Path => "file.path",
         FileAttr::Folder => "file.folder",
         FileAttr::Ext => "file.ext",
+        FileAttr::Mtime => "file.mtime",
+        FileAttr::Size => "file.size",
     }
 }
 
@@ -544,5 +701,85 @@ mod tests {
     fn referenced_fields_includes_order_by_bare_aggregate_column() {
         let q = parse("SELECT status GROUP BY status ORDER BY sum(n) DESC").unwrap();
         assert!(q.referenced_fields().contains("n"));
+    }
+
+    #[test]
+    fn reldate_parse_grammar() {
+        use super::{DateUnit, RelDate};
+        assert_eq!(RelDate::parse("today"), Some(RelDate::Today));
+        assert_eq!(RelDate::parse("now"), Some(RelDate::Now));
+        assert_eq!(
+            RelDate::parse("-7d"),
+            Some(RelDate::Offset {
+                n: -7,
+                unit: DateUnit::Day
+            })
+        );
+        assert_eq!(
+            RelDate::parse("+3w"),
+            Some(RelDate::Offset {
+                n: 3,
+                unit: DateUnit::Week
+            })
+        );
+        assert_eq!(
+            RelDate::parse("-2mo"),
+            Some(RelDate::Offset {
+                n: -2,
+                unit: DateUnit::Month
+            })
+        );
+        assert_eq!(
+            RelDate::parse("-1y"),
+            Some(RelDate::Offset {
+                n: -1,
+                unit: DateUnit::Year
+            })
+        );
+        // rejects
+        for bad in [
+            "7d",
+            "-7m",
+            "-7x",
+            "tomorrow",
+            "draft",
+            "-7",
+            "",
+            "-999999999999999d",
+            // A doubled or misplaced sign must never slip an embedded `-`/
+            // `+` into `digits`: `i64::from_str` accepts its own leading
+            // sign, so without an explicit all-digits check on `digits`,
+            // `--999999999999999d` would strip only the outer `-`, parse
+            // the huge NEGATIVE remainder as `n` (sailing past the
+            // `> MAX_OFFSET_MAGNITUDE` check, which only catches large
+            // *positive* values), then flip it back to a huge positive
+            // value via `sign * n` — bypassing the bound entirely and
+            // reaching `resolve_reldate`'s `Duration::days` with a value
+            // that panics on overflow (reproduced end-to-end in
+            // `exec::tests` before this guard was added; see
+            // task-5-report.md).
+            "--999999999999999d",
+            "-+7d",
+            "+-7d",
+        ] {
+            assert_eq!(RelDate::parse(bad), None, "should reject {bad}");
+        }
+    }
+
+    #[test]
+    fn reldate_parse_rejects_offset_beyond_max_magnitude() {
+        use super::{DateUnit, RelDate};
+        // Just at the bound still parses...
+        assert_eq!(
+            RelDate::parse("-100000d"),
+            Some(RelDate::Offset {
+                n: -100_000,
+                unit: DateUnit::Day
+            })
+        );
+        // ...one past it does not, regardless of unit.
+        for bad in ["-100001d", "+100001w", "-100001mo", "+100001y"] {
+            assert_eq!(RelDate::parse(bad), None, "should reject {bad}");
+        }
     }
 }
