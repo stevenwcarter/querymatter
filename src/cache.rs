@@ -782,9 +782,12 @@ pub struct CacheSummary {
 /// Builds a [`CacheSummary`] for the vault at `vault_dir`: counts and sizes
 /// come from [`load_cache`] plus a listing of [`cache_dir`]'s on-disk blob
 /// and manifest files, so `bytes` reflects what's actually persisted rather
-/// than a value recomputed from the decoded records. Errors — naming
-/// `querymatter init` (the CLI dispatch adds that, see `main`) — when
-/// `vault_dir` has no readable cache.
+/// than a value recomputed from the decoded records. Errors when
+/// `vault_dir` has no readable cache — missing, corrupt, or written by an
+/// incompatible [`SCHEMA_VERSION`] — but this function's own error does
+/// *not* name `querymatter init`; `run_cache_status` in `main` wraps this
+/// call with the context that does, since that's also where the
+/// no-vault-at-all case is worded.
 pub fn cache_summary(vault_dir: &Path) -> anyhow::Result<CacheSummary> {
     let (body, dirs) = load_cache(vault_dir).context("no readable .querymatter cache found")?;
     let file_count = dirs.iter().map(|d| d.files.len()).sum();
@@ -793,8 +796,15 @@ pub fn cache_summary(vault_dir: &Path) -> anyhow::Result<CacheSummary> {
     let mut bytes = 0u64;
     for entry in fs::read_dir(&cache).with_context(|| format!("reading {}", cache.display()))? {
         let entry = entry?;
-        if entry.file_type()?.is_file() {
-            bytes += entry.metadata()?.len();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("reading file type of {}", entry.path().display()))?;
+        if file_type.is_file() {
+            let len = entry
+                .metadata()
+                .with_context(|| format!("reading metadata of {}", entry.path().display()))?
+                .len();
+            bytes += len;
         }
     }
 

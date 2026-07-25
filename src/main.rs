@@ -398,7 +398,11 @@ fn run_cache(args: &CacheArgs) -> anyhow::Result<()> {
 /// (or the cwd when `dir` is absent): its location, size, counts, TTL, and
 /// each cached directory's last scan time. Printed to stdout — inspection
 /// data, matching `config list`'s convention. Errors, naming `querymatter
-/// init`, when no vault is found at or above the resolved directory.
+/// init`, both when no vault is found at or above the resolved directory
+/// and when one is found but its `manifest.bin` is unreadable (corrupt, or
+/// written by an incompatible crate version) — [`cache::cache_summary`]'s
+/// own error doesn't mention `init`, so this wraps it with context that
+/// does.
 fn run_cache_status(dir: Option<&Path>) -> anyhow::Result<()> {
     let start = match dir {
         Some(dir) => fs::canonicalize(dir)
@@ -411,7 +415,13 @@ fn run_cache_status(dir: Option<&Path>) -> anyhow::Result<()> {
             start.display()
         )
     })?;
-    let summary = cache::cache_summary(&vault)?;
+    let summary = cache::cache_summary(&vault).with_context(|| {
+        format!(
+            "cache at {} may be corrupt or from an incompatible querymatter version \
+             (run `querymatter init` to rebuild it)",
+            cache::cache_dir(&vault).display()
+        )
+    })?;
     println!("{}", render_cache_summary(&summary));
     Ok(())
 }

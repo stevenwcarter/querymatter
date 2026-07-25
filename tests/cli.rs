@@ -420,6 +420,32 @@ fn cache_status_without_a_vault_exits_nonzero_and_mentions_init() {
         .stderr(predicates::str::contains("init"));
 }
 
+#[test]
+fn cache_status_with_corrupt_manifest_exits_nonzero_and_mentions_init() {
+    // A vault whose `manifest.bin` is present but unreadable (corrupt, or
+    // left behind by an incompatible crate version after an upgrade) is a
+    // different failure mode than "no vault at all" — `find_vault` still
+    // resolves it, but `cache_summary`'s read of the header fails. That path
+    // must still point the user at `querymatter init` (W33).
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg("init")
+        .arg(td.path())
+        .assert()
+        .success();
+
+    let manifest = td.path().join(".querymatter/manifest.bin");
+    fs::write(&manifest, b"not a real manifest").unwrap();
+
+    qm(home.path())
+        .args(["cache", "status"])
+        .arg(td.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("init"));
+}
+
 /// `init`'s walk flags parse into the "init" subcommand's own nested
 /// `ArgMatches`, not the top-level one `main` builds `Cli` from —
 /// `Settings::resolve_walk` must be handed that nested `ArgMatches`, or every
