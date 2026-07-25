@@ -64,22 +64,29 @@ SELECT [DISTINCT] cols [AS alias] [FROM 'glob'] [WHERE ...] [GROUP BY ...] [HAVI
   comparison: arithmetic `+ - * / %`, string concat `||`, and the functions
   `lower(s)`, `upper(s)` (both Unicode-aware, not ASCII-only), `length(s)`,
   `trim(s)`, `ltrim(s)`, `rtrim(s)`, `substr(s, start[, len])` (1-based,
-  clamped), `replace(s, from, to)`. `COALESCE(a, b, ...)` is also supported —
-  variadic, returning the first non-null argument (columns, literals, and
-  nested expressions can all be arguments), e.g. `SELECT jira, COALESCE(epic,
-  'none') AS epic`. A `Null` or non-numeric operand to arithmetic, and
-  divide/mod by zero, all yield `Null` rather than an error. Arithmetic is
-  computed in `f64`, so an integer field beyond `f64`'s 53-bit exact range
-  loses precision. An expression *containing* an aggregate (e.g. `count(*) +
-  1`) is not supported — mix them via `HAVING` instead.
+  clamped), `replace(s, from, to)`, and `DATE(s)`/`DATE(s, fmt)` — casts `s`
+  to a date/datetime, `NULL` on failure (see [Dates](#dates) below).
+  `COALESCE(a, b, ...)` is also supported — variadic, returning the first
+  non-null argument (columns, literals, and nested expressions can all be
+  arguments), e.g. `SELECT jira, COALESCE(epic, 'none') AS epic`. A `Null`
+  or non-numeric operand to arithmetic, and divide/mod by zero, all yield
+  `Null` rather than an error. Arithmetic is computed in `f64`, so an
+  integer field beyond `f64`'s 53-bit exact range loses precision. An
+  expression *containing* an aggregate (e.g. `count(*) + 1`) is not
+  supported — mix them via `HAVING` instead.
 - **FROM** — optional; when present its value is a path glob applied within
   the scanned directories (e.g. `FROM 'plans/**'`). Omit it and every
   discovered record is in scope.
 - **WHERE** — a comparison (`= != <> < <= > >=`) between two scalar
   expressions (so `WHERE start < end` or `WHERE upper(status) = 'DRAFT'`
-  work), plus `LIKE`/`NOT LIKE` (`%`/`_` wildcards), `IN (...)`/`NOT IN
-  (...)`, `IS NULL`/`IS NOT NULL`, and `[NOT] '<value>' MEMBER OF(<col>)` for
-  a list-valued field (e.g. `WHERE 'mobile' MEMBER OF(tags)`) — combined with
+  work), plus `LIKE`/`NOT LIKE` (`%`/`_` wildcards), `[NOT] REGEXP
+  '<pattern>'` (`RLIKE` is a synonym — sqlparser maps both keywords to the
+  same node) for a case-sensitive regex match, backed by the `regex` crate,
+  against **any scalar expression**, not just a bare column (e.g.
+  `lower(status) REGEXP 'draft'`); an uncompilable pattern is rejected at
+  parse time rather than on every row. Also `IN (...)`/`NOT IN (...)`, `IS
+  NULL`/`IS NOT NULL`, and `[NOT] '<value>' MEMBER OF(<col>)` for a
+  list-valued field (e.g. `WHERE 'mobile' MEMBER OF(tags)`) — combined with
   `AND`, `OR`, `NOT`, and parentheses. A quoted string literal forces string
   comparison — unless it matches the [relative-date
   grammar](#relative-date-literals) (`'-7d'`, `'today'`, `'now'`, …), in
@@ -103,12 +110,12 @@ SELECT [DISTINCT] cols [AS alias] [FROM 'glob'] [WHERE ...] [GROUP BY ...] [HAVI
   with optional `ASC`/`DESC`. NULLs sort last regardless of direction.
 - **`CASE`** — `CASE WHEN cond THEN val [WHEN cond THEN val ...] [ELSE val]
   END` (the *searched* form; each `WHEN` is a full `WHERE`-style condition —
-  comparisons, `LIKE`, `IN`, `MEMBER OF`, `AND`/`OR`/`NOT`) or `CASE expr WHEN
-  val THEN val2 ... [ELSE val] END` (the *simple* form; each `WHEN` value is
-  compared against `expr` for equality). The first matching arm wins; a
-  missing `ELSE` yields `Null` when none match. Usable in `SELECT`, `WHERE`,
-  and `ORDER BY` — e.g. `SELECT CASE WHEN status = 'draft' THEN 'D' ELSE 'S'
-  END AS c`.
+  comparisons, `LIKE`, `REGEXP`, `IN`, `MEMBER OF`, `AND`/`OR`/`NOT`) or `CASE
+  expr WHEN val THEN val2 ... [ELSE val] END` (the *simple* form; each
+  `WHEN` value is compared against `expr` for equality). The first matching
+  arm wins; a missing `ELSE` yields `Null` when none match. Usable in
+  `SELECT`, `WHERE`, and `ORDER BY` — e.g. `SELECT CASE WHEN status =
+  'draft' THEN 'D' ELSE 'S' END AS c`.
 - **LIMIT n [OFFSET m]**.
 
 ### Boundaries worth knowing
@@ -176,12 +183,52 @@ available alongside frontmatter fields:
 | `file.ext` | extension without the dot, e.g. `md` |
 | `file.mtime` | modification time as an ISO-8601 UTC string, e.g. `2026-07-20T10:30:00Z` (sorts and compares lexicographically) |
 | `file.size` | file size in bytes, as an integer |
+| `file.word_count` | word count of the Markdown body after the frontmatter fence |
+| `file.body` | the Markdown body after the frontmatter fence, as text |
 
-`file.mtime` and `file.size` come from the same stat querymatter already
-performs for cache freshness — reading them costs no extra I/O.
+`file.mtime`, `file.size`, and `file.word_count` all come from the same stat
+and parse querymatter already does for every record — reading them costs no
+extra I/O, cache or no cache.
+
+`file.body` is different: it's read from disk **lazily, at query time**,
+only for a query that actually references it (in `SELECT`, `WHERE`, or
+anywhere else), rather than being materialized for every record up front.
+That makes it the one `file.*` column with a real caveat — **under
+`--force-cache`** (which promises zero filesystem access for the whole run),
+or whenever the underlying file has moved, been deleted, or changed since it
+was cached, `file.body` can't be read and resolves to `NULL` rather than a
+wrong or stale answer. (Strict mode fails the whole query up front instead,
+naming `--force-cache`, so a `NULL` you didn't expect is never silently
+mistaken for "the file has an empty body"; pass `--lenient` to get the
+per-row `NULL` instead.)
 
 ```sql
-SELECT file.name WHERE file.mtime >= '-7d' ORDER BY file.mtime DESC
+SELECT file.name, file.word_count WHERE file.body REGEXP 'TODO|FIXME'
+```
+
+### Dates
+
+A frontmatter scalar that's a **strict ISO date or datetime** — `YYYY-MM-DD`
+(non-zero-padded forms like `2026-7-4` count too, since they're unambiguous)
+or a full RFC3339 timestamp — is auto-detected at ingest and compared
+**chronologically**, not lexicographically: `WHERE created < updated` sorts
+and filters by calendar order, not string order. A partial form (`2026`,
+`2026-07`) or anything else that isn't a clean ISO date stays a plain
+string, no change in behavior. A field that's a date in some files and an
+ordinary string in others (a stray `'TBD'`, say) still sorts sensibly — the
+comparison falls back to the values' ISO text, which orders identically to a
+chronological compare for well-formed dates.
+
+`DATE(x)` / `DATE(x, '<chrono-format>')` casts `x` to a date, for a
+non-ISO-formatted field: with no format argument it tries strict
+`%Y-%m-%d` then RFC3339 (the same detection ingest applies); with one, `x`
+is parsed against that [chrono strftime
+pattern](https://docs.rs/chrono/latest/chrono/format/strftime/index.html)
+instead. An already-`Date`/`DateTime` value passes through unchanged;
+anything `DATE()` can't parse yields `NULL` rather than an error.
+
+```sql
+SELECT jira, DATE(reported, '%m/%d/%Y') AS reported_on ORDER BY reported_on
 ```
 
 ### Relative-date literals
@@ -201,11 +248,13 @@ WHERE created >= '-7d'
 WHERE updated < 'today'
 ```
 
-This assumes frontmatter dates are stored as ISO-8601 strings, so they sort
-and compare correctly against these forms — the same string space
-`file.mtime` (above) lives in. A quoted string that doesn't match this
-grammar (`'draft'`) stays an ordinary string literal — no change in
-behavior.
+A relative-date literal always resolves to an ISO-8601 string, so it
+compares correctly whichever way the other side happens to be represented:
+chronologically against an auto-detected [`Date`/`DateTime`
+field](#dates), and lexicographically against a plain ISO string like
+`file.mtime` — both orderings agree for well-formed ISO text. A quoted
+string that doesn't match this grammar (`'draft'`) stays an ordinary string
+literal — no change in behavior.
 
 ### Unknown-column validation
 
@@ -496,6 +545,15 @@ querymatter init ~/notes
 querymatter init ~/notes --ttl 60   # shorten the TTL --fast consults (default 300s)
 ```
 
+A cache written by an older, schema-incompatible `querymatter` is treated
+exactly like a missing one for a normal (non-`--force-cache`) query: the
+next run does one full live rebuild and re-persists it in the current
+format, printing a one-line stderr warning explaining why that run was
+slower — no manual `querymatter init` needed. (`querymatter cache status`,
+which only ever reads the cache rather than rebuilding it, still hard-errors
+naming `init` for the same incompatible cache — see [Inspecting the
+cache](#inspecting-the-cache-querymatter-cache-status) below.)
+
 ### Automatic discovery
 
 A normal query run (no subcommand) searches **upward** from the current
@@ -616,8 +674,12 @@ Every key is optional; an absent key falls through to the next layer. Values
 resolve per key, independently:
 
 ```
-flag  >  environment  >  config file  >  built-in default
+flag  >  environment  >  vault config  >  config file  >  built-in default
 ```
+
+`vault config` is a `.querymatter.toml` a team can commit at the vault
+root, spliced in between the environment and this per-user file — see
+[Vault-level config](#vault-level-config-querymattertoml) below.
 
 So a configured `hidden = true` still scans hidden files when you pass no flag,
 and `--no-hidden` turns it back off for one run. Likewise a configured
@@ -659,6 +721,9 @@ header             true         (default)
 quiet              false        (default)
 ```
 
+A key supplied by a `.querymatter.toml` above the current directory shows
+its layer as `vault` in this same listing.
+
 A malformed config file, an unknown key, or an invalid value is a hard error
 naming the file — a typo must not silently do nothing. The file is read once
 per session, at resolution time: a `config set` run in another shell cannot
@@ -672,7 +737,37 @@ file, not what a different, already-running session resolved.)
 so any comments, blank lines, or key order you added by hand are **not**
 preserved. If you hand-edit `config.toml` (e.g. to add the comments in the
 example above), keep documentation like that in a separate note rather than
-relying on it surviving the next `config set`/`config unset`.
+relying on it surviving the next `config set`/`config unset`. (These
+commands only ever touch the per-user file — never the vault-level one,
+which is meant to be edited by hand and committed like any other shared
+config.)
+
+### Vault-level config (`.querymatter.toml`)
+
+A team can commit shared defaults at the vault root as `.querymatter.toml`,
+using the **same schema** as the per-user `config.toml` above (the same
+keys, the same strict "unknown key is an error" rule). It's discovered by
+walking **upward** from the current directory — the same direction (and
+starting point) `.querymatter/` cache discovery walks, but independently: a
+`.querymatter.toml` doesn't need a `.querymatter/` cache directory alongside
+it, so a team can commit shared defaults before anyone has ever run `init`,
+and an existing cache implies nothing about whether a `.querymatter.toml`
+exists above it.
+
+A key it sets outranks the per-user config file but still loses to a flag
+or environment variable — see the precedence chain above. A missing
+`.querymatter.toml` is not an error (resolution just falls through to the
+per-user config/default layers); one that's found but fails to parse is a
+hard error naming its path, exactly like a malformed per-user
+`config.toml`. There's no `config`-style subcommand for it — it's meant to
+be edited by hand and committed to version control, not written by
+`config set`.
+
+```toml
+# .querymatter.toml, committed at the vault root
+respect_gitignore = true
+exclude           = ["**/templates/**"]
+```
 
 ## Shell completions
 
@@ -681,16 +776,34 @@ relying on it surviving the next `config set`/`config unset`.
 flags, directories, and the allowed values of `--format`, `--table-style`, and
 the `config` keys.
 
+`querymatter completions --install [SHELL]` writes that same script directly
+into the shell's user completion directory instead of printing it — a
+one-step setup for `bash`/`zsh`/`fish`:
+
+| Shell | Installed to |
+| --- | --- |
+| `bash` | `~/.local/share/bash-completion/completions/querymatter` |
+| `zsh` | `~/.zsh/completions/_querymatter` — a directory of our own, since not every distro's default `${fpath[1]}` is user-writable; add `fpath=(~/.zsh/completions $fpath)` before `compinit` if it isn't already on your `$fpath` |
+| `fish` | `~/.config/fish/completions/querymatter.fish` |
+
+`SHELL` is optional with `--install` — it's auto-detected from `$SHELL`
+(recognizing `bash`/`zsh`/`fish`; anything else needs it named explicitly).
+Without `--install`, `SHELL` stays required, exactly as before.
+
+`--install` is pure convenience, so nothing about it is a hard error:
+whenever it can't determine your home directory, doesn't know a completion
+directory for the shell (`elvish`/`powershell` have no such convention to
+target), or hits a write failure (e.g. permissions), it prints a clear
+reason to stderr and **falls back to printing the script to stdout** —
+today's manual-redirect behavior, so you're never left empty-handed.
+
 ```sh
-# bash
+querymatter completions --install          # auto-detects $SHELL
+querymatter completions --install zsh      # explicit shell
+
+# the manual form still works for any of the five shells, e.g. to choose
+# your own path or target elvish/powershell:
 querymatter completions bash > ~/.local/share/bash-completion/completions/querymatter
-
-# zsh — anywhere on your $fpath (must be writable without sudo; not every
-# distro's default ${fpath[1]} is, so check first or point at a dir of
-# your own that's on $fpath)
-querymatter completions zsh > "${fpath[1]}/_querymatter"
-
-# fish
 querymatter completions fish > ~/.config/fish/completions/querymatter.fish
 ```
 
@@ -774,10 +887,11 @@ pseudo-columns, in SQL position; dot-command names, right after a leading
 `.`; config keys, right after `.set`/`.unset`; and saved-query names, right
 after `.query run`. It does not complete SQL keywords (`SELECT`, `WHERE`, and
 so on) — only schema-derived and dot-command/config-key/saved-query names.
-The column and saved-query-name lists are both one-time snapshots taken when
-the REPL starts, so a field discovered by a later `.reload`/`.refresh`, or a
-query saved from another shell (`querymatter query save`) mid-session, won't
-tab-complete until you restart the REPL.
+The column and saved-query-name lists are snapshots, but `.reload`,
+`.refresh`/`.refresh-all`, and `.query save` all refresh both of them live
+right afterward — a field just discovered by that rescan, a query you just
+saved (in this session or, since the refresh re-reads `queries.toml`, from
+another shell too) tab-completes immediately, no REPL restart needed.
 
 History records one entry per statement or dot-command, not per line: typing
 a SQL statement across several lines (ended by `;` or `\G`) or a dot-command
@@ -810,4 +924,7 @@ The full design spec is at
 The `.querymatter/` cache/vault feature described above has its own design
 doc at
 [`docs/superpowers/specs/2026-07-23-cache-vault-design.md`](docs/superpowers/specs/2026-07-23-cache-vault-design.md).
+`REGEXP`, dates, `file.body`/`file.word_count`, `completions --install`, and
+the vault-level config layer (above) are specified in
+[`docs/superpowers/specs/2026-07-25-query-power-bundle-design.md`](docs/superpowers/specs/2026-07-25-query-power-bundle-design.md).
 Further planned work is tracked in [`TODO.md`](TODO.md).
