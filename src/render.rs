@@ -126,15 +126,21 @@ pub enum Output {
 const BANNER_ASTERISKS: usize = 27;
 
 /// Renders `table` as `output` describes, using `style`'s borders when that
-/// resolves to [`Format::Table`].
-pub fn render(table: &ResultTable, output: Output, style: TableStyle) -> String {
+/// resolves to [`Format::Table`], and omitting the header row for
+/// table/md/csv/tsv when `header` is `false`.
+///
+/// JSON is keyed by column header regardless — dropping the header would
+/// leave nothing to key objects by — and vertical (`\G`) output shows
+/// right-aligned labels rather than a header row, so both ignore `header`
+/// entirely.
+pub fn render(table: &ResultTable, output: Output, style: TableStyle, header: bool) -> String {
     match output {
         Output::Vertical => render_vertical(table),
-        Output::Format(Format::Table) => render_table(table, style),
-        Output::Format(Format::Md) => render_markdown(table),
+        Output::Format(Format::Table) => render_table(table, style, header),
+        Output::Format(Format::Md) => render_markdown(table, header),
         Output::Format(Format::Json) => render_json(table),
-        Output::Format(Format::Csv) => render_delimited(table, b','),
-        Output::Format(Format::Tsv) => render_delimited(table, b'\t'),
+        Output::Format(Format::Csv) => render_delimited(table, b',', header),
+        Output::Format(Format::Tsv) => render_delimited(table, b'\t', header),
     }
 }
 
@@ -143,8 +149,8 @@ pub fn render(table: &ResultTable, output: Output, style: TableStyle) -> String 
 /// [`TableStyle::Ascii`] deliberately loads no preset at all rather than
 /// loading `ASCII_FULL`: `comfy-table`'s own default is what shipped, so
 /// leaving it untouched keeps the default output provably unchanged.
-fn render_table(table: &ResultTable, style: TableStyle) -> String {
-    let mut ct = new_table(table);
+fn render_table(table: &ResultTable, style: TableStyle, header: bool) -> String {
+    let mut ct = new_table(table, header);
     match style {
         TableStyle::Ascii => {}
         TableStyle::Unicode => {
@@ -196,17 +202,19 @@ fn render_vertical(table: &ResultTable) -> String {
 }
 
 /// Renders `table` as a Markdown table, independent of any [`TableStyle`].
-fn render_markdown(table: &ResultTable) -> String {
-    let mut ct = new_table(table);
+fn render_markdown(table: &ResultTable, header: bool) -> String {
+    let mut ct = new_table(table, header);
     ct.load_preset(ASCII_MARKDOWN);
     ct.trim_fmt()
 }
 
-/// A `comfy-table` [`Table`] carrying `table`'s headers and rows, with no
-/// preset loaded yet.
-fn new_table(table: &ResultTable) -> Table {
+/// A `comfy-table` [`Table`] carrying `table`'s headers (unless `header` is
+/// `false`) and rows, with no preset loaded yet.
+fn new_table(table: &ResultTable, header: bool) -> Table {
     let mut ct = Table::new();
-    ct.set_header(&table.headers);
+    if header {
+        ct.set_header(&table.headers);
+    }
     for row in &table.rows {
         ct.add_row(row.iter().map(Value::display));
     }
@@ -250,22 +258,25 @@ fn to_json(value: &Value) -> JsonValue {
     }
 }
 
-/// Renders `table` as `delimiter`-separated text with a header row.
-fn render_delimited(table: &ResultTable, delimiter: u8) -> String {
+/// Renders `table` as `delimiter`-separated text, with a header row unless
+/// `header` is `false`.
+fn render_delimited(table: &ResultTable, delimiter: u8, header: bool) -> String {
     // A `ResultTable` guarantees each row has exactly one cell per header
     // (see `query::ResultTable`'s doc comment), so `write_record`'s
     // field-count check can never fail here; the only realistic failure mode
     // left is an OOM writing to the in-memory buffer. Fail loudly rather than
     // silently producing blank output indistinguishable from "zero rows".
-    write_delimited(table, delimiter)
+    write_delimited(table, delimiter, header)
         .expect("ResultTable guarantees one cell per header (query::ResultTable)")
 }
 
-fn write_delimited(table: &ResultTable, delimiter: u8) -> csv::Result<String> {
+fn write_delimited(table: &ResultTable, delimiter: u8, header: bool) -> csv::Result<String> {
     let mut writer = WriterBuilder::new()
         .delimiter(delimiter)
         .from_writer(Vec::new());
-    writer.write_record(&table.headers)?;
+    if header {
+        writer.write_record(&table.headers)?;
+    }
     for row in &table.rows {
         writer.write_record(row.iter().map(Value::display))?;
     }
@@ -302,22 +313,96 @@ mod tests {
     }
     #[test]
     fn json_roundtrips() {
-        let s = render(&table(), Output::Format(Format::Json), TableStyle::Ascii);
+        let s = render(
+            &table(),
+            Output::Format(Format::Json),
+            TableStyle::Ascii,
+            true,
+        );
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v[0]["status"], "synced");
         assert_eq!(v[0]["Count"], 2);
     }
     #[test]
     fn csv_has_header_and_rows() {
-        let s = render(&table(), Output::Format(Format::Csv), TableStyle::Ascii);
+        let s = render(
+            &table(),
+            Output::Format(Format::Csv),
+            TableStyle::Ascii,
+            true,
+        );
         assert_eq!(s.lines().next().unwrap(), "status,Count");
         assert!(s.contains("synced,2"));
     }
     #[test]
     fn tsv_uses_tabs() {
-        let s = render(&table(), Output::Format(Format::Tsv), TableStyle::Ascii);
+        let s = render(
+            &table(),
+            Output::Format(Format::Tsv),
+            TableStyle::Ascii,
+            true,
+        );
         assert_eq!(s.lines().next().unwrap(), "status\tCount");
     }
+
+    #[test]
+    fn csv_no_header_omits_header_row() {
+        let s = render(
+            &table(),
+            Output::Format(Format::Csv),
+            TableStyle::Ascii,
+            false,
+        );
+        assert_eq!(s.lines().next().unwrap(), "synced,2");
+        assert!(!s.contains("status,Count"));
+    }
+
+    #[test]
+    fn tsv_no_header_omits_header_row() {
+        let s = render(
+            &table(),
+            Output::Format(Format::Tsv),
+            TableStyle::Ascii,
+            false,
+        );
+        assert_eq!(s.lines().next().unwrap(), "synced\t2");
+    }
+
+    #[test]
+    fn table_no_header_omits_header_row() {
+        let s = render(
+            &table(),
+            Output::Format(Format::Table),
+            TableStyle::Ascii,
+            false,
+        );
+        assert!(!s.contains("status"), "header must be gone, got:\n{s}");
+        assert!(s.contains("synced"));
+    }
+
+    #[test]
+    fn json_and_vertical_ignore_header_flag() {
+        let j_on = render(
+            &table(),
+            Output::Format(Format::Json),
+            TableStyle::Ascii,
+            true,
+        );
+        let j_off = render(
+            &table(),
+            Output::Format(Format::Json),
+            TableStyle::Ascii,
+            false,
+        );
+        assert_eq!(
+            j_on, j_off,
+            "JSON is keyed by header; the flag must not change it"
+        );
+        let v_on = render(&table(), Output::Vertical, TableStyle::Ascii, true);
+        let v_off = render(&table(), Output::Vertical, TableStyle::Ascii, false);
+        assert_eq!(v_on, v_off, "vertical labels are not a header row");
+    }
+
     #[test]
     fn format_from_str() {
         assert_eq!("md".parse::<Format>().unwrap(), Format::Md);
@@ -387,7 +472,8 @@ mod tests {
         insta::assert_snapshot!(render(
             &table(),
             Output::Format(Format::Table),
-            TableStyle::Ascii
+            TableStyle::Ascii,
+            true
         ));
     }
     #[test]
@@ -395,7 +481,8 @@ mod tests {
         insta::assert_snapshot!(render(
             &table(),
             Output::Format(Format::Md),
-            TableStyle::Ascii
+            TableStyle::Ascii,
+            true
         ));
     }
 
@@ -412,7 +499,7 @@ mod tests {
                 vec![Value::Str("draft".into()), Value::Str("x  ".into())],
             ],
         };
-        let s = render(&t, Output::Format(Format::Csv), TableStyle::Ascii);
+        let s = render(&t, Output::Format(Format::Csv), TableStyle::Ascii, true);
         assert!(
             s.lines().last().unwrap().ends_with("x  "),
             "trailing whitespace in the last cell must survive rendering, got: {s:?}"
@@ -449,6 +536,7 @@ mod tests {
             &variant_table(),
             Output::Format(Format::Json),
             TableStyle::Ascii,
+            true,
         );
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v[0]["n"], serde_json::Value::Null);
@@ -463,6 +551,7 @@ mod tests {
             &variant_table(),
             Output::Format(Format::Csv),
             TableStyle::Ascii,
+            true,
         );
         let data_line = s.lines().nth(1).unwrap();
         // Null -> empty cell; Bool/Float -> Value::display(); List -> its
@@ -477,6 +566,7 @@ mod tests {
             &variant_table(),
             Output::Format(Format::Table),
             TableStyle::Ascii,
+            true,
         );
         assert!(s.contains("true"));
         assert!(s.contains("1.5"));
@@ -505,7 +595,12 @@ mod tests {
 
     #[test]
     fn unicode_style_draws_box_characters() {
-        let s = render(&table(), Output::Format(Format::Table), TableStyle::Unicode);
+        let s = render(
+            &table(),
+            Output::Format(Format::Table),
+            TableStyle::Unicode,
+            true,
+        );
         assert!(s.contains('╭'), "expected rounded corners, got:\n{s}");
         assert!(
             s.contains('│'),
@@ -515,7 +610,12 @@ mod tests {
 
     #[test]
     fn plain_style_draws_no_borders() {
-        let s = render(&table(), Output::Format(Format::Table), TableStyle::Plain);
+        let s = render(
+            &table(),
+            Output::Format(Format::Table),
+            TableStyle::Plain,
+            true,
+        );
         assert!(!s.contains('|'), "expected no borders, got:\n{s}");
         assert!(!s.contains('+'), "expected no borders, got:\n{s}");
         assert!(s.contains("synced"), "content must survive, got:\n{s}");
@@ -529,10 +629,10 @@ mod tests {
     fn non_table_formats_ignore_style() {
         let t = table();
         for format in [Format::Json, Format::Csv, Format::Tsv, Format::Md] {
-            let baseline = render(&t, Output::Format(format), TableStyle::Ascii);
+            let baseline = render(&t, Output::Format(format), TableStyle::Ascii, true);
             for style in [TableStyle::Unicode, TableStyle::Compact, TableStyle::Plain] {
                 assert_eq!(
-                    render(&t, Output::Format(format), style),
+                    render(&t, Output::Format(format), style, true),
                     baseline,
                     "{format:?} must ignore {style:?}"
                 );
@@ -545,7 +645,8 @@ mod tests {
         insta::assert_snapshot!(render(
             &table(),
             Output::Format(Format::Table),
-            TableStyle::Unicode
+            TableStyle::Unicode,
+            true
         ));
     }
 
@@ -554,7 +655,8 @@ mod tests {
         insta::assert_snapshot!(render(
             &table(),
             Output::Format(Format::Table),
-            TableStyle::Compact
+            TableStyle::Compact,
+            true
         ));
     }
 
@@ -563,13 +665,14 @@ mod tests {
         insta::assert_snapshot!(render(
             &table(),
             Output::Format(Format::Table),
-            TableStyle::Plain
+            TableStyle::Plain,
+            true
         ));
     }
 
     #[test]
     fn vertical_snapshot() {
-        insta::assert_snapshot!(render(&table(), Output::Vertical, TableStyle::Ascii));
+        insta::assert_snapshot!(render(&table(), Output::Vertical, TableStyle::Ascii, true));
     }
 
     /// Column names are right-aligned to the widest header, so the `:`
@@ -584,7 +687,7 @@ mod tests {
                 Value::Str("draft".into()),
             ]],
         };
-        insta::assert_snapshot!(render(&t, Output::Vertical, TableStyle::Ascii));
+        insta::assert_snapshot!(render(&t, Output::Vertical, TableStyle::Ascii, true));
     }
 
     /// There are no headers worth showing without a row, and an empty result
@@ -595,7 +698,7 @@ mod tests {
             headers: vec!["status".into()],
             rows: vec![],
         };
-        assert_eq!(render(&t, Output::Vertical, TableStyle::Ascii), "");
+        assert_eq!(render(&t, Output::Vertical, TableStyle::Ascii, true), "");
     }
 
     /// Every format returns text with no trailing newline; the printers add
@@ -603,7 +706,7 @@ mod tests {
     /// assertion rather than inheriting confidence from the other formats.
     #[test]
     fn vertical_has_no_trailing_newline() {
-        let s = render(&table(), Output::Vertical, TableStyle::Ascii);
+        let s = render(&table(), Output::Vertical, TableStyle::Ascii, true);
         assert!(
             !s.ends_with('\n'),
             "must not end with a newline, got: {s:?}"
@@ -612,7 +715,7 @@ mod tests {
 
     #[test]
     fn vertical_renders_null_bool_float_list() {
-        let s = render(&variant_table(), Output::Vertical, TableStyle::Ascii);
+        let s = render(&variant_table(), Output::Vertical, TableStyle::Ascii, true);
         assert!(s.contains("b: true"), "got:\n{s}");
         assert!(s.contains("f: 1.5"), "got:\n{s}");
         assert!(s.contains("l: a, b"), "got:\n{s}");
@@ -626,15 +729,15 @@ mod tests {
     /// so the style knob has no say either.
     #[test]
     fn vertical_ignores_table_style() {
-        let baseline = render(&table(), Output::Vertical, TableStyle::Ascii);
+        let baseline = render(&table(), Output::Vertical, TableStyle::Ascii, true);
         for style in [TableStyle::Unicode, TableStyle::Compact, TableStyle::Plain] {
-            assert_eq!(render(&table(), Output::Vertical, style), baseline);
+            assert_eq!(render(&table(), Output::Vertical, style, true), baseline);
         }
     }
 
     #[test]
     fn vertical_numbers_rows_from_one() {
-        let s = render(&table(), Output::Vertical, TableStyle::Ascii);
+        let s = render(&table(), Output::Vertical, TableStyle::Ascii, true);
         assert!(s.contains(" 1. row "), "got:\n{s}");
         assert!(s.contains(" 2. row "), "got:\n{s}");
     }
