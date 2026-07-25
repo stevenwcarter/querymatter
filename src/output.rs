@@ -76,10 +76,10 @@ impl OutputSink {
     /// Closes a piped child's stdin (signaling EOF) and waits for it to
     /// exit, so a pager or filter has flushed and finished before the sink
     /// is dropped or replaced. No-op for [`Stdout`](Self::Stdout) and
-    /// [`File`](Self::File).
+    /// [`File`](Self::File). `Child::wait` already drops `stdin` itself
+    /// before waiting, so there's no need to do it here first.
     pub fn finish(&mut self) -> io::Result<()> {
         if let OutputSink::Command(child) = self {
-            drop(child.stdin.take()); // EOF to the child
             child.wait()?;
         }
         Ok(())

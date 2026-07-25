@@ -653,24 +653,27 @@ fn saved_query_names() -> Vec<String> {
 /// opens `path`, `Some("|cmd")` (the sqlite3 convention) pipes every later
 /// statement's result through `cmd` via the shell, and `None` (a bare
 /// `.output` or `.output stdout`) resets to stdout. Either way a one-line
-/// confirmation goes to stderr. Before any switch, [`OutputSink::finish`] is
-/// called on the *old* sink — closing and reaping a prior piped command so
-/// it isn't left running after its output has moved elsewhere. A path that
-/// can't be opened, or a command that can't be spawned, is reported on
-/// stderr instead, and `sink` is left exactly as it was — the session keeps
-/// running on whatever it was already writing to.
+/// confirmation goes to stderr.
+///
+/// The new target is opened (or spawned) *first*, without touching the old
+/// sink at all. Only once that succeeds is [`OutputSink::finish`] called on
+/// the *old* sink — closing and reaping a prior piped command — and `sink`
+/// swapped to the new value. A path that can't be opened, or a command that
+/// can't be spawned, is reported on stderr instead, and `sink` is left
+/// completely untouched: even a live piped command keeps running and
+/// accepting writes exactly as before the failed switch, since it was never
+/// finished in the first place.
 fn apply_output(sink: &mut OutputSink, target: Option<String>) {
-    if let Err(err) = sink.finish() {
-        eprintln!("querymatter: error finishing previous output: {err}");
-    }
     match target {
         None => {
+            finish_old_sink(sink);
             *sink = OutputSink::Stdout;
             eprintln!("querymatter: results on stdout");
         }
         Some(arg) => match arg.strip_prefix('|') {
             Some(cmd) => match OutputSink::open_command(cmd.trim()) {
                 Ok(opened) => {
+                    finish_old_sink(sink);
                     *sink = opened;
                     eprintln!("querymatter: piping results through {}", cmd.trim());
                 }
@@ -678,12 +681,24 @@ fn apply_output(sink: &mut OutputSink, target: Option<String>) {
             },
             None => match OutputSink::open_file(Path::new(&arg)) {
                 Ok(opened) => {
+                    finish_old_sink(sink);
                     *sink = opened;
                     eprintln!("querymatter: writing results to {arg}");
                 }
                 Err(err) => eprintln!("querymatter: cannot write to {arg}: {err}"),
             },
         },
+    }
+}
+
+/// Finishes `sink` (closing and reaping a live piped command; a no-op for
+/// [`OutputSink::Stdout`]/[`OutputSink::File`]) now that a replacement has
+/// already been opened successfully — [`apply_output`]'s shared "the switch
+/// is confirmed, retire the old target" step. A failure here is reported but
+/// not fatal: the caller is about to overwrite `sink` regardless.
+fn finish_old_sink(sink: &mut OutputSink) {
+    if let Err(err) = sink.finish() {
+        eprintln!("querymatter: error finishing previous output: {err}");
     }
 }
 
@@ -1611,6 +1626,30 @@ mod tests {
         assert!(matches!(sink, OutputSink::Stdout));
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "alpha\nbeta\n");
+    }
+
+    /// A failed switch must not disturb a *live* pipe: the new target is
+    /// opened before the old sink is touched, so a bad path after
+    /// `.output |cmd` leaves the original child's stdin open and still
+    /// writable — proving the fix for the "dead pipe after a failed switch"
+    /// finding (W45).
+    #[test]
+    fn apply_output_keeps_the_old_pipe_alive_when_the_new_target_fails_to_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("piped.txt");
+        let mut sink = OutputSink::Stdout;
+
+        apply_output(&mut sink, Some(format!("|cat > {}", path.display())));
+        assert!(matches!(sink, OutputSink::Command(_)));
+
+        apply_output(&mut sink, Some("/no/such/dir/x".to_string()));
+        assert!(matches!(sink, OutputSink::Command(_)));
+
+        // The original pipe is still alive and usable, not a dead sink whose
+        // stdin was already closed by a `finish()` on the failed switch.
+        sink.write_block("still alive").unwrap();
+        sink.finish().unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "still alive\n");
     }
 
     #[test]
