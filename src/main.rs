@@ -677,8 +677,10 @@ fn build_session(
         }
     };
 
-    for warning in &report.warnings {
-        eprintln!("querymatter: {warning}");
+    if !settings.quiet.value {
+        for warning in &report.warnings {
+            eprintln!("querymatter: {warning}");
+        }
     }
     let fallback = Settings::resolve(cli, &Config::default(), matches);
     Ok(Session::new(

@@ -303,6 +303,39 @@ fn malformed_frontmatter_warning_stays_off_stdout() {
 }
 
 #[test]
+fn quiet_suppresses_skipped_file_warnings_but_not_errors() {
+    let td = TempDir::new().unwrap();
+    fs::write(td.path().join("good.md"), "---\nstatus: draft\n---\n").unwrap();
+    fs::write(td.path().join("bad.md"), "---\n: : broken\n  bad\n---\n").unwrap();
+    let home = TempDir::new().unwrap();
+
+    // Without --quiet: the skipped-file warning appears on stderr.
+    qm(home.path())
+        .args(["-e", "SELECT status"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("querymatter:"));
+
+    // With --quiet: stderr carries no "querymatter: <warning>" chatter for the
+    // successful query (the "-- N rows" line is REPL-only, absent in -e mode).
+    qm(home.path())
+        .args(["--quiet", "-e", "SELECT status"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .stderr(predicates::str::is_empty());
+
+    // --quiet must never swallow a real query error.
+    qm(home.path())
+        .args(["--quiet", "-e", "SELECT FROM WHERE bogus((("])
+        .arg(td.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::is_empty().not());
+}
+
+#[test]
 fn batch_good_then_bad_exits_nonzero() {
     let td = tree();
     let home = TempDir::new().unwrap();
