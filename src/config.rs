@@ -41,6 +41,12 @@ pub struct Config {
     pub exclude: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lenient: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timer: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub header: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quiet: Option<bool>,
 }
 
 /// One configurable setting, named identically on the command line and in the
@@ -64,6 +70,12 @@ pub enum ConfigKey {
     Exclude,
     #[value(name = "lenient")]
     Lenient,
+    #[value(name = "timer")]
+    Timer,
+    #[value(name = "header")]
+    Header,
+    #[value(name = "quiet")]
+    Quiet,
 }
 
 /// What a [`ConfigKey`] accepts, for `config get` and for error messages.
@@ -86,7 +98,7 @@ impl fmt::Display for Allowed {
 
 impl ConfigKey {
     /// Every key, in listing order.
-    pub const ALL: [ConfigKey; 7] = [
+    pub const ALL: [ConfigKey; 10] = [
         ConfigKey::Format,
         ConfigKey::TableStyle,
         ConfigKey::Ext,
@@ -94,6 +106,9 @@ impl ConfigKey {
         ConfigKey::Hidden,
         ConfigKey::Exclude,
         ConfigKey::Lenient,
+        ConfigKey::Timer,
+        ConfigKey::Header,
+        ConfigKey::Quiet,
     ];
 
     /// The key's name, identical on the command line and in the TOML file.
@@ -106,6 +121,9 @@ impl ConfigKey {
             ConfigKey::Hidden => "hidden",
             ConfigKey::Exclude => "exclude",
             ConfigKey::Lenient => "lenient",
+            ConfigKey::Timer => "timer",
+            ConfigKey::Header => "header",
+            ConfigKey::Quiet => "quiet",
         }
     }
 
@@ -114,9 +132,12 @@ impl ConfigKey {
         match self {
             ConfigKey::Format => Allowed::OneOf(&["table", "json", "csv", "tsv", "md"]),
             ConfigKey::TableStyle => Allowed::OneOf(&["ascii", "unicode", "compact", "plain"]),
-            ConfigKey::RespectGitignore | ConfigKey::Hidden | ConfigKey::Lenient => {
-                Allowed::OneOf(&["true", "false"])
-            }
+            ConfigKey::RespectGitignore
+            | ConfigKey::Hidden
+            | ConfigKey::Lenient
+            | ConfigKey::Timer
+            | ConfigKey::Header
+            | ConfigKey::Quiet => Allowed::OneOf(&["true", "false"]),
             ConfigKey::Ext | ConfigKey::Exclude => Allowed::List,
         }
     }
@@ -190,6 +211,9 @@ pub fn set(config: &mut Config, key: ConfigKey, value: &str) -> anyhow::Result<(
         ConfigKey::Ext => config.ext = Some(split_list(value)),
         ConfigKey::Exclude => config.exclude = Some(parse_exclude_list(value)?),
         ConfigKey::Lenient => config.lenient = Some(parse_bool(key, value)?),
+        ConfigKey::Timer => config.timer = Some(parse_bool(key, value)?),
+        ConfigKey::Header => config.header = Some(parse_bool(key, value)?),
+        ConfigKey::Quiet => config.quiet = Some(parse_bool(key, value)?),
     }
     Ok(())
 }
@@ -216,6 +240,9 @@ pub fn unset(config: &mut Config, key: ConfigKey) {
         ConfigKey::Ext => config.ext = None,
         ConfigKey::Exclude => config.exclude = None,
         ConfigKey::Lenient => config.lenient = None,
+        ConfigKey::Timer => config.timer = None,
+        ConfigKey::Header => config.header = None,
+        ConfigKey::Quiet => config.quiet = None,
     }
 }
 
@@ -230,6 +257,9 @@ pub fn get(config: &Config, key: ConfigKey) -> Option<String> {
         ConfigKey::Ext => config.ext.as_ref().map(|list| list.join(",")),
         ConfigKey::Exclude => config.exclude.as_ref().map(|list| list.join(",")),
         ConfigKey::Lenient => config.lenient.map(|b| b.to_string()),
+        ConfigKey::Timer => config.timer.map(|b| b.to_string()),
+        ConfigKey::Header => config.header.map(|b| b.to_string()),
+        ConfigKey::Quiet => config.quiet.map(|b| b.to_string()),
     }
 }
 
@@ -564,5 +594,17 @@ mod tests {
             ConfigKey::Ext.allowed().to_string(),
             "a comma-separated list"
         );
+    }
+
+    #[test]
+    fn timer_header_quiet_round_trip() {
+        let mut config = Config::default();
+        set(&mut config, ConfigKey::Timer, "true").unwrap();
+        set(&mut config, ConfigKey::Header, "false").unwrap();
+        set(&mut config, ConfigKey::Quiet, "true").unwrap();
+        assert_eq!(get(&config, ConfigKey::Timer).as_deref(), Some("true"));
+        assert_eq!(get(&config, ConfigKey::Header).as_deref(), Some("false"));
+        assert_eq!(get(&config, ConfigKey::Quiet).as_deref(), Some("true"));
+        assert_eq!(ConfigKey::Timer.allowed().to_string(), "true, false");
     }
 }

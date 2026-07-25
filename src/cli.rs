@@ -133,6 +133,22 @@ pub struct Cli {
     #[arg(long, conflicts_with = "lenient")]
     pub no_lenient: bool,
 
+    /// Suppress the header row in table/csv/tsv/md output.
+    #[arg(long)]
+    pub no_header: bool,
+
+    /// Force the header row on, overriding a config `header = false`.
+    #[arg(long, conflicts_with = "no_header")]
+    pub header: bool,
+
+    /// Suppress non-error stderr chatter (skipped-file warnings, scan summaries).
+    #[arg(long, short = 'q')]
+    pub quiet: bool,
+
+    /// Force chatter on, overriding a config `quiet = true`.
+    #[arg(long, conflicts_with = "quiet")]
+    pub no_quiet: bool,
+
     /// Flags shared with `querymatter init` that shape the directory walk.
     #[command(flatten)]
     pub walk: WalkFlags,
