@@ -3078,3 +3078,87 @@ fn date_field_renders_verbatim_across_csv_json_table() {
         .success()
         .stdout(predicates::str::contains("2026-03-15"));
 }
+
+/// W43: a scalar function on the tested side of LIKE (matches `=`'s ability).
+#[test]
+fn where_scalar_expr_like() {
+    let home = TempDir::new().unwrap();
+    let td = tree(); // plans/a.md=draft, plans/b.md=synced, product/c.md=synced
+    qm(home.path())
+        .args([
+            "-e",
+            "SELECT status WHERE lower(status) LIKE '%draf%'",
+            "--format",
+            "csv",
+            td.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout("status\ndraft\n");
+}
+
+/// W43: IN and IS NULL accept a scalar expression on the tested side.
+#[test]
+fn where_scalar_expr_in_and_isnull() {
+    let home = TempDir::new().unwrap();
+    let td = tree();
+    qm(home.path())
+        .args([
+            "-e",
+            "SELECT status WHERE lower(status) IN ('draft','synced')",
+            "--format",
+            "csv",
+            td.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout("status\ndraft\nsynced\nsynced\n");
+}
+
+/// W43: MEMBER OF now accepts a bare column (and any expression) on the left —
+/// impossible before (the left had to be a literal).
+#[test]
+fn where_column_member_of_list() {
+    let home = TempDir::new().unwrap();
+    let td = TempDir::new().unwrap();
+    for (p, s) in [
+        (
+            "x.md",
+            "---\nlead: mobile\ntags:\n  - mobile\n  - web\n---\n",
+        ),
+        ("y.md", "---\nlead: infra\ntags:\n  - web\n---\n"),
+    ] {
+        let f = td.path().join(p);
+        fs::create_dir_all(f.parent().unwrap()).unwrap();
+        fs::write(f, s).unwrap();
+    }
+    qm(home.path())
+        .args([
+            "-e",
+            "SELECT lead WHERE lead MEMBER OF(tags)",
+            "--format",
+            "csv",
+            td.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout("lead\nmobile\n"); // x.md: 'mobile' is in tags; y.md: 'infra' is not
+}
+
+/// W43 invariant I1: `file.body` referenced through the WIDENED predicate funnel
+/// must still be detected, so `--force-cache` still fails fast (W56 guard).
+#[test]
+fn force_cache_file_body_like_still_errors_after_widening() {
+    let home = TempDir::new().unwrap();
+    let td = tree();
+    qm(home.path())
+        .args([
+            "-e",
+            "SELECT file.name WHERE file.body LIKE '%draft%'",
+            "--force-cache",
+            td.path().to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("force-cache"));
+}

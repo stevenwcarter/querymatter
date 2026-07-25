@@ -255,26 +255,29 @@ fn rewrite_expr_literals(expr: &mut Expr, now: SystemTime) {
 }
 
 /// Walks a `WHERE` predicate tree's literal positions for
-/// [`rewrite_relative_dates`]: both `Compare` operands, every `IN` list
-/// element, `MEMBER OF`'s literal, and `Regexp`'s `Expr` operand (mirroring
-/// `Compare`, since that operand is just as general). `Like`'s pattern is a
-/// plain `String` (never a `Literal`) and `IsNull` carries no literal at
-/// all, so neither needs a rewrite — `Regexp`'s pattern is the same plain
-/// `String` as `Like`'s, for the same reason.
+/// [`rewrite_relative_dates`]: both `Compare` operands, `Like`/`In`/`IsNull`'s
+/// tested `Expr` (and every `IN` list element), `MemberOf`'s value `Expr`,
+/// and `Regexp`'s `Expr` operand — all now equally general, so the widened
+/// operands can carry a relative-date literal the same as `Compare` always
+/// could. `Like`/`Regexp`'s pattern is a plain `String` (never a `Literal`),
+/// so neither needs a rewrite of its own beyond the tested expression.
 fn rewrite_predicate_literals(pred: &mut Predicate, now: SystemTime) {
     match pred {
         Predicate::Compare(l, _, r) => {
             rewrite_expr_literals(l, now);
             rewrite_expr_literals(r, now);
         }
-        Predicate::In(_, literals, _) => {
+        Predicate::Like(expr, _, _) | Predicate::IsNull(expr, _) => {
+            rewrite_expr_literals(expr, now)
+        }
+        Predicate::In(expr, literals, _) => {
+            rewrite_expr_literals(expr, now);
             for lit in literals {
                 rewrite_literal(lit, now);
             }
         }
-        Predicate::MemberOf(lit, _, _) => rewrite_literal(lit, now),
+        Predicate::MemberOf(value, _, _) => rewrite_expr_literals(value, now),
         Predicate::Regexp(expr, _, _) => rewrite_expr_literals(expr, now),
-        Predicate::Like(..) | Predicate::IsNull(..) => {}
         Predicate::And(a, b) | Predicate::Or(a, b) => {
             rewrite_predicate_literals(a, now);
             rewrite_predicate_literals(b, now);
@@ -686,11 +689,15 @@ fn expr_columns(expr: &Expr) -> Vec<&ColRef> {
 fn predicate_columns(pred: &Predicate) -> Vec<&ColRef> {
     match pred {
         Predicate::Compare(l, _, r) => expr_columns(l).into_iter().chain(expr_columns(r)).collect(),
-        Predicate::Like(col, _, _) | Predicate::In(col, _, _) | Predicate::IsNull(col, _) => {
-            vec![col]
+        Predicate::Like(expr, _, _) | Predicate::In(expr, _, _) | Predicate::IsNull(expr, _) => {
+            expr_columns(expr)
         }
         Predicate::Regexp(expr, _, _) => expr_columns(expr),
-        Predicate::MemberOf(_, col, _) => vec![col],
+        Predicate::MemberOf(value, col, _) => {
+            let mut cols = expr_columns(value);
+            cols.push(col);
+            cols
+        }
         Predicate::And(a, b) | Predicate::Or(a, b) => predicate_columns(a)
             .into_iter()
             .chain(predicate_columns(b))
@@ -1681,8 +1688,8 @@ fn eval_predicate(record: &Record, pred: &Predicate, disk_reads_allowed: bool) -
             op,
             &eval_expr(record, right, disk_reads_allowed),
         ),
-        Predicate::Like(col, pattern, negated) => {
-            let value = resolve_col(record, col, disk_reads_allowed);
+        Predicate::Like(expr, pattern, negated) => {
+            let value = eval_expr(record, expr, disk_reads_allowed);
             if value.is_null() {
                 return None;
             }
@@ -1697,27 +1704,32 @@ fn eval_predicate(record: &Record, pred: &Predicate, disk_reads_allowed: bool) -
             let base = Some(regexp_matches(&value.display(), pattern));
             maybe_negate(base, *negated)
         }
-        Predicate::In(col, literals, negated) => {
-            let value = resolve_col(record, col, disk_reads_allowed);
+        Predicate::In(expr, literals, negated) => {
+            let value = eval_expr(record, expr, disk_reads_allowed);
             if value.is_null() {
                 return None;
             }
             let base = Some(literals.iter().any(|lit| element_equals(&value, lit)));
             maybe_negate(base, *negated)
         }
-        Predicate::MemberOf(lit, col, negated) => {
+        Predicate::MemberOf(value_expr, col, negated) => {
+            let needle = eval_expr(record, value_expr, disk_reads_allowed);
             let value = resolve_col(record, col, disk_reads_allowed);
             let Value::List(items) = &value else {
                 // Unknown for both a `Null` field and a non-list value —
                 // never a hard `false` — mirroring `In`'s null-column rule.
                 return None;
             };
-            let base = Some(items.iter().any(|el| element_equals(el, lit)));
+            let base = Some(
+                items
+                    .iter()
+                    .any(|el| eval_compare(el, &CmpOp::Eq, &needle) == Some(true)),
+            );
             maybe_negate(base, *negated)
         }
         // The only predicate that is determinate — and true — for a NULL field.
-        Predicate::IsNull(col, negated) => {
-            Some(resolve_col(record, col, disk_reads_allowed).is_null() != *negated)
+        Predicate::IsNull(expr, negated) => {
+            Some(eval_expr(record, expr, disk_reads_allowed).is_null() != *negated)
         }
         Predicate::And(a, b) => three_valued_and(
             eval_predicate(record, a, disk_reads_allowed),
