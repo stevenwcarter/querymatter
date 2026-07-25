@@ -388,7 +388,7 @@ fn execute_ungrouped<'a>(
     }
 
     let order = resolve_order_targets(&q.order_by, &headers)?;
-    rows.sort_by(|(ra, rowa), (rb, rowb)| {
+    let cmp = |(ra, rowa): &(&Record, Vec<Value>), (rb, rowb): &(&Record, Vec<Value>)| {
         order
             .iter()
             .map(|(target, desc)| {
@@ -398,9 +398,22 @@ fn execute_ungrouped<'a>(
             })
             .find(|ord| *ord != Ordering::Equal)
             .unwrap_or(Ordering::Equal)
-    });
+    };
 
     let offset = q.offset.unwrap_or(0);
+    let rows = match q.limit {
+        // Only the `offset + limit` window can ever be observed, so select
+        // just that many rows instead of fully sorting the rest.
+        Some(limit) => {
+            let n = offset.saturating_add(limit).min(rows.len());
+            bounded_top_k(rows, n, cmp)
+        }
+        None => {
+            rows.sort_by(cmp);
+            rows
+        }
+    };
+
     let rows: Vec<Vec<Value>> = rows
         .into_iter()
         .map(|(_, row)| row)
@@ -409,6 +422,39 @@ fn execute_ungrouped<'a>(
         .collect();
 
     Ok(ResultTable { headers, rows })
+}
+
+/// The smallest `n` of `items` under `cmp`, sorted, with ties broken by each
+/// item's original position — byte-identical to a full stable sort by `cmp`
+/// followed by `.take(n)`. Used by [`execute_ungrouped`] and
+/// [`execute_grouped`] to bound `ORDER BY` + `LIMIT` to the requested window.
+///
+/// `n` is clamped to `items.len()`. Selection runs in expected `O(len)` via
+/// [`slice::select_nth_unstable_by`] rather than a full `O(len log len)`
+/// sort, so cost tracks the requested window (`offset + limit`) rather than
+/// the whole result.
+fn bounded_top_k<T>(items: Vec<T>, n: usize, cmp: impl Fn(&T, &T) -> Ordering) -> Vec<T> {
+    let mut indexed: Vec<(usize, T)> = items.into_iter().enumerate().collect();
+    let len = indexed.len();
+    let n = n.min(len);
+
+    // Folding the original index in as a final ascending tiebreaker turns
+    // `cmp` (which may rank equal-key items as ties) into a strict total
+    // order, so the partial selection below and the final sort agree with
+    // what a *stable* sort by `cmp` alone would produce: equal-key items
+    // keep their input order, exactly as `Vec::sort_by`'s stability
+    // guarantees for a full sort.
+    let total_order = |a: &(usize, T), b: &(usize, T)| cmp(&a.1, &b.1).then(a.0.cmp(&b.0));
+
+    if n == 0 {
+        return Vec::new();
+    }
+    if n < len {
+        indexed.select_nth_unstable_by(n - 1, &total_order);
+        indexed.truncate(n);
+    }
+    indexed.sort_by(&total_order);
+    indexed.into_iter().map(|(_, item)| item).collect()
 }
 
 /// Drops duplicate projected rows in place for `SELECT DISTINCT`, keeping
@@ -472,7 +518,7 @@ fn execute_grouped<'a>(
         .map(|(_, row, order_keys)| (row, order_keys))
         .collect();
 
-    rows.sort_by(|(_, oa), (_, ob)| {
+    let cmp = |(_, oa): &(Vec<Value>, Vec<Value>), (_, ob): &(Vec<Value>, Vec<Value>)| {
         order
             .iter()
             .zip(oa)
@@ -480,9 +526,22 @@ fn execute_grouped<'a>(
             .map(|(((_, desc), va), vb)| order_cmp(va, vb, *desc))
             .find(|ord| *ord != Ordering::Equal)
             .unwrap_or(Ordering::Equal)
-    });
+    };
 
     let offset = q.offset.unwrap_or(0);
+    let rows = match q.limit {
+        // Only the `offset + limit` window of groups can ever be observed,
+        // so select just that many instead of fully sorting the rest.
+        Some(limit) => {
+            let n = offset.saturating_add(limit).min(rows.len());
+            bounded_top_k(rows, n, cmp)
+        }
+        None => {
+            rows.sort_by(cmp);
+            rows
+        }
+    };
+
     let rows: Vec<Vec<Value>> = rows
         .into_iter()
         .map(|(row, _)| row)
@@ -1989,6 +2048,77 @@ mod tests {
         assert_eq!(t.rows, vec![vec![Value::Str("synced".into())]]);
     }
     #[test]
+    fn order_by_limit_preserves_tie_input_order_like_full_sort() {
+        // Five rows share the same `status` key, so a full stable sort
+        // leaves ORDER BY status LIMIT 3 with the first 3 rows in *input*
+        // (scan) order. A non-stable top-k (e.g. an unstable binary-heap
+        // selection with no tiebreaker) would be free to return any 3 of
+        // the 5 equal-key rows in any order — this is the load-bearing pin
+        // that the bounded top-k must match a stable full sort exactly.
+        let rows = [
+            rec("s", "s/a.md", &[("status", Value::Str("x".into()))]),
+            rec("s", "s/b.md", &[("status", Value::Str("x".into()))]),
+            rec("s", "s/c.md", &[("status", Value::Str("x".into()))]),
+            rec("s", "s/d.md", &[("status", Value::Str("x".into()))]),
+            rec("s", "s/e.md", &[("status", Value::Str("x".into()))]),
+        ];
+        let q = parse("SELECT file.name ORDER BY status LIMIT 3").unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec![Value::Str("a.md".into())],
+                vec![Value::Str("b.md".into())],
+                vec![Value::Str("c.md".into())],
+            ]
+        );
+    }
+    #[test]
+    fn order_by_limit_offset_window_matches_full_sort() {
+        // n: a=5, b=3, c=4, d=1, e=2. A full stable sort by n DESC is
+        // a(5), c(4), b(3), e(2), d(1); .skip(2).take(3) is b, e, d — the
+        // bounded top-k (which only ever materializes offset + limit rows)
+        // must land on the exact same window.
+        let rows = [
+            rec("s", "s/a.md", &[("n", Value::Int(5))]),
+            rec("s", "s/b.md", &[("n", Value::Int(3))]),
+            rec("s", "s/c.md", &[("n", Value::Int(4))]),
+            rec("s", "s/d.md", &[("n", Value::Int(1))]),
+            rec("s", "s/e.md", &[("n", Value::Int(2))]),
+        ];
+        let q = parse("SELECT file.name ORDER BY n DESC LIMIT 3 OFFSET 2").unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec![Value::Str("b.md".into())],
+                vec![Value::Str("e.md".into())],
+                vec![Value::Str("d.md".into())],
+            ]
+        );
+    }
+    #[test]
+    fn order_by_limit_zero_returns_no_rows() {
+        let q = parse("SELECT status ORDER BY status LIMIT 0").unwrap();
+        let t = execute(&q, recs().iter(), false).unwrap();
+        assert!(t.rows.is_empty());
+    }
+    #[test]
+    fn order_by_limit_exceeds_row_count_returns_all_rows_in_order() {
+        // `recs()` has only 3 rows; LIMIT 100 must behave exactly like no
+        // LIMIT at all rather than panicking or truncating oddly.
+        let q = parse("SELECT status ORDER BY status LIMIT 100").unwrap();
+        let t = execute(&q, recs().iter(), false).unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec![Value::Str("draft".into())],
+                vec![Value::Str("synced".into())],
+                vec![Value::Str("synced".into())],
+            ]
+        );
+    }
+    #[test]
     fn distinct_dedups_projection() {
         let rows = [
             rec("s", "s/a/1.md", &[]),
@@ -3300,6 +3430,58 @@ mod agg_tests {
         .unwrap();
         let t = execute(&q, rows.iter(), false).unwrap();
         assert_eq!(t.rows, vec![vec![Value::Str("x".into()), Value::Int(2)]]);
+    }
+    #[test]
+    fn grouped_order_by_limit_preserves_tie_input_order_like_full_sort() {
+        // Five single-row groups with status a..e (scanned out of order).
+        // GROUP BY pre-sorts groups by key tuple (alphabetically) before
+        // ORDER BY runs, and every group ties on count(*) == 1, so a full
+        // stable sort by count(*) DESC leaves that alphabetical order
+        // untouched — LIMIT 3 must return a, b, c, matching the ungrouped
+        // tie-stability pin above.
+        let rows = [
+            rec("s/c.md", "c", "010"),
+            rec("s/a.md", "a", "010"),
+            rec("s/e.md", "e", "010"),
+            rec("s/b.md", "b", "010"),
+            rec("s/d.md", "d", "010"),
+        ];
+        let q =
+            parse("SELECT status, count(*) AS n GROUP BY status ORDER BY count(*) DESC LIMIT 3")
+                .unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec![Value::Str("a".into()), Value::Int(1)],
+                vec![Value::Str("b".into()), Value::Int(1)],
+                vec![Value::Str("c".into()), Value::Int(1)],
+            ]
+        );
+    }
+    #[test]
+    fn grouped_order_by_limit_offset_window_matches_full_sort() {
+        // Same five tied groups as above; LIMIT 2 OFFSET 1 must equal
+        // full-sort(a, b, c, d, e).skip(1).take(2) = b, c.
+        let rows = [
+            rec("s/c.md", "c", "010"),
+            rec("s/a.md", "a", "010"),
+            rec("s/e.md", "e", "010"),
+            rec("s/b.md", "b", "010"),
+            rec("s/d.md", "d", "010"),
+        ];
+        let q = parse(
+            "SELECT status, count(*) AS n GROUP BY status ORDER BY count(*) DESC LIMIT 2 OFFSET 1",
+        )
+        .unwrap();
+        let t = execute(&q, rows.iter(), false).unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec![Value::Str("b".into()), Value::Int(1)],
+                vec![Value::Str("c".into()), Value::Int(1)],
+            ]
+        );
     }
     #[test]
     fn group_by_key_does_not_collide_ambiguous_concatenations() {
