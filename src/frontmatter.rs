@@ -56,6 +56,24 @@ pub fn extract(content: &str) -> Extract {
     Extract::Fields { fields, word_count }
 }
 
+/// The Markdown body after the frontmatter fence — the exact text [`extract`]
+/// counts words from, exposed standalone for `file.body`'s eval-time disk
+/// read ([`crate::query::exec::read_body`]), which re-parses a freshly-read
+/// file fresh rather than reusing anything cached (design W56: only the word
+/// count is ever persisted, never the body text itself).
+///
+/// `None` when `content`'s frontmatter fence, if present, isn't valid YAML —
+/// the same condition [`extract`] reports as [`Extract::Invalid`]; a file
+/// with no fence at all (or an empty one) still yields `Some` (gray_matter
+/// treats the whole input as body content in that case, matching `extract`'s
+/// [`Extract::None`] behavior for word-counting purposes).
+pub fn body(content: &str) -> Option<String> {
+    Matter::<YAML>::new()
+        .parse::<Pod>(content)
+        .ok()
+        .map(|parsed| parsed.content)
+}
+
 /// Converts gray_matter's dynamic `Pod` into our `Value`.
 ///
 /// Scalars map directly; arrays recurse into `Value::List`; a nested mapping
@@ -220,6 +238,21 @@ mod tests {
             panic!("expected Fields")
         };
         assert_eq!(word_count, 0);
+    }
+
+    // Task 7 (W56 part 2): `body` exposes the same post-fence text
+    // `word_count` was already counting, standalone — for `file.body`'s
+    // eval-time re-read.
+    #[test]
+    fn body_returns_the_text_after_the_fence() {
+        let c = "---\nstatus: draft\n---\nTODO fix this\n";
+        assert_eq!(body(c).as_deref(), Some("TODO fix this"));
+    }
+
+    #[test]
+    fn body_is_none_for_invalid_frontmatter_yaml() {
+        let c = "---\nkey: : : broken\n  bad indent\n---\n";
+        assert_eq!(body(c), None);
     }
 
     #[test]

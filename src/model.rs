@@ -1,7 +1,7 @@
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use indexmap::IndexMap;
 use std::cmp::Ordering;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 /// A dynamically-typed value read from Markdown YAML frontmatter.
@@ -197,6 +197,11 @@ pub enum FileAttr {
     Size,
     /// The Markdown body's word count (see [`crate::frontmatter::extract`]).
     WordCount,
+    /// The Markdown body text itself (the content after the frontmatter
+    /// fence), read from disk lazily at query-eval time — never cached (see
+    /// [`crate::query::exec::read_body`]). This is the one `FileAttr` this
+    /// module's own pure [`Record::file_attr`] cannot resolve.
+    Body,
 }
 
 /// One queryable row: a Markdown file's YAML frontmatter fields, plus its
@@ -211,6 +216,17 @@ pub struct Record {
     mtime: SystemTime,
     size: u64,
     word_count: usize,
+    /// The file's absolute path, for [`FileAttr::Body`]'s eval-time disk
+    /// read (see [`crate::query::exec::read_body`]) — every other `file.*`
+    /// attribute is resolved relative to `root` instead (see `path`/`folder`
+    /// below), but a real read needs the whole path. Both live producers
+    /// ([`crate::store::scan_root`]) and cache-backed ones
+    /// ([`crate::cache::records_from`]) always pass an already-canonicalized
+    /// `path` into [`Record::new`], so this is absolute in practice; a
+    /// hand-built test `Record` that passes a relative `path` just gets that
+    /// path back (harmless, since no test constructs a `Record` this way and
+    /// then reads its body).
+    abs_path: PathBuf,
 }
 
 impl Record {
@@ -254,6 +270,7 @@ impl Record {
             mtime,
             size,
             word_count,
+            abs_path: path.to_path_buf(),
         }
     }
 
@@ -277,6 +294,15 @@ impl Record {
     /// Resolves a `file.*` pseudo-column to its value: `Name`/`Path`/`Folder`/
     /// `Ext` are strings, `Mtime` is an RFC3339 UTC string, and `Size`/
     /// `WordCount` are integer counts.
+    ///
+    /// `Body` always resolves to `Value::Null` here — this function is pure
+    /// (`&self -> Value`, no I/O, no disk-access gate), so it cannot perform
+    /// the real read `file.body` needs. The query executor special-cases
+    /// `ColRef::File(FileAttr::Body)` *before* it would ever reach this
+    /// match, resolving it via [`crate::query::exec::read_body`] against
+    /// [`Record::abs_path`] instead (see `query::exec::resolve_col`). This
+    /// arm exists only so the match stays exhaustive over [`FileAttr`];
+    /// reaching it for a real `file.body` query would be a caller bug.
     pub fn file_attr(&self, attr: FileAttr) -> Value {
         match attr {
             FileAttr::Name => Value::Str(self.name.clone()),
@@ -286,7 +312,16 @@ impl Record {
             FileAttr::Mtime => Value::Str(system_time_to_iso(self.mtime)),
             FileAttr::Size => Value::Int(self.size as i64),
             FileAttr::WordCount => Value::Int(self.word_count as i64),
+            FileAttr::Body => Value::Null,
         }
+    }
+
+    /// This file's absolute path, for `file.body`'s eval-time disk read (see
+    /// [`crate::query::exec::read_body`]). Every other `file.*` attribute is
+    /// resolved relative to the scan root instead; only a real read needs
+    /// the whole path.
+    pub fn abs_path(&self) -> &Path {
+        &self.abs_path
     }
 
     /// The cached Markdown body word count, as a raw `usize` rather than a
@@ -596,6 +631,30 @@ mod record_tests {
         );
         assert_eq!(r.file_attr(FileAttr::WordCount), Value::Int(5));
         assert_eq!(r.word_count(), 5);
+    }
+    #[test]
+    fn abs_path_is_the_path_record_new_was_given() {
+        // `abs_path` carries whatever `path` `Record::new` was constructed
+        // with verbatim (both real producers always pass an already
+        // canonicalized/absolute path — see the field's doc comment).
+        let r = Record::new(
+            Path::new("/vault"),
+            Path::new("/vault/plans/a.md"),
+            IndexMap::new(),
+            SystemTime::UNIX_EPOCH,
+            0,
+            0,
+        );
+        assert_eq!(r.abs_path(), Path::new("/vault/plans/a.md"));
+    }
+    #[test]
+    fn file_attr_body_is_a_null_sentinel() {
+        // `file_attr` is pure and cannot perform the real disk read
+        // `file.body` needs; reaching this arm directly (rather than through
+        // `query::exec::resolve_col`'s `read_body` special case) always
+        // yields `Null`, never the real body text.
+        let r = rec();
+        assert_eq!(r.file_attr(FileAttr::Body), Value::Null);
     }
     #[test]
     fn field_present_and_missing() {

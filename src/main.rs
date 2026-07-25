@@ -38,7 +38,7 @@ use chrono::{DateTime, Utc};
 use clap::{ArgMatches, CommandFactory, FromArgMatches};
 use directories::BaseDirs;
 
-use crate::cache::CacheSummary;
+use crate::cache::{CacheSummary, Freshness};
 use crate::cli::{
     CacheAction, CacheArgs, Cli, Command, CompletionsArgs, ConfigAction, ConfigArgs, ExplainArgs,
     InitArgs, QueryAction, QueryArgs,
@@ -980,12 +980,14 @@ fn build_session(
     // touches the per-user config file, so reverting a key must still honor
     // a vault-supplied value for it.
     let fallback = Settings::resolve(cli, &vault_config, &Config::default(), matches);
-    Ok(Session::new(
-        Box::new(store),
-        settings,
-        fallback,
-        session_vault,
-    ))
+    let mut session = Session::new(Box::new(store), settings, fallback, session_vault);
+    // `file.body` (design W56) is the one column a query can evaluate that
+    // needs live disk access beyond the store already built above;
+    // `--force-cache` promises zero such access for the whole run, so gate
+    // it here from the same `cli.freshness()` that decided how `store` was
+    // loaded.
+    session.set_disk_reads_allowed(cli.freshness() != Freshness::ForceCache);
+    Ok(session)
 }
 
 /// Runs `input` via [`run_statements`] and maps its total row count to an

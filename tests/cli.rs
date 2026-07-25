@@ -1051,6 +1051,142 @@ fn force_cache_returns_stale_value_after_on_disk_edit() {
     );
 }
 
+/// Task 7 (W56 part 2), test 1 (brief): `WHERE file.body LIKE '%TODO%'`
+/// matches a fixture whose body contains it, end to end through the real
+/// CLI/cache path (not just the in-process executor unit tests).
+#[test]
+fn file_body_like_matches_a_fixture_containing_todo() {
+    let td = TempDir::new().unwrap();
+    fs::write(
+        td.path().join("has-todo.md"),
+        "---\nstatus: draft\n---\nTODO fix this\n",
+    )
+    .unwrap();
+    fs::write(
+        td.path().join("no-todo.md"),
+        "---\nstatus: draft\n---\nall done\n",
+    )
+    .unwrap();
+    let home = TempDir::new().unwrap();
+
+    let out = qm(home.path())
+        .current_dir(td.path())
+        .args([
+            "-e",
+            "SELECT file.name WHERE file.body LIKE '%TODO%'",
+            "--format",
+            "csv",
+            "--no-cache",
+            ".",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    assert_eq!(s.lines().last().unwrap().trim(), "has-todo.md");
+}
+
+/// Task 7 (W56 part 2), test 2 (brief): under `--force-cache`, a `file.body`
+/// query yields NULL under `--lenient`, and a clear diagnostic (nonzero exit,
+/// stderr naming `--force-cache`) in strict (default) mode — never a wrong
+/// answer.
+#[test]
+fn file_body_under_force_cache_is_null_lenient_and_diagnostic_strict() {
+    let td = TempDir::new().unwrap();
+    fs::write(
+        td.path().join("a.md"),
+        "---\nstatus: draft\n---\nTODO fix this\n",
+    )
+    .unwrap();
+    let home = TempDir::new().unwrap();
+
+    qm(home.path())
+        .arg("init")
+        .arg(td.path())
+        .assert()
+        .success();
+
+    // Strict (default): the whole query fails fast with a clear diagnostic.
+    qm(home.path())
+        .current_dir(td.path())
+        .args(["-e", "SELECT file.body", "--force-cache"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("force-cache"));
+
+    // --lenient: the query still runs, resolving file.body to NULL (empty
+    // in CSV) rather than erroring or returning stale/wrong text.
+    let out = qm(home.path())
+        .current_dir(td.path())
+        .args([
+            "-e",
+            "SELECT file.body",
+            "--force-cache",
+            "--lenient",
+            "--format",
+            "csv",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    assert_eq!(
+        s.lines().last().unwrap().trim(),
+        "\"\"",
+        "file.body under --force-cache --lenient must be NULL (empty in CSV), got: {s:?}"
+    );
+}
+
+/// Task 7 (W56 part 2), test 3 (brief): a frontmatter-only query performs NO
+/// body read — proven by deleting every source file after `init` builds the
+/// cache, then running a normal-freshness (not `--force-cache`) query that
+/// never references `file.body`. If evaluating an unrelated column ever
+/// eagerly touched `file.body`'s disk read, `--force-cache` (which forbids
+/// ANY filesystem access beyond the initial cache read) would surface it as
+/// a hard failure — the source files are gone, so any such access errors.
+/// Plain per-file freshness isn't a suitable vehicle for this check: it
+/// would itself notice the deletion and drop the row (a correct, unrelated
+/// behavior — see `new_file_added_and_deleted_file_dropped` in
+/// `cache.rs`), giving a false signal either way.
+#[test]
+fn frontmatter_only_query_needs_no_body_read_after_files_deleted() {
+    let td = TempDir::new().unwrap();
+    fs::write(
+        td.path().join("a.md"),
+        "---\nstatus: draft\n---\nTODO fix this\n",
+    )
+    .unwrap();
+    let home = TempDir::new().unwrap();
+
+    qm(home.path())
+        .arg("init")
+        .arg(td.path())
+        .assert()
+        .success();
+
+    fs::remove_file(td.path().join("a.md")).unwrap();
+
+    let out = qm(home.path())
+        .current_dir(td.path())
+        .args(["-e", "SELECT status", "--format", "csv", "--force-cache"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    assert_eq!(
+        s.lines().last().unwrap().trim(),
+        "draft",
+        "a frontmatter-only --force-cache query must succeed from the cache \
+         alone, even though the source file is gone; got: {s:?}"
+    );
+}
+
 #[test]
 fn default_freshness_reflects_on_disk_edit() {
     // Spec §4 default mode: accurate per-file (mtime+size) freshness

@@ -713,11 +713,13 @@ mod tests {
 
         let parsed = crate::query::parse("SELECT roadmap").unwrap();
         assert!(
-            crate::query::execute_with_schema(&parsed, store.records(), &schema, false).is_err(),
+            crate::query::execute_with_schema(&parsed, store.records(), &schema, false, true)
+                .is_err(),
             "a product-only column must be unknown under a plans-scoped default-mode query"
         );
         assert!(
-            crate::query::execute_with_schema(&parsed, store.records(), &schema, true).is_ok(),
+            crate::query::execute_with_schema(&parsed, store.records(), &schema, true, true)
+                .is_ok(),
             "--lenient must bypass the subtree-scoped validation surface"
         );
     }

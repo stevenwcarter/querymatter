@@ -30,12 +30,23 @@ pub struct Session {
     /// is cache-backed. `None` for a live (no-cache) session, in which case
     /// [`refresh`](Self::refresh) falls back to an in-memory-only reload.
     vault: Option<PathBuf>,
+    /// Whether a query may touch the filesystem beyond the store it was
+    /// built with — gates `file.body` (design W56), `false` only under
+    /// `Freshness::ForceCache`. Fixed for this session's whole lifetime (set
+    /// once by [`Self::set_disk_reads_allowed`] right after construction,
+    /// from the CLI's freshness mode); unlike `.format`/`.style`/etc. there
+    /// is no dot-command to change it mid-session. Defaults to `true`
+    /// (unrestricted) so every existing [`Session::new`] call site — none of
+    /// which cares about `--force-cache` — keeps its pre-W56 behavior.
+    disk_reads_allowed: bool,
 }
 
 impl Session {
     /// Builds a session over `store` with `settings`, keeping `fallback` —
     /// the resolution with the per-user config file removed but the vault
-    /// layer kept — for `.unset`.
+    /// layer kept — for `.unset`. Disk reads default to allowed; a caller
+    /// that built `store` under `Freshness::ForceCache` must follow up with
+    /// [`Self::set_disk_reads_allowed`].
     pub fn new(
         store: Box<dyn RecordStore>,
         settings: Settings,
@@ -47,7 +58,17 @@ impl Session {
             settings,
             fallback,
             vault,
+            disk_reads_allowed: true,
         }
+    }
+
+    /// Restricts (or permits) this session's queries from reading `file.body`
+    /// off disk (see the `disk_reads_allowed` field's doc comment above).
+    /// Called once by `main::build_session` right after construction, from
+    /// the CLI's resolved [`crate::cache::Freshness`]; never toggled
+    /// mid-session.
+    pub fn set_disk_reads_allowed(&mut self, allowed: bool) {
+        self.disk_reads_allowed = allowed;
     }
 
     /// The format rendered results are produced in.
@@ -209,6 +230,7 @@ impl Session {
             self.store.records(),
             &schema,
             self.settings.lenient.value,
+            self.disk_reads_allowed,
         )
         .with_context(|| format!("failed to execute query: {sql}"))
     }

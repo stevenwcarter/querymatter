@@ -632,6 +632,7 @@ fn file_attr_from_str(name: &str) -> Result<FileAttr, ParseError> {
         "mtime" => Ok(FileAttr::Mtime),
         "size" => Ok(FileAttr::Size),
         "word_count" => Ok(FileAttr::WordCount),
+        "body" => Ok(FileAttr::Body),
         other => Err(ParseError::BadColumn(format!(
             "unknown file attribute `file.{other}`"
         ))),
@@ -1288,6 +1289,22 @@ mod tests {
             q.select[0].expr,
             SelectExpr::Expr(Expr::Col(ColRef::File(FileAttr::WordCount)))
         );
+    }
+    // Task 7 (W56 part 2): `file.body` recognized the same way as the other
+    // `file.*` pseudo-columns.
+    #[test]
+    fn file_body_pseudo_column() {
+        let q = parse("SELECT file.body WHERE file.body LIKE '%TODO%'").unwrap();
+        assert_eq!(
+            q.select[0].expr,
+            SelectExpr::Expr(Expr::Col(ColRef::File(FileAttr::Body)))
+        );
+        match q.filter.unwrap() {
+            Predicate::Like(ColRef::File(FileAttr::Body), pattern, false) => {
+                assert_eq!(pattern, "%TODO%")
+            }
+            p => panic!("unexpected {p:?}"),
+        }
     }
     #[test]
     fn where_ops_and_boolean() {

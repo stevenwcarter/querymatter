@@ -811,6 +811,7 @@ fn file_attr_label(attr: FileAttr) -> &'static str {
         FileAttr::Mtime => "file.mtime",
         FileAttr::Size => "file.size",
         FileAttr::WordCount => "file.word_count",
+        FileAttr::Body => "file.body",
     }
 }
 

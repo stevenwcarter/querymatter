@@ -35,7 +35,7 @@ const PROMPT: &str = "querymatter> ";
 const CONTINUATION_PROMPT: &str = "   ...> ";
 /// The `file.*` pseudo-columns every record exposes, independent of
 /// frontmatter (kept in sync with [`crate::model::FileAttr`]'s labels).
-const FILE_COLUMNS: [&str; 7] = [
+const FILE_COLUMNS: [&str; 8] = [
     "file.name",
     "file.path",
     "file.folder",
@@ -43,6 +43,7 @@ const FILE_COLUMNS: [&str; 7] = [
     "file.mtime",
     "file.size",
     "file.word_count",
+    "file.body",
 ];
 /// The history file's name under the REPL's state/data directory.
 const HISTORY_FILE: &str = "history.txt";
@@ -2190,11 +2191,12 @@ mod tests {
     /// itself is a faithful proxy for that printed output — and, since
     /// `print_describe`'s `Some(name) if FILE_COLUMNS.contains(&name) => ...`
     /// guard reads the same const, this also pins that `.describe
-    /// file.mtime`/`.describe file.size`/`.describe file.word_count` route to
-    /// the pseudo-column path rather than falling through to "unknown field"
-    /// (Task 4 follow-up; `file.word_count` added Task 6/W56).
+    /// file.mtime`/`.describe file.size`/`.describe file.word_count`/
+    /// `.describe file.body` route to the pseudo-column path rather than
+    /// falling through to "unknown field" (Task 4 follow-up; `file.word_count`
+    /// added Task 6/W56; `file.body` added Task 7/W56).
     #[test]
-    fn file_columns_include_mtime_size_and_word_count() {
+    fn file_columns_include_mtime_size_word_count_and_body() {
         assert_eq!(
             FILE_COLUMNS,
             [
@@ -2205,6 +2207,7 @@ mod tests {
                 "file.mtime",
                 "file.size",
                 "file.word_count",
+                "file.body",
             ]
         );
     }
@@ -2212,13 +2215,15 @@ mod tests {
     /// `.describe file.size`/`.describe file.word_count` must not falsely
     /// claim `Str` (Task 4 follow-up; extended Task 6/W56): both are
     /// `Int`-typed pseudo-columns, and every other `file.*` column —
-    /// including `file.mtime`, an ISO-8601 UTC string — stays `Str`.
+    /// including `file.mtime`, an ISO-8601 UTC string, and `file.body`
+    /// (Task 7/W56) — stays `Str`.
     #[test]
     fn describe_file_column_reports_accurate_types() {
         assert!(describe_file_column_line("file.size").contains("type Int"));
         assert!(describe_file_column_line("file.word_count").contains("type Int"));
         assert!(describe_file_column_line("file.mtime").contains("type Str"));
         assert!(describe_file_column_line("file.name").contains("type Str"));
+        assert!(describe_file_column_line("file.body").contains("type Str"));
     }
 
     #[test]
