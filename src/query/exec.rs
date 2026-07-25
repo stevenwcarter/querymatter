@@ -2624,6 +2624,48 @@ mod tests {
     }
 
     #[test]
+    fn relative_date_resolves_inside_order_by_case_arm() {
+        // Regression: `rewrite_relative_dates` must also walk
+        // `OrderTarget::Expr` — without that, a relative-date literal
+        // nested inside an `ORDER BY CASE ...` condition would never be
+        // visited by the rewrite at all (only `SELECT`/`WHERE`/`HAVING`
+        // were walked before this task) and would reach `literal_value` as
+        // an unresolved `Literal::RelativeDate`, panicking via its
+        // `unreachable!()`.
+        let now = fixed_now();
+        let recent = rec(
+            "s",
+            "s/a.md",
+            &[("created", Value::Str("2026-07-20".into()))],
+        );
+        let old = rec(
+            "s",
+            "s/b.md",
+            &[("created", Value::Str("2026-06-01".into()))],
+        );
+        let q = parse(
+            "SELECT file.name ORDER BY CASE WHEN created >= '-7d' THEN 0 ELSE 1 END, file.name",
+        )
+        .unwrap();
+        // Must not panic; the recent row must sort first.
+        let t = execute_with_schema_at(
+            &q,
+            [&old, &recent].into_iter(),
+            &["created".to_string()],
+            false,
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec![Value::Str("a.md".into())],
+                vec![Value::Str("b.md".into())],
+            ]
+        );
+    }
+
+    #[test]
     fn extreme_offset_magnitude_falls_back_to_str_and_does_not_panic() {
         // Each of these is malformed/out-of-bound enough that
         // `RelDate::parse` must reject it, so it stays a plain
