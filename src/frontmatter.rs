@@ -58,13 +58,33 @@ pub fn extract(content: &str) -> Extract {
 fn pod_to_value(pod: Pod) -> Value {
     match pod {
         Pod::Null => Value::Null,
-        Pod::String(s) => Value::Str(s),
+        Pod::String(s) => detect_scalar(&s),
         Pod::Integer(i) => Value::Int(i),
         Pod::Float(f) => Value::Float(f),
         Pod::Boolean(b) => Value::Bool(b),
         Pod::Array(items) => Value::List(items.into_iter().map(pod_to_value).collect()),
         Pod::Hash(map) => Value::Map(map.into_iter().map(|(k, v)| (k, pod_to_value(v))).collect()),
     }
+}
+
+/// A frontmatter scalar string becomes a [`Value::Date`] (strict `%Y-%m-%d`)
+/// or [`Value::DateTime`] (strict RFC3339); anything else stays a
+/// [`Value::Str`]. Strict: chrono's own parse must accept the whole string,
+/// so partial forms (`2026`, `2026-07`) and invalid dates (bad month/day)
+/// fall through to `Str`.
+///
+/// `%Y-%m-%d` doesn't require zero-padded month/day — `2026-7-4` parses as a
+/// valid date and is deliberately accepted as `Value::Date`: it's
+/// unambiguous, and rejecting it would need an extra regex pre-check for no
+/// real benefit (see `non_zero_padded_date_is_still_a_date` below).
+fn detect_scalar(s: &str) -> Value {
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return Value::Date(d);
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Value::DateTime(dt.with_timezone(&chrono::Utc));
+    }
+    Value::Str(s.to_string())
 }
 
 #[cfg(test)]
@@ -133,6 +153,48 @@ mod tests {
         };
         assert_eq!(m.get("prd"), Some(&Value::Str("010".into())));
     }
+    #[test]
+    fn strict_iso_strings_become_dates_others_stay_strings() {
+        use chrono::NaiveDate;
+        assert_eq!(
+            detect_scalar("2026-07-24"),
+            Value::Date(NaiveDate::from_ymd_opt(2026, 7, 24).unwrap())
+        );
+        assert!(matches!(
+            detect_scalar("2026-07-24T10:00:00Z"),
+            Value::DateTime(_)
+        ));
+        // non-dates stay strings/ints — I5
+        for s in [
+            "2026",
+            "2026-07",
+            "1.2.3",
+            "v1",
+            "draft",
+            "2026-13-01",
+            "2026-07-99",
+        ] {
+            assert_eq!(
+                detect_scalar(s),
+                Value::Str(s.to_string()),
+                "{s} must stay a string"
+            );
+        }
+    }
+
+    // Decision (task 2, W57): non-zero-padded month/day is unambiguous, so we
+    // accept it as a Date rather than adding a regex pre-check to force
+    // zero-padding. Pinned here so a future change to detect_scalar can't
+    // silently flip this.
+    #[test]
+    fn non_zero_padded_date_is_still_a_date() {
+        use chrono::NaiveDate;
+        assert_eq!(
+            detect_scalar("2026-7-4"),
+            Value::Date(NaiveDate::from_ymd_opt(2026, 7, 4).unwrap())
+        );
+    }
+
     #[test]
     fn nested_mapping_becomes_value_map() {
         let c = "---\nestimate:\n  low: 5\n  high: 10\n---\n";
