@@ -11,6 +11,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use directories::ProjectDirs;
@@ -62,6 +63,7 @@ const DOT_COMMAND_NAMES: &[&str] = &[
     ".format",
     ".style",
     ".header",
+    ".timer",
     ".output",
     ".settings",
     ".set",
@@ -108,6 +110,9 @@ pub enum DotCommand {
     /// `.header [on|off]` — set (`Some`) or report (`None`) whether results
     /// include a header row.
     Header(Option<bool>),
+    /// `.timer [on|off]` — set (`Some`) or report (`None`) whether the
+    /// `-- N rows` line includes the query's elapsed time.
+    Timer(Option<bool>),
     /// `.output [path]` — redirect subsequent statement results to `path`
     /// (`Some`), or reset to stdout (`None`, from a bare `.output` or an
     /// explicit `.output stdout`).
@@ -278,6 +283,10 @@ pub fn parse_dot(line: &str) -> DotCommand {
             Some(value) => DotCommand::Header(value),
             None => DotCommand::Unknown(line.to_string()),
         },
+        "timer" => match parse_on_off(words.next()) {
+            Some(value) => DotCommand::Timer(value),
+            None => DotCommand::Unknown(line.to_string()),
+        },
         "output" => match words.next() {
             None => DotCommand::Output(None),
             Some(arg) if arg.eq_ignore_ascii_case("stdout") => DotCommand::Output(None),
@@ -314,8 +323,8 @@ pub fn parse_dot(line: &str) -> DotCommand {
 }
 
 /// Parses an optional `on`/`off` argument (case-insensitive), shared by every
-/// dot-command that toggles a boolean setting — `.header` here, and `.timer`
-/// in a later task. The outer `Option` is `None` for an unrecognized argument
+/// dot-command that toggles a boolean setting — `.header` and `.timer`. The
+/// outer `Option` is `None` for an unrecognized argument
 /// (any word but `on`/`off`), which the caller maps to an error; the inner
 /// `Option` is `None` for a bare command with no argument at all, meaning
 /// "report the current state" rather than change it.
@@ -431,12 +440,14 @@ pub fn run(mut session: Session) -> anyhow::Result<()> {
 /// [`dispatch_query`] (each statement inside a `.query run <name>`'s saved
 /// SQL), so both paths format results identically.
 fn run_statement(session: &Session, statement: &Statement, sink: &mut OutputSink) {
+    let start = Instant::now();
     match session.render_statement_counted(statement) {
         Ok((rendered, count)) => {
             if let Err(err) = sink.write_block(&rendered) {
                 eprintln!("querymatter: failed to write results: {err}");
             }
-            eprintln!("{}", row_count_line(count));
+            let elapsed = session.timer().then(|| start.elapsed());
+            eprintln!("{}", row_count_line(count, elapsed));
         }
         Err(err) => eprintln!("querymatter: {err:#}"),
     }
@@ -445,9 +456,16 @@ fn run_statement(session: &Session, statement: &Statement, sink: &mut OutputSink
 /// The `-- N rows` line printed to stderr after a REPL statement's result,
 /// distinguishing a genuinely empty result from a mistake (REPL-only; batch
 /// and `-e` mode never print this). Pulled out as a pure function so the
-/// singular/plural wording is unit-tested without a TTY.
-fn row_count_line(n: usize) -> String {
-    format!("-- {n} row{}", if n == 1 { "" } else { "s" })
+/// singular/plural wording is unit-tested without a TTY. `elapsed` is
+/// `Some` only when `.timer` is on, in which case the query's wall-clock
+/// time is appended in seconds to 3 decimal places; `None` reproduces
+/// exactly the untimed line.
+fn row_count_line(n: usize, elapsed: Option<Duration>) -> String {
+    let plural = if n == 1 { "" } else { "s" };
+    match elapsed {
+        Some(d) => format!("-- {n} row{plural} ({:.3}s)", d.as_secs_f64()),
+        None => format!("-- {n} row{plural}"),
+    }
 }
 
 /// The startup banner [`run`] prints to stdout on entering the REPL: the
@@ -491,16 +509,15 @@ fn history_entry(line: &Line) -> Option<String> {
 /// and returning `true` when the REPL should exit (`.quit`/`.exit`).
 ///
 /// stdout/stderr policy: reference/inspection output (`.help`, `.schema`,
-/// `.settings`, `.query list`, and `.format`'s/`.style`'s/`.header`'s reports
-/// of the current format/style/header setting) goes to stdout; the
-/// `.reload`/`.refresh`/
-/// `.refresh-all` reports, `.set`/`.unset` confirmations, `.output`'s
-/// confirmation, and all error messages (unknown command, bad format, bad
-/// style, bad key, missing argument, unknown saved-query name) go to stderr,
-/// keeping stdout clean for piping. `.query run <name>`'s query results
-/// follow a typed statement's own policy instead — the rendered result goes
-/// wherever `sink` points, and the `-- N rows` line stays on stderr (see
-/// [`run_statement`]).
+/// `.settings`, `.query list`, and `.format`'s/`.style`'s/`.header`'s/
+/// `.timer`'s reports of the current format/style/header/timer setting) goes
+/// to stdout; the `.reload`/`.refresh`/`.refresh-all` reports, `.set`/`.unset`
+/// confirmations, `.output`'s confirmation, and all error messages (unknown
+/// command, bad format, bad style, bad key, missing argument, unknown
+/// saved-query name) go to stderr, keeping stdout clean for piping. `.query
+/// run <name>`'s query results follow a typed statement's own policy instead
+/// — the rendered result goes wherever `sink` points, and the `-- N rows`
+/// line stays on stderr (see [`run_statement`]).
 fn dispatch_dot(cmd: DotCommand, session: &mut Session, sink: &mut OutputSink) -> bool {
     match cmd {
         DotCommand::Help => print_help(),
@@ -513,6 +530,10 @@ fn dispatch_dot(cmd: DotCommand, session: &mut Session, sink: &mut OutputSink) -
         DotCommand::Header(Some(on)) => session.set_header(on),
         DotCommand::Header(None) => {
             println!("header: {}", if session.header() { "on" } else { "off" });
+        }
+        DotCommand::Timer(Some(on)) => session.set_timer(on),
+        DotCommand::Timer(None) => {
+            println!("timer: {}", if session.timer() { "on" } else { "off" });
         }
         DotCommand::Output(target) => apply_output(sink, target),
         DotCommand::Reload => report_reload(session),
@@ -717,6 +738,10 @@ fn help_text() -> String {
     let _ = writeln!(
         text,
         "  .header [on|off]   show, or set, whether results include a header row"
+    );
+    let _ = writeln!(
+        text,
+        "  .timer [on|off]    show, or set, whether the row-count line shows elapsed query time"
     );
     let _ = writeln!(
         text,
@@ -1592,9 +1617,28 @@ mod tests {
 
     #[test]
     fn row_count_line_pluralizes_correctly() {
-        assert_eq!(row_count_line(0), "-- 0 rows");
-        assert_eq!(row_count_line(1), "-- 1 row");
-        assert_eq!(row_count_line(2), "-- 2 rows");
+        assert_eq!(row_count_line(0, None), "-- 0 rows");
+        assert_eq!(row_count_line(1, None), "-- 1 row");
+        assert_eq!(row_count_line(2, None), "-- 2 rows");
+    }
+
+    /// `row_count_line(_, None)` must produce exactly today's output — every
+    /// non-timed caller passes `None` — and `Some(d)` appends the elapsed
+    /// seconds to 3 decimal places.
+    #[test]
+    fn row_count_line_appends_elapsed_when_timed() {
+        assert_eq!(row_count_line(3, None), "-- 3 rows");
+        assert_eq!(row_count_line(1, None), "-- 1 row");
+        assert_eq!(
+            row_count_line(3, Some(Duration::from_millis(12))),
+            "-- 3 rows (0.012s)"
+        );
+    }
+
+    #[test]
+    fn parses_timer_on_off() {
+        assert_eq!(parse_dot(".timer on"), DotCommand::Timer(Some(true)));
+        assert_eq!(parse_dot(".timer"), DotCommand::Timer(None));
     }
 
     /// The startup banner must name the record count and hint at both

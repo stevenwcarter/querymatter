@@ -63,6 +63,11 @@ impl Session {
         self.settings.header.value
     }
 
+    /// Whether the REPL reports elapsed query time on the `-- N rows` line.
+    pub fn timer(&self) -> bool {
+        self.settings.timer.value
+    }
+
     /// Every setting, for `.settings`.
     pub fn settings(&self) -> &Settings {
         &self.settings
@@ -242,6 +247,15 @@ impl Session {
     /// only.
     pub fn set_header(&mut self, on: bool) {
         self.settings.header = Resolved {
+            value: on,
+            source: Source::Session,
+        };
+    }
+
+    /// Switches whether the REPL reports elapsed query time, for the rest of
+    /// this session only.
+    pub fn set_timer(&mut self, on: bool) {
+        self.settings.timer = Resolved {
             value: on,
             source: Source::Session,
         };
