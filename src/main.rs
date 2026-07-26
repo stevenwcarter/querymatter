@@ -387,6 +387,17 @@ fn run_init(args: &InitArgs, config: &Config, matches: &ArgMatches) -> anyhow::R
 
     let report = cache::build_vault(&base, &opts, args.ttl)?;
 
+    // Surface each skipped file's reason (unreadable content, invalid YAML
+    // frontmatter, or a rejected traversal) rather than only the bare count
+    // below — otherwise the skip is silent data loss: the file is thereafter
+    // permanently absent from the cache with no way to learn why. Mirrors
+    // `build_session`'s identical warning surfacing for the live-scan path.
+    if !settings.quiet.value {
+        for warning in &report.warnings {
+            eprintln!("querymatter: {warning}");
+        }
+    }
+
     // The cache build already succeeded; a prompt hiccup (e.g. a stdin read
     // error) must not fail the command, so the git-ignore offer is
     // best-effort — downgraded to a warning rather than propagated.
