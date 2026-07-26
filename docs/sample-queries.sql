@@ -30,6 +30,9 @@ SELECT file.name FROM 'work/**' WHERE file.body REGEXP 'TODO|FIXME' ORDER BY fil
 -- Nested dotted paths walk into YAML mappings
 SELECT jira, estimate.low, estimate.high FROM 'work/plans/**' WHERE estimate.high > 12 ORDER BY jira LIMIT 5;
 
+-- A second nested-path example: series.name/series.book (about 1 in 4 reading records has a series)
+SELECT title, series.name, series.book FROM 'reading/**' WHERE series.name IS NOT NULL ORDER BY series.name, series.book LIMIT 5;
+
 -- MEMBER OF: literal on the left, list-valued column on the right
 SELECT name FROM 'starwars/characters/**' WHERE 'EMPIRE' MEMBER OF(episodes) AND NOT 'NEWHOPE' MEMBER OF(episodes) ORDER BY name;
 
@@ -66,6 +69,9 @@ SELECT substr(name, 1, 8) || '...' AS clipped FROM 'starwars/starships/**' ORDER
 -- Arithmetic in SELECT and WHERE
 SELECT title, prep_minutes + cook_minutes AS total_minutes FROM 'recipes/**' WHERE prep_minutes + cook_minutes > 110 ORDER BY total_minutes DESC LIMIT 5;
 
+-- Arithmetic beyond +: subtraction, multiplication, division, modulo
+SELECT title, cook_minutes - prep_minutes AS active_diff, prep_minutes * 2 AS doubled_prep, cook_minutes / 2 AS half_cook, servings % 2 AS servings_parity FROM 'recipes/**' ORDER BY title LIMIT 5;
+
 -- COALESCE picks the first non-null argument
 SELECT jira, COALESCE(epic, 'unassigned') AS epic FROM 'work/plans/**' ORDER BY jira LIMIT 5;
 
@@ -84,8 +90,14 @@ SELECT status, count(*) AS n FROM 'work/**' GROUP BY status ORDER BY n DESC;
 -- Aggregates with HAVING on an alias
 SELECT cuisine, count(*) AS n, avg(prep_minutes) AS avg_prep FROM 'recipes/**' GROUP BY cuisine HAVING n >= 35 ORDER BY n DESC;
 
+-- GROUP BY a SELECT alias key, HAVING on both an aggregate and a key-column leaf, ORDER BY a bare aggregate
+SELECT status AS s, count(*) AS n FROM 'work/**' GROUP BY s HAVING count(*) >= 35 AND s != 'draft' ORDER BY count(*) DESC;
+
 -- min / max / sum without GROUP BY
 SELECT min(height_cm) AS shortest, max(height_cm) AS tallest, sum(mass_kg) AS total_mass FROM 'starwars/characters/**';
+
+-- count(col) only counts non-null rows — many reading records are unrated
+SELECT count(rating) AS rated FROM 'reading/**';
 
 -- count(distinct col)
 SELECT count(distinct author) AS authors FROM 'reading/**';

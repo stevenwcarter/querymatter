@@ -228,6 +228,32 @@ SELECT jira, estimate.low, estimate.high FROM 'work/plans/**' WHERE estimate.hig
 +---------+--------------+---------------+
 ```
 
+## A second nested-path example: series.name/series.book
+
+About 1 in 4 `reading/` records has a `series:` mapping — a second dotted-path
+example alongside `estimate.*`, this time two levels of a nested mapping
+projected together.
+
+```sql
+SELECT title, series.name, series.book FROM 'reading/**' WHERE series.name IS NOT NULL ORDER BY series.name, series.book LIMIT 5;
+```
+
+```
++----------------------+--------------+-------------+
+| title                | series.name  | series.book |
++===================================================+
+| The Hollow Harbor    | Archive Wars | 1           |
+|----------------------+--------------+-------------|
+| The Distant Mountain | Archive Wars | 2           |
+|----------------------+--------------+-------------|
+| The Glass Orchard    | Archive Wars | 2           |
+|----------------------+--------------+-------------|
+| The Silent Orchard   | Archive Wars | 3           |
+|----------------------+--------------+-------------|
+| The Glass Garden     | Archive Wars | 3           |
++----------------------+--------------+-------------+
+```
+
 ## MEMBER OF: literal on the left
 
 A quoted literal tests membership in a list-valued column — here, characters
@@ -489,6 +515,32 @@ SELECT title, prep_minutes + cook_minutes AS total_minutes FROM 'recipes/**' WHE
 +---------------------------+---------------+
 ```
 
+## Arithmetic beyond +: subtraction, multiplication, division, modulo
+
+All five arithmetic operators in one query: `-`, `*`, `/`, and `%` alongside
+the `+` already shown above. Arithmetic is computed in `f64`, so `/` and `%`
+can produce a fractional result (`half_cook`) even from integer inputs.
+
+```sql
+SELECT title, cook_minutes - prep_minutes AS active_diff, prep_minutes * 2 AS doubled_prep, cook_minutes / 2 AS half_cook, servings % 2 AS servings_parity FROM 'recipes/**' ORDER BY title LIMIT 5;
+```
+
+```
++------------------------+-------------+--------------+-----------+-----------------+
+| title                  | active_diff | doubled_prep | half_cook | servings_parity |
++===================================================================================+
+| Creamy Beef Soup       | -23         | 82           | 9         | 1               |
+|------------------------+-------------+--------------+-----------+-----------------|
+| Creamy Beef Soup       | 10          | 26           | 11.5      | 0               |
+|------------------------+-------------+--------------+-----------+-----------------|
+| Creamy Beef Stir-Fry   | 68          | 36           | 43        | 1               |
+|------------------------+-------------+--------------+-----------+-----------------|
+| Creamy Beef Stir-Fry   | 36          | 30           | 25.5      | 0               |
+|------------------------+-------------+--------------+-----------+-----------------|
+| Creamy Chicken Noodles | 49          | 64           | 40.5      | 0               |
++------------------------+-------------+--------------+-----------+-----------------+
+```
+
 ## COALESCE picks the first non-null argument
 
 `epic` is missing on some work docs; `COALESCE` falls back to a literal.
@@ -667,6 +719,32 @@ SELECT cuisine, count(*) AS n, avg(prep_minutes) AS avg_prep FROM 'recipes/**' G
 +----------+----+--------------------+
 ```
 
+## GROUP BY an alias, HAVING both leaf forms, ORDER BY a bare aggregate
+
+One query showing three related capabilities at once: `GROUP BY s` groups by
+a `SELECT AS` alias of a plain column (`status AS s`); `HAVING` combines an
+aggregate leaf (`count(*) >= 35`) and a grouping-key leaf (`s != 'draft'`)
+with `AND`; `ORDER BY count(*) DESC` sorts by a bare aggregate call, with no
+alias needed.
+
+```sql
+SELECT status AS s, count(*) AS n FROM 'work/**' GROUP BY s HAVING count(*) >= 35 AND s != 'draft' ORDER BY count(*) DESC;
+```
+
+```
++-----------+-----+
+| s         | n   |
++=================+
+| synced    | 122 |
+|-----------+-----|
+| done      | 90  |
+|-----------+-----|
+| in-review | 85  |
+|-----------+-----|
+| blocked   | 48  |
++-----------+-----+
+```
+
 ## min / max / sum without GROUP BY
 
 ```sql
@@ -679,6 +757,23 @@ SELECT min(height_cm) AS shortest, max(height_cm) AS tallest, sum(mass_kg) AS to
 +=================================+
 | 66       | 228     | 2698       |
 +----------+---------+------------+
+```
+
+## count(col) only counts non-null rows
+
+Unlike `count(*)`, `count(rating)` skips rows where `rating` is absent —
+`reading/` has plenty of unrated (queued/abandoned) books.
+
+```sql
+SELECT count(rating) AS rated FROM 'reading/**';
+```
+
+```
++-------+
+| rated |
++=======+
+| 95    |
++-------+
 ```
 
 ## count(distinct col)
