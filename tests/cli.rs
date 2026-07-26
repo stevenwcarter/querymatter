@@ -3441,3 +3441,62 @@ fn md_output_unchanged_by_terminal_sanitizer() {
         .success()
         .stdout(predicate::str::contains("\u{1b}"));
 }
+
+/// Task 4 (B4) characterization: a downstream reader that closes its end of
+/// the pipe early (`| head`) must NOT make querymatter panic (Rust's default
+/// SIGPIPE=SIG_IGN turns the resulting write into an `EPIPE` `io::Error`,
+/// which `println!`/`write!` on stdout convert into a panic) or print
+/// `Broken pipe` noise to stderr from the streaming result path. Uses raw
+/// `std::process::Command`, NOT `assert_cmd`: `assert_cmd::Command::assert`
+/// captures the whole child's stdout before returning, so the pipe is never
+/// closed while the child is still writing — this needs a real early close.
+///
+/// Each row carries a 300-byte `pad` field (selected alongside `idx`), not
+/// just the bare index: a Linux pipe's kernel buffer is 64 KiB, and
+/// `io::Stdout` line-buffers, flushing (i.e. issuing a real `write(2)`) on
+/// every row. With `idx` alone, 500 rows total under 2 KiB of CSV — it all
+/// fits in one flush that lands before the reader below has a chance to
+/// close its end, so the bug never fires. Padded, 500 rows total well over
+/// 64 KiB, so later rows' flushes land after the pipe closes and hit EPIPE —
+/// reproducing the real `| head` scenario this pins.
+#[test]
+fn broken_pipe_exits_without_panic_or_error_noise() {
+    use std::io::Read;
+    use std::process::{Command as PCommand, Stdio};
+
+    let td = TempDir::new().unwrap();
+    let pad = "x".repeat(300);
+    for i in 0..500 {
+        fs::write(
+            td.path().join(format!("n{i}.md")),
+            format!("---\nidx: {i}\npad: \"{pad}\"\n---\n"),
+        )
+        .unwrap();
+    }
+    let home = TempDir::new().unwrap();
+    let bin = assert_cmd::cargo::cargo_bin("querymatter");
+    let mut child = PCommand::new(bin)
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path())
+        .env_remove("QUERYMATTER_TABLE_STYLE")
+        .arg("-e")
+        .arg("SELECT idx, pad")
+        .arg("--format")
+        .arg("csv")
+        .arg(td.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Read a little, then drop the read end to close the pipe early.
+    let mut buf = [0u8; 64];
+    let _ = child.stdout.take().unwrap().read(&mut buf);
+    drop(child.stdout.take());
+    let out = child.wait_with_output().unwrap();
+    let code = out.status.code();
+    assert_ne!(code, Some(101), "panicked on broken pipe");
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("Broken pipe"),
+        "leaked Broken pipe error to stderr"
+    );
+}
