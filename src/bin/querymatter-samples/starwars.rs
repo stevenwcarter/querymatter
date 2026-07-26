@@ -1,13 +1,5 @@
 //! Fixed star-wars folder — identical at every scale (spec §4.1).
 
-// This module's full public surface is the Task 3 interface contract that
-// later tasks in the sample-generator plan consume (see
-// docs/superpowers/plans/2026-07-26-sample-generator.md); `main()` doesn't
-// call into it until Task 6 wires the generator pipeline together. The
-// tests below already pin the implementation. Drop this once Task 6 lands
-// and every item has a real caller.
-#![allow(dead_code)]
-
 use std::fmt::Write as _;
 use std::path::Path;
 

@@ -1,13 +1,5 @@
 //! File emission: exact bytes, deterministic mtimes.
 
-// This module's full public surface is the Task 2 interface contract that
-// later tasks in the sample-generator plan consume (see
-// docs/superpowers/plans/2026-07-26-sample-generator.md); `main()` doesn't
-// call into it until Task 6 wires the generator pipeline together. The
-// tests below already pin the implementation. Drop this once Task 6 lands
-// and every item has a real caller.
-#![allow(dead_code)]
-
 use std::fs;
 use std::io::Write as _;
 use std::path::Path;

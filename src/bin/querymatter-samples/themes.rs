@@ -1,13 +1,5 @@
 //! Scaled contrived themes (spec §3, §4.2–4.4).
 
-// This module's public surface (`split_counts`, `generate_work`) is a Task 4
-// interface contract that Task 5 (recipes/reading) and Task 6 (pipeline
-// wiring) consume (see docs/superpowers/plans/2026-07-26-sample-generator.md);
-// `main()` doesn't call into it until Task 6 lands. The tests below already
-// pin the implementation. Drop this once Task 6 lands and every item has a
-// real caller.
-#![allow(dead_code)]
-
 use std::fmt::Write as _;
 use std::path::Path;
 

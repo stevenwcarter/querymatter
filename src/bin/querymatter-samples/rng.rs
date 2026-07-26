@@ -1,14 +1,6 @@
 //! Embedded deterministic PRNG (SplitMix64) — no `rand` dependency, so the
 //! output stream can never shift under a dependency upgrade.
 
-// This module's full public surface is the Task 1 interface contract that
-// later tasks in the sample-generator plan consume (see
-// docs/superpowers/plans/2026-07-26-sample-generator.md); `main()` doesn't
-// call into it until Task 6 wires the generator pipeline together. The
-// vectors in `tests` below already pin the implementation. Drop this once
-// Task 6 lands and every item has a real caller.
-#![allow(dead_code)]
-
 pub const GLOBAL_SEED: u64 = 0x5EED_5A17_1E5A_3B1E;
 
 pub struct SplitMix64 {
