@@ -3330,3 +3330,30 @@ fn regexp_matches_are_stable_after_hoisting() {
         .stdout(predicate::str::contains("A123"))
         .stdout(predicate::str::contains("B999").not());
 }
+
+/// Task 3 (B3) RED: frontmatter is fully attacker-controlled (any Markdown
+/// file in a queried vault). A `title` carrying a raw ESC screen-clear
+/// sequence must not reach the terminal unsanitized in the default table
+/// render — today it does, since `Value::display()` is written verbatim.
+#[test]
+fn table_output_neutralizes_ansi_escapes_from_frontmatter() {
+    let td = TempDir::new().unwrap();
+    // title carries a raw ESC (0x1b) screen-clear sequence
+    fs::write(
+        td.path().join("evil.md"),
+        "---\ntitle: \"\u{1b}[2J[H spoof\"\n---\n",
+    )
+    .unwrap();
+    let home = TempDir::new().unwrap();
+    let out = qm(home.path())
+        .arg("-e")
+        .arg("SELECT title")
+        .arg(td.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    // The default (table) render must not emit the raw ESC byte.
+    assert!(!out.contains(&0x1b), "raw ESC leaked into table output");
+}

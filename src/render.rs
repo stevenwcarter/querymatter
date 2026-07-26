@@ -5,6 +5,7 @@
 //! Every format is returned with no trailing newline, so a caller (the REPL
 //! printer) can add exactly one when it prints the result.
 
+use std::borrow::Cow;
 use std::io::{self, IsTerminal, Write};
 use std::str::FromStr;
 
@@ -311,6 +312,24 @@ fn render_markdown(table: &ResultTable, header: bool) -> String {
     ct.trim_fmt()
 }
 
+/// Neutralizes C0/C1 control characters — ESC, `\r`, and their kin — so a
+/// frontmatter value can't forge terminal escape sequences (screen clears,
+/// cursor moves, forged rows) when rendered into a table cell or vertical
+/// (`\G`) line. `\t` is left untouched; everything else `char::is_control`
+/// reports becomes U+FFFD.
+///
+/// Used **only** by the table ([`new_table`]) and vertical ([`render_vertical`])
+/// paths. Never call this from the csv/tsv/json paths — those are a stable,
+/// byte-identity interchange contract (see the module doc) and must keep
+/// receiving raw [`Value::display`] output untouched.
+///
+/// TODO(B3 RED): currently a no-op placeholder so the characterization tests
+/// fail for the right reason (the render paths don't sanitize yet); the next
+/// commit fills in the real replacement.
+fn sanitize_for_terminal(s: &str) -> Cow<'_, str> {
+    Cow::Borrowed(s)
+}
+
 /// A `comfy-table` [`Table`] carrying `table`'s headers (unless `header` is
 /// `false`) and rows, with no preset loaded yet.
 fn new_table(table: &ResultTable, header: bool) -> Table {
@@ -359,6 +378,28 @@ mod tests {
             ],
         }
     }
+    /// Task 3 (B3) RED: characterizes the sanitizer's contract before it's
+    /// implemented. `sanitize_for_terminal` is currently a no-op placeholder,
+    /// so this fails until the real implementation lands.
+    #[test]
+    fn sanitize_for_terminal_neutralizes_control_bytes_but_keeps_tab() {
+        let s = "before\u{1b}[2Jafter\rend\ttab";
+        let sanitized = sanitize_for_terminal(s);
+        assert!(
+            !sanitized.contains('\u{1b}'),
+            "ESC must be neutralized, got {sanitized:?}"
+        );
+        assert!(
+            !sanitized.contains('\r'),
+            "CR must be neutralized, got {sanitized:?}"
+        );
+        assert!(sanitized.contains('\t'), "tab must survive, got {sanitized:?}");
+        assert!(
+            sanitized.contains("before") && sanitized.contains("after") && sanitized.contains("tab"),
+            "normal text must survive, got {sanitized:?}"
+        );
+    }
+
     #[test]
     fn json_roundtrips() {
         let s = render(
