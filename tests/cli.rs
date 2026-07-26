@@ -18,6 +18,19 @@ fn tree() -> TempDir {
     td
 }
 
+/// The `.bin` blob file names directly under `.querymatter/` (i.e. every
+/// per-directory cache blob `save_cache` writes), excluding `manifest.bin`
+/// itself. Used by the B14 orphan-GC test below to count blobs on disk
+/// without depending on the crate's private blob-naming scheme.
+fn blob_file_names(cache_dir: &Path) -> Vec<String> {
+    fs::read_dir(cache_dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".bin") && name != "manifest.bin")
+        .collect()
+}
+
 /// Points HOME and XDG_CONFIG_HOME at `dir` so a command never reads or
 /// writes the developer's real config. HOME covers macOS, where `directories`
 /// uses ~/Library/Application Support and ignores XDG_CONFIG_HOME.
@@ -571,6 +584,82 @@ fn cache_status_with_corrupt_manifest_exits_nonzero_and_mentions_init() {
         .assert()
         .failure()
         .stderr(predicates::str::contains("init"));
+}
+
+/// B14 (resource/cleanup): once `product/` is deleted and the vault
+/// re-`init`ed, `save_cache` must GC `product/`'s now-orphaned blob file
+/// rather than leave it lingering under `.querymatter/` forever. Equally
+/// important — and the sharper failure mode a buggy/over-aggressive GC would
+/// hit — the rewritten manifest plus the surviving `plans/` blob must still
+/// load correctly afterward: `cache status` still reports both `plans/`
+/// files, and a query still returns their real values, not silently-dropped
+/// or corrupted rows.
+#[test]
+fn reinit_gcs_orphaned_blob_for_a_removed_directory() {
+    let td = tree(); // plans/{a,b}.md (draft, synced), product/c.md (synced)
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg("init")
+        .arg(td.path())
+        .assert()
+        .success();
+
+    let cache_dir = td.path().join(".querymatter");
+    assert_eq!(
+        blob_file_names(&cache_dir).len(),
+        2,
+        "sanity: one blob per directory (plans/, product/) right after init"
+    );
+
+    fs::remove_dir_all(td.path().join("product")).unwrap();
+
+    qm(home.path())
+        .arg("init")
+        .arg(td.path())
+        .assert()
+        .success();
+
+    let blobs_after = blob_file_names(&cache_dir);
+    assert_eq!(
+        blobs_after.len(),
+        1,
+        "product/'s orphaned blob must be GC'd once it's no longer in the \
+         manifest, got {blobs_after:?}"
+    );
+
+    let status_out = qm(home.path())
+        .args(["cache", "status"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert!(
+        String::from_utf8(status_out)
+            .unwrap()
+            .contains("files:       2"),
+        "the manifest must still report plans/'s 2 surviving files, not lose \
+         them to an over-aggressive GC"
+    );
+
+    let query_out = qm(home.path())
+        .current_dir(td.path())
+        .args(["-e", "SELECT status", "--format", "csv", "--force-cache"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(query_out).unwrap();
+    let mut rows: Vec<&str> = s.lines().skip(1).map(str::trim).collect();
+    rows.sort_unstable();
+    assert_eq!(
+        rows,
+        vec!["draft", "synced"],
+        "plans/'s surviving rows must still load correctly from the \
+         rewritten manifest + kept blob after GC; got {s:?}"
+    );
 }
 
 /// `init`'s walk flags parse into the "init" subcommand's own nested

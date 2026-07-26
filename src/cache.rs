@@ -192,7 +192,10 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 /// Persists `dirs` to `<vault_dir>/.querymatter/`: one blob file per
 /// [`CachedDir`], then `manifest.bin` last, all via [`write_atomic`] so a
-/// reader never sees a manifest that outraces its blobs.
+/// reader never sees a manifest that outraces its blobs — then GCs any blob
+/// file no longer referenced by the manifest just written (B14), so a
+/// directory removed or renamed out from under the vault doesn't leave its
+/// old blob (a new path hashes to a new [`blob_file_name`]) on disk forever.
 ///
 /// A `CachedDir` that fails to encode (see [`encode`]'s panic note — in
 /// practice a pre-1970 mtime from clock skew or archive extraction) is
@@ -235,7 +238,69 @@ pub fn save_cache(vault_dir: &Path, dirs: &[CachedDir], ttl_secs: u64) -> anyhow
     let manifest_bytes = try_write_manifest_bytes(&body).context("encoding manifest.bin")?;
     write_atomic(&cache_dir.join(MANIFEST_FILE_NAME), &manifest_bytes)
         .context("writing manifest.bin")?;
+
+    // Strictly after the manifest rename above completes (INV-4/crash-safety
+    // — see `gc_orphaned_blobs`'s doc comment): the keep-set below is built
+    // from `body`, the very manifest just made durable, so a crash at any
+    // point from here on can only ever leave a harmless orphan blob behind,
+    // never a manifest pointing at a blob this function already deleted.
+    let keep: BTreeSet<&str> = std::iter::once(MANIFEST_FILE_NAME)
+        .chain(body.dirs.iter().map(|entry| entry.blob.as_str()))
+        .collect();
+    gc_orphaned_blobs(&cache_dir, &keep);
+
     Ok(())
+}
+
+/// Deletes every `.bin` file directly under `cache_dir` whose name is not in
+/// `keep` — i.e. every blob belonging to a [`CachedDir`] no longer in the
+/// manifest [`save_cache`] just wrote, typically because its directory was
+/// deleted or renamed (a renamed directory hashes to a different
+/// [`blob_file_name`], orphaning the old one).
+///
+/// Must be called strictly *after* `manifest.bin` is durably written: a crash
+/// before that point leaves the previous manifest — and every blob it names —
+/// untouched, while a crash during or after this cleanup can only ever strand
+/// a harmless orphan blob, never delete a blob the just-written manifest
+/// still references (INV-4). `keep` is expected to already include
+/// `manifest.bin` itself alongside every current [`ManifestEntry::blob`].
+///
+/// Conservative by construction, in two ways: only names matching the exact
+/// blob-naming scheme ([`is_blob_file_name`]) are even considered — an
+/// unrelated file that happens to end in `.bin` (or `manifest.bin`, which
+/// never matches that shape) is left alone — and only regular files are
+/// touched, never a directory. Best-effort: a failed `remove_file` for one
+/// stray blob (permissions, a concurrent process) is silently ignored rather
+/// than failing the whole cache save, since orphans are a harmless leak, not
+/// a correctness problem.
+fn gc_orphaned_blobs(cache_dir: &Path, keep: &BTreeSet<&str>) {
+    let Ok(entries) = fs::read_dir(cache_dir) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if keep.contains(name.as_str()) || !is_blob_file_name(&name) {
+            continue;
+        }
+        if !entry.file_type().is_ok_and(|file_type| file_type.is_file()) {
+            continue;
+        }
+        let _ = fs::remove_file(entry.path());
+    }
+}
+
+/// True when `name` has exactly the shape [`blob_file_name`] produces: 16
+/// lowercase hex digits followed by `.bin`. The one place
+/// [`gc_orphaned_blobs`] decides whether a filename is a candidate blob at
+/// all, so it never mistakes an unrelated `.bin` file (or `manifest.bin`) for
+/// an orphan.
+fn is_blob_file_name(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".bin") else {
+        return false;
+    };
+    stem.len() == 16 && stem.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// True when `path` lies at or under at least one directory in `scope`, or
@@ -1256,6 +1321,41 @@ mod tests {
 
         let (_, loaded) = load_cache(td.path()).unwrap();
         assert_eq!(loaded, vec![good]);
+    }
+
+    /// B14: a save's orphan GC deletes an unreferenced blob (regression test
+    /// below covers that end to end via the CLI), but this pins the
+    /// conservative other half directly — it must NEVER delete anything that
+    /// isn't unambiguously a blob file, even though none of these planted
+    /// files are referenced by the (empty) manifest either. Covers: an
+    /// unrelated file, a `.bin` file with uppercase hex (our scheme is always
+    /// lowercase — see `blob_file_name`), a `.bin` file whose stem is the
+    /// wrong length, and a subdirectory.
+    #[test]
+    fn save_cache_gc_leaves_non_blob_and_malformed_bin_files_alone() {
+        let td = TempDir::new().unwrap();
+        save_cache(td.path(), &[], 300).unwrap();
+
+        let cache_dir = td.path().join(".querymatter");
+        fs::write(cache_dir.join("notes.txt"), b"unrelated file").unwrap();
+        fs::write(
+            cache_dir.join("DEADBEEF00000000.bin"),
+            b"uppercase hex, not our scheme",
+        )
+        .unwrap();
+        fs::write(cache_dir.join("short.bin"), b"too short to be a blob name").unwrap();
+        fs::create_dir(cache_dir.join("subdir")).unwrap();
+
+        // Re-save with the same (empty) dir set: the GC re-runs over
+        // `cache_dir` with nothing in the keep-set beyond `manifest.bin`
+        // itself, so an incorrect GC would delete every planted file above.
+        save_cache(td.path(), &[], 300).unwrap();
+
+        assert!(cache_dir.join("notes.txt").is_file());
+        assert!(cache_dir.join("DEADBEEF00000000.bin").is_file());
+        assert!(cache_dir.join("short.bin").is_file());
+        assert!(cache_dir.join("subdir").is_dir());
+        assert!(cache_dir.join("manifest.bin").is_file());
     }
 
     #[test]
