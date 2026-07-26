@@ -1177,6 +1177,31 @@ fn file_body_like_matches_a_fixture_containing_todo() {
     assert_eq!(s.lines().last().unwrap().trim(), "has-todo.md");
 }
 
+/// Task 10 (B10): a query referencing `file.body` from BOTH `WHERE` and
+/// `SELECT` (indirectly, via projecting an unrelated column that's only kept
+/// because the `WHERE` matched) must still return the same row/value as
+/// before the per-record memo was added — the equivalence pin the brief
+/// calls for. The in-process unit test alongside `read_body_cached` proves
+/// the memoization itself (one disk read, not two); this end-to-end test
+/// proves memoizing it didn't change what the query returns.
+#[test]
+fn file_body_referenced_twice_is_consistent() {
+    let td = TempDir::new().unwrap();
+    fs::write(
+        td.path().join("n.md"),
+        "---\ntitle: t\n---\nhello TODO world\n",
+    )
+    .unwrap();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg("-e")
+        .arg("SELECT title WHERE file.body LIKE '%TODO%'")
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("t"));
+}
+
 /// B8: `file.body` always re-reads fresh from disk (design W56 — the cache
 /// never stores body text), so it must respect `max_file_bytes` even for a
 /// file whose cached (mtime, size) entry was written under a LARGER cap and

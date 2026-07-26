@@ -7,6 +7,7 @@
 //! **grouped/aggregate** path (a `GROUP BY` clause and/or an aggregate
 //! `SELECT` item); see [`is_grouped_or_aggregate`] for the dispatch check.
 
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -204,6 +205,11 @@ fn execute_with_schema_at<'a>(
         max_file_bytes,
         like_regexes: &like_regexes,
         regexp_regexes: &regexp_regexes,
+        // Task B10: this base `ctx` isn't scoped to any single record, so it
+        // carries no body memo — `execute_ungrouped` derives a fresh
+        // per-record `ctx` (with `Some(&cache)`) around each record's own
+        // filter/projection/order evaluation instead. See [`EvalCtx::body_cache`].
+        body_cache: None,
     };
     if is_grouped_or_aggregate(q) {
         return execute_grouped(q, records.into_iter(), ctx);
@@ -217,8 +223,11 @@ fn execute_with_schema_at<'a>(
 /// contains, already compiled to a [`Regex`] exactly once per query (Tasks
 /// B1/B2) — see [`compile_pattern_regexes`], [`like_matches`], and
 /// [`regexp_matches`]. `Copy` for the same reason `disk_reads_allowed` was
-/// passed by value everywhere before it: a `bool` plus two shared references
-/// cost nothing to copy at each recursive call.
+/// passed by value everywhere before it: a `bool` plus a couple of shared
+/// references cost nothing to copy at each recursive call — including
+/// `body_cache`, which is itself just a shared reference, so re-pointing it
+/// at a fresh per-record cache (see [`execute_ungrouped`]) is one more `Copy`,
+/// not a clone of anything it points to.
 #[derive(Clone, Copy)]
 pub(crate) struct EvalCtx<'a> {
     /// Whether `file.body` disk reads are allowed for this query (design
@@ -233,6 +242,23 @@ pub(crate) struct EvalCtx<'a> {
     /// Every `REGEXP` pattern in the query, compiled once, keyed by its
     /// literal pattern text.
     regexp_regexes: &'a HashMap<String, Regex>,
+    /// Task B10: the current single record's memoized `file.body`, if this
+    /// `ctx` is scoped to one record's evaluation. `None` for `ctx` values
+    /// that aren't record-scoped (the query-wide base `ctx`, and every
+    /// `GROUP BY`/aggregate call site, which folds over many records rather
+    /// than evaluating one) — those keep re-reading `file.body` fresh per
+    /// reference, exactly as before this task.
+    ///
+    /// `execute_ungrouped` builds a fresh, empty `RefCell` for each filtered
+    /// record and derives a per-record `ctx` pointing `body_cache` at it
+    /// (`Some(&cache)`), reused across that ONE record's `WHERE` filter,
+    /// `SELECT` projection, and `ORDER BY` key evaluation — see
+    /// [`filter_records`] and [`read_body_cached`]. The cache is dropped once
+    /// that record's row is fully built; it is never shared across records
+    /// (that would let one row's body linger in memory well past its use, and
+    /// — worse — leak a stale value into the next record if this field were
+    /// ever mistakenly left populated across the loop iteration).
+    body_cache: Option<&'a RefCell<Option<Value>>>,
 }
 
 /// Compiles every `LIKE` pattern `q` contains into its translated [`Regex`],
@@ -575,25 +601,59 @@ fn is_grouped_or_aggregate(q: &Query) -> bool {
             .any(|item| matches!(item.expr, SelectExpr::Agg(_)))
 }
 
+/// A record that survived [`filter_records`]'s `FROM`/`WHERE` pass, paired
+/// with the per-record `file.body` memo (Task B10) built while evaluating
+/// its `WHERE` clause — see [`filter_records`]'s doc for how each caller uses
+/// (or discards) that cell.
+type FilteredRecord<'a> = (&'a Record, RefCell<Option<Value>>);
+
 /// Applies the `FROM` glob and `WHERE` predicate — the filtering step shared
 /// by both the non-grouped and grouped/aggregate pipelines.
+///
+/// Each surviving record is paired with the (possibly still-empty)
+/// [`RefCell`] used to memoize its `file.body` while evaluating `WHERE`
+/// (Task B10): [`execute_ungrouped`] carries that SAME cell forward into that
+/// record's projection and `ORDER BY` evaluation, so a `WHERE`/`SELECT`/
+/// `ORDER BY` combination that all reference `file.body` still reads the file
+/// only once. A record's cell is created fresh here regardless of whether
+/// `WHERE` actually touches `file.body` — cheap (an empty `RefCell`, no
+/// allocation) and it keeps the return type uniform for every caller.
+/// [`execute_grouped`] discards the cell (see its call site below): the
+/// grouped/aggregate path folds many records per group rather than
+/// evaluating one, so it doesn't yet memoize (see [`AggState::update`]).
 fn filter_records<'a>(
     q: &Query,
     records: impl Iterator<Item = &'a Record>,
     ctx: EvalCtx<'_>,
-) -> Result<Vec<&'a Record>, ExecError> {
+) -> Result<Vec<FilteredRecord<'a>>, ExecError> {
     let candidates = filter_by_glob(records.collect(), q.from_glob.as_deref())?;
     Ok(candidates
         .into_iter()
-        .filter(|record| match &q.filter {
-            // SQL 3VL: a row is kept only when the predicate is definitely
-            // true; both `Some(false)` and `None` (unknown, i.e. a NULL was
-            // involved) exclude it.
-            Some(pred) => eval_predicate(record, pred, ctx) == Some(true),
-            None => true,
+        .filter_map(|record| {
+            let body_cache = RefCell::new(None);
+            let keep = match &q.filter {
+                // SQL 3VL: a row is kept only when the predicate is
+                // definitely true; both `Some(false)` and `None` (unknown,
+                // i.e. a NULL was involved) exclude it.
+                Some(pred) => {
+                    let record_ctx = EvalCtx {
+                        body_cache: Some(&body_cache),
+                        ..ctx
+                    };
+                    eval_predicate(record, pred, record_ctx) == Some(true)
+                }
+                None => true,
+            };
+            keep.then_some((record, body_cache))
         })
         .collect())
 }
+
+/// One projected row still carrying its source `record` and `file.body` memo
+/// (Task B10) — the shape [`execute_ungrouped`] threads from projection
+/// through to `ORDER BY` key resolution, before both are discarded in favor
+/// of just the projected cells.
+type ProjectedRow<'a> = (&'a Record, Vec<Value>, RefCell<Option<Value>>);
 
 /// The filter / project / order / limit pipeline for a non-grouped query.
 fn execute_ungrouped<'a>(
@@ -602,16 +662,26 @@ fn execute_ungrouped<'a>(
     ctx: EvalCtx<'_>,
 ) -> Result<ResultTable, ExecError> {
     let filtered = filter_records(q, records, ctx)?;
-    let columns = expand_select(q, &filtered);
+    let record_refs: Vec<&Record> = filtered.iter().map(|(record, _)| *record).collect();
+    let columns = expand_select(q, &record_refs);
     let headers: Vec<String> = columns.iter().map(|(header, _)| header.clone()).collect();
-    let mut rows: Vec<(&Record, Vec<Value>)> = filtered
+    // Task B10: `body_cache` came back from `filter_records` already carrying
+    // whatever `WHERE` read for this record (or still empty, if `WHERE`
+    // never touched `file.body`) — reusing that SAME cell here means a
+    // `SELECT` reference reads the file at most once more than `WHERE`
+    // already did, never fresh per `SELECT` item.
+    let mut rows: Vec<ProjectedRow<'a>> = filtered
         .into_iter()
-        .map(|record| {
+        .map(|(record, body_cache)| {
+            let record_ctx = EvalCtx {
+                body_cache: Some(&body_cache),
+                ..ctx
+            };
             let row = columns
                 .iter()
-                .map(|(_, expr)| eval_expr(record, expr, ctx))
+                .map(|(_, expr)| eval_expr(record, expr, record_ctx))
                 .collect();
-            (record, row)
+            (record, row, body_cache)
         })
         .collect();
 
@@ -625,13 +695,20 @@ fn execute_ungrouped<'a>(
     // decorate-sort-undecorate shape `execute_grouped` uses for its groups —
     // instead of letting the comparator re-derive them (re-reading
     // `file.body` from disk, or re-evaluating a scalar expression) on every
-    // pairwise comparison the sort/selection below makes.
+    // pairwise comparison the sort/selection below makes. Task B10: still the
+    // SAME per-record `body_cache` carried in from `WHERE`/`SELECT` above, so
+    // `ORDER BY file.body` costs no additional read when either already
+    // resolved it.
     let mut rows: Vec<(Vec<Value>, Vec<Value>)> = rows
         .into_iter()
-        .map(|(record, row)| {
+        .map(|(record, row, body_cache)| {
+            let record_ctx = EvalCtx {
+                body_cache: Some(&body_cache),
+                ..ctx
+            };
             let order_keys: Vec<Value> = order
                 .iter()
-                .map(|(target, _)| order_key_value(target, record, &row, ctx))
+                .map(|(target, _)| order_key_value(target, record, &row, record_ctx))
                 .collect();
             (row, order_keys)
         })
@@ -711,9 +788,9 @@ fn bounded_top_k<T>(items: Vec<T>, n: usize, cmp: impl Fn(&T, &T) -> Ordering) -
 /// non-`Value` conversion `count(distinct col)` keys on, since `Value` has
 /// no `Eq`/`Hash` — collected per-row rather than joined into one string, so
 /// that e.g. cells `("ab", "c")` and `("a", "bc")` never collide.
-fn dedup_rows(rows: &mut Vec<(&Record, Vec<Value>)>) {
+fn dedup_rows(rows: &mut Vec<ProjectedRow<'_>>) {
     let mut seen: HashSet<Vec<String>> = HashSet::new();
-    rows.retain(|(_, row)| {
+    rows.retain(|(_, row, _)| {
         let key: Vec<String> = row.iter().map(Value::to_cmp_string).collect();
         seen.insert(key)
     });
@@ -733,7 +810,14 @@ fn execute_grouped<'a>(
     records: impl Iterator<Item = &'a Record>,
     ctx: EvalCtx<'_>,
 ) -> Result<ResultTable, ExecError> {
-    let filtered = filter_records(q, records, ctx)?;
+    // Task B10's per-record `body_cache` (see `filter_records`) isn't reused
+    // here: the grouped/aggregate path folds many records per group rather
+    // than evaluating one, so each record's cache is simply dropped once
+    // filtering is done — see `AggState::update`.
+    let filtered: Vec<&Record> = filter_records(q, records, ctx)?
+        .into_iter()
+        .map(|(record, _)| record)
+        .collect();
 
     let items = validate_grouped_select(q)?;
     let headers: Vec<String> = q.select.iter().map(|item| item.header()).collect();
@@ -1022,7 +1106,10 @@ fn group_rows<'a>(
     for &record in records {
         let key: Vec<Value> = group_by
             .iter()
-            .map(|col| resolve_col(record, col, disk_reads_allowed, max_file_bytes))
+            // Not record-scoped (Task B10): a `GROUP BY` key is one value
+            // per record, resolved once here regardless, so there's no
+            // repeated-reference within a single record to memoize.
+            .map(|col| resolve_col(record, col, disk_reads_allowed, max_file_bytes, None))
             .collect();
         let hash_key: Vec<String> = key.iter().map(hashable_cell_key).collect();
         match index.entry(hash_key) {
@@ -1279,37 +1366,45 @@ impl<'a> AggState<'a> {
 
     /// Folds one more row into the running state. Call once per row in the
     /// group, in row order — order matters for `GROUP_CONCAT`.
+    ///
+    /// Not record-scoped (Task B10): each `resolve_col` call below passes no
+    /// `body_cache`, so a `file.body` aggregate argument still re-reads the
+    /// file fresh for every row folded in here, unchanged from before this
+    /// task — the fold visits each record once per `AggState` regardless, and
+    /// unifying that with the filter/projection/order memo would mean
+    /// threading a cache through `group_rows`/`project_group`'s multi-record
+    /// loops, well beyond this task's per-record scope.
     fn update(&mut self, record: &Record, disk_reads_allowed: bool, max_file_bytes: u64) {
         match self {
             AggState::CountStar(count) => *count += 1,
             AggState::Count { col, count } => {
-                if !resolve_col(record, col, disk_reads_allowed, max_file_bytes).is_null() {
+                if !resolve_col(record, col, disk_reads_allowed, max_file_bytes, None).is_null() {
                     *count += 1;
                 }
             }
             AggState::CountDistinct { col, seen } => {
-                let value = resolve_col(record, col, disk_reads_allowed, max_file_bytes);
+                let value = resolve_col(record, col, disk_reads_allowed, max_file_bytes, None);
                 if !value.is_null() {
                     seen.insert(value.to_cmp_string());
                 }
             }
             AggState::Sum { col, sum } => {
                 if let Some(n) =
-                    resolve_col(record, col, disk_reads_allowed, max_file_bytes).as_number()
+                    resolve_col(record, col, disk_reads_allowed, max_file_bytes, None).as_number()
                 {
                     *sum += n;
                 }
             }
             AggState::Avg { col, sum, count } => {
                 if let Some(n) =
-                    resolve_col(record, col, disk_reads_allowed, max_file_bytes).as_number()
+                    resolve_col(record, col, disk_reads_allowed, max_file_bytes, None).as_number()
                 {
                     *sum += n;
                     *count += 1;
                 }
             }
             AggState::Extreme { col, want, best } => {
-                let value = resolve_col(record, col, disk_reads_allowed, max_file_bytes);
+                let value = resolve_col(record, col, disk_reads_allowed, max_file_bytes, None);
                 if !value.is_null() {
                     match compare_values(&value, best) {
                         Some(ord) if ord == *want => *best = value,
@@ -1320,7 +1415,7 @@ impl<'a> AggState<'a> {
                 }
             }
             AggState::GroupConcat { col, parts } => {
-                let value = resolve_col(record, col, disk_reads_allowed, max_file_bytes);
+                let value = resolve_col(record, col, disk_reads_allowed, max_file_bytes, None);
                 if !value.is_null() {
                     parts.push(value.display());
                 }
@@ -1590,16 +1685,21 @@ fn sorted_field_union(records: &[&Record]) -> Vec<String> {
 /// `Null` sentinel for `Body` — see its doc comment): it's the one column
 /// that needs a real disk read, gated by `disk_reads_allowed` (design W56;
 /// `false` under `Freshness::ForceCache`) and capped by `max_file_bytes`
-/// (security fix B8) — see [`read_body`].
+/// (security fix B8) — see [`read_body`]. `body_cache`, when `Some` (Task
+/// B10), memoizes that read for the record's current evaluation — see
+/// [`read_body_cached`].
 fn resolve_col(
     record: &Record,
     col: &ColRef,
     disk_reads_allowed: bool,
     max_file_bytes: u64,
+    body_cache: Option<&RefCell<Option<Value>>>,
 ) -> Value {
     match col {
         ColRef::Field(path) => record.field(path),
-        ColRef::File(FileAttr::Body) => read_body(record, disk_reads_allowed, max_file_bytes),
+        ColRef::File(FileAttr::Body) => {
+            read_body_cached(record, disk_reads_allowed, max_file_bytes, body_cache)
+        }
         ColRef::File(attr) => record.file_attr(*attr),
     }
 }
@@ -1639,6 +1739,33 @@ fn read_body(record: &Record, disk_reads_allowed: bool, max_file_bytes: u64) -> 
     }
 }
 
+/// [`read_body`], memoized in `body_cache` for the lifetime of one record's
+/// evaluation (Task B10): the first `file.body` reference for a given record
+/// reads and parses the file (or resolves the B8 size cap, or `Null` for an
+/// unreadable file) exactly like `read_body` always did; every subsequent
+/// reference to the SAME record — whether from `WHERE`, `SELECT`, or `ORDER
+/// BY` — reuses that already-computed [`Value`] instead of hitting the disk
+/// again. `body_cache` is `None` for a `ctx` that isn't scoped to a single
+/// record (the query-wide base `ctx`, and every `GROUP BY`/aggregate call
+/// site), which falls straight through to a fresh [`read_body`] call every
+/// time, same as before this task.
+fn read_body_cached(
+    record: &Record,
+    disk_reads_allowed: bool,
+    max_file_bytes: u64,
+    body_cache: Option<&RefCell<Option<Value>>>,
+) -> Value {
+    let Some(cache) = body_cache else {
+        return read_body(record, disk_reads_allowed, max_file_bytes);
+    };
+    if let Some(cached) = &*cache.borrow() {
+        return cached.clone();
+    }
+    let value = read_body(record, disk_reads_allowed, max_file_bytes);
+    *cache.borrow_mut() = Some(value.clone());
+    value
+}
+
 /// Evaluates a scalar expression against `record`: a column/`file.*`
 /// pseudo-column resolves via [`resolve_col`], a literal evaluates to its
 /// `Value`, a scalar-function call evaluates its arguments first then
@@ -1657,7 +1784,13 @@ fn read_body(record: &Record, disk_reads_allowed: bool, max_file_bytes: u64) -> 
 /// matching falls through to `else_expr`, or `Value::Null` with no `ELSE`.
 pub(crate) fn eval_expr(record: &Record, expr: &Expr, ctx: EvalCtx<'_>) -> Value {
     match expr {
-        Expr::Col(col) => resolve_col(record, col, ctx.disk_reads_allowed, ctx.max_file_bytes),
+        Expr::Col(col) => resolve_col(
+            record,
+            col,
+            ctx.disk_reads_allowed,
+            ctx.max_file_bytes,
+            ctx.body_cache,
+        ),
         Expr::Lit(lit) => literal_value(lit),
         Expr::Scalar(f, args) => {
             let values: Vec<Value> = args.iter().map(|arg| eval_expr(record, arg, ctx)).collect();
@@ -1943,7 +2076,13 @@ fn eval_predicate(record: &Record, pred: &Predicate, ctx: EvalCtx<'_>) -> Option
         }
         Predicate::MemberOf(value_expr, col, negated) => {
             let needle = eval_expr(record, value_expr, ctx);
-            let value = resolve_col(record, col, ctx.disk_reads_allowed, ctx.max_file_bytes);
+            let value = resolve_col(
+                record,
+                col,
+                ctx.disk_reads_allowed,
+                ctx.max_file_bytes,
+                ctx.body_cache,
+            );
             let Value::List(items) = &value else {
                 // Unknown for both a `Null` field and a non-list value —
                 // never a hard `false` — mirroring `In`'s null-column rule.
@@ -2131,9 +2270,13 @@ fn order_key_value(
 ) -> Value {
     match target {
         ResolvedOrderTarget::AliasIndex(idx) => row[*idx].clone(),
-        ResolvedOrderTarget::Col(col) => {
-            resolve_col(record, col, ctx.disk_reads_allowed, ctx.max_file_bytes)
-        }
+        ResolvedOrderTarget::Col(col) => resolve_col(
+            record,
+            col,
+            ctx.disk_reads_allowed,
+            ctx.max_file_bytes,
+            ctx.body_cache,
+        ),
         ResolvedOrderTarget::Expr(expr) => eval_expr(record, expr, ctx),
     }
 }
@@ -4532,6 +4675,41 @@ mod agg_tests {
                 read_body(&r, true, u64::MAX),
                 Value::Str("hello world".into())
             );
+        }
+
+        /// Task 10 (B10): a second `file.body` reference sharing the same
+        /// `body_cache` must reuse the FIRST read's value rather than hitting
+        /// the disk again — proven by deleting the file between the two
+        /// `resolve_col` calls. Without memoization the second call would
+        /// re-run `read_body` against a now-missing file and get `Null`
+        /// instead; the contrasting `None`-cache call at the end confirms
+        /// that really would happen, so the memoized match above isn't a
+        /// coincidence of `read_body` itself being idempotent.
+        #[test]
+        fn resolve_col_memoizes_body_in_a_shared_cache() {
+            let td = TempDir::new().unwrap();
+            let r = rec_on_disk(
+                td.path(),
+                "a.md",
+                "---\nstatus: draft\n---\nTODO fix this\n",
+                &[],
+            );
+            let col = ColRef::File(FileAttr::Body);
+            let cache = RefCell::new(None);
+
+            let first = resolve_col(&r, &col, true, u64::MAX, Some(&cache));
+            fs::remove_file(r.abs_path()).unwrap();
+            let second = resolve_col(&r, &col, true, u64::MAX, Some(&cache));
+
+            assert_eq!(first, Value::Str("TODO fix this".into()));
+            assert_eq!(
+                second, first,
+                "a shared body_cache must serve the second reference from memory"
+            );
+
+            // Contrast: without a shared cache, the same deleted file DOES
+            // resolve to `Null` on a fresh read.
+            assert_eq!(resolve_col(&r, &col, true, u64::MAX, None), Value::Null);
         }
 
         /// Test 2 (brief), lenient half: under `--force-cache`
