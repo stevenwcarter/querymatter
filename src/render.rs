@@ -299,7 +299,8 @@ fn render_vertical(table: &ResultTable) -> String {
         // (see `query::ResultTable`), but a truncating zip degrades instead of
         // panicking should that ever weaken.
         for (header, value) in table.headers.iter().zip(row) {
-            out.push_str(&format!("\n{header:>width$}: {}", value.display()));
+            let header = sanitize_for_terminal(header);
+            out.push_str(&format!("\n{header:>width$}: {}", sanitized_display(value)));
         }
     }
     out
@@ -318,16 +319,32 @@ fn render_markdown(table: &ResultTable, header: bool) -> String {
 /// (`\G`) line. `\t` is left untouched; everything else `char::is_control`
 /// reports becomes U+FFFD.
 ///
-/// Used **only** by the table ([`new_table`]) and vertical ([`render_vertical`])
-/// paths. Never call this from the csv/tsv/json paths — those are a stable,
-/// byte-identity interchange contract (see the module doc) and must keep
-/// receiving raw [`Value::display`] output untouched.
-///
-/// TODO(B3 RED): currently a no-op placeholder so the characterization tests
-/// fail for the right reason (the render paths don't sanitize yet); the next
-/// commit fills in the real replacement.
+/// Used **only** by the table ([`new_table`]) and vertical
+/// ([`render_vertical`]) paths. Never call this from the csv/tsv/json paths —
+/// those are a stable, byte-identity interchange contract (see the module
+/// doc) and must keep receiving raw [`Value::display`] output untouched.
 fn sanitize_for_terminal(s: &str) -> Cow<'_, str> {
-    Cow::Borrowed(s)
+    if !s.chars().any(|c| c.is_control() && c != '\t') {
+        return Cow::Borrowed(s);
+    }
+    Cow::Owned(
+        s.chars()
+            .map(|c| {
+                if c.is_control() && c != '\t' {
+                    '\u{FFFD}'
+                } else {
+                    c
+                }
+            })
+            .collect(),
+    )
+}
+
+/// [`Value::display`], sanitized for terminal display via
+/// [`sanitize_for_terminal`]. Used by the table and vertical (`\G`) paths
+/// only — see that function's doc for why.
+fn sanitized_display(value: &Value) -> String {
+    sanitize_for_terminal(&value.display()).into_owned()
 }
 
 /// A `comfy-table` [`Table`] carrying `table`'s headers (unless `header` is
@@ -335,10 +352,10 @@ fn sanitize_for_terminal(s: &str) -> Cow<'_, str> {
 fn new_table(table: &ResultTable, header: bool) -> Table {
     let mut ct = Table::new();
     if header {
-        ct.set_header(&table.headers);
+        ct.set_header(table.headers.iter().map(|h| sanitize_for_terminal(h)));
     }
     for row in &table.rows {
-        ct.add_row(row.iter().map(Value::display));
+        ct.add_row(row.iter().map(sanitized_display));
     }
     ct
 }
@@ -393,9 +410,14 @@ mod tests {
             !sanitized.contains('\r'),
             "CR must be neutralized, got {sanitized:?}"
         );
-        assert!(sanitized.contains('\t'), "tab must survive, got {sanitized:?}");
         assert!(
-            sanitized.contains("before") && sanitized.contains("after") && sanitized.contains("tab"),
+            sanitized.contains('\t'),
+            "tab must survive, got {sanitized:?}"
+        );
+        assert!(
+            sanitized.contains("before")
+                && sanitized.contains("after")
+                && sanitized.contains("tab"),
             "normal text must survive, got {sanitized:?}"
         );
     }

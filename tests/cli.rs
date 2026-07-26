@@ -3357,3 +3357,22 @@ fn table_output_neutralizes_ansi_escapes_from_frontmatter() {
     // The default (table) render must not emit the raw ESC byte.
     assert!(!out.contains(&0x1b), "raw ESC leaked into table output");
 }
+
+/// Task 3 (B3) INV-1 pin: the table/vertical sanitizer must not touch the
+/// json interchange path. The same ESC-bearing value must still come through
+/// as serde's own `` escape, byte-identical to before this fix.
+#[test]
+fn json_output_unchanged_by_terminal_sanitizer() {
+    let td = TempDir::new().unwrap();
+    fs::write(td.path().join("evil.md"), "---\ntitle: \"\u{1b}x\"\n---\n").unwrap();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg("-e")
+        .arg("SELECT title")
+        .arg("--format")
+        .arg("json")
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\\u001b"));
+}
