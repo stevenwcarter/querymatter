@@ -39,17 +39,26 @@ SELECT jira, lead FROM 'work/**' WHERE lead MEMBER OF(reviewers) ORDER BY jira L
 -- LIKE with % wildcards
 SELECT name FROM 'starwars/starships/**' WHERE manufacturer LIKE '%Kuat%' ORDER BY name;
 
+-- NOT LIKE excludes the same wildcard match instead of including it
+SELECT name FROM 'starwars/starships/**' WHERE manufacturer NOT LIKE '%Kuat%' ORDER BY name;
+
 -- REGEXP against a computed expression, not just a bare column
 SELECT title, cuisine FROM 'recipes/**' WHERE lower(title) REGEXP 'chick(en|pea)' ORDER BY title LIMIT 5;
 
 -- IN over a literal list
 SELECT name, home_planet FROM 'starwars/characters/**' WHERE home_planet IN ('Tatooine', 'Naboo') ORDER BY name;
 
+-- NOT IN excludes the same literal list instead of including it
+SELECT name, home_planet FROM 'starwars/characters/**' WHERE home_planet NOT IN ('Tatooine', 'Naboo') ORDER BY name LIMIT 5;
+
 -- IS NULL: absent frontmatter keys read as NULL
 SELECT name, climate FROM 'starwars/planets/**' WHERE population IS NULL ORDER BY name;
 
 -- Scalar functions and aliases
 SELECT upper(name) AS loud, length(name) AS len FROM 'starwars/characters/**' ORDER BY len DESC LIMIT 3;
+
+-- trim() strips padding — replace() swaps a substring
+SELECT jira, replace(status, '-', ' ') AS status_label, length(trim('  ' || jira || '  ')) AS trimmed_len FROM 'work/**' ORDER BY jira LIMIT 5;
 
 -- String concatenation with ||
 SELECT substr(name, 1, 8) || '...' AS clipped FROM 'starwars/starships/**' ORDER BY clipped LIMIT 4;
@@ -62,6 +71,9 @@ SELECT jira, COALESCE(epic, 'unassigned') AS epic FROM 'work/plans/**' ORDER BY 
 
 -- Searched CASE (all three branches show up across the full 20-character cast)
 SELECT name, CASE WHEN mass_kg IS NULL THEN 'unknown' WHEN mass_kg >= 100 THEN 'heavy' ELSE 'light' END AS build FROM 'starwars/characters/**' ORDER BY name;
+
+-- Simple CASE: expr compared against each WHEN value for equality
+SELECT jira, CASE status WHEN 'blocked' THEN 'B' WHEN 'draft' THEN 'D' WHEN 'done' THEN 'X' ELSE 'other' END AS code FROM 'work/**' ORDER BY jira LIMIT 5;
 
 -- CASE as an ORDER BY expression: blocked work first
 SELECT jira, status FROM 'work/**' ORDER BY CASE WHEN status = 'blocked' THEN 0 ELSE 1 END, jira LIMIT 5;
@@ -83,6 +95,9 @@ SELECT kind, group_concat(name) AS members FROM 'starwars/characters/**' GROUP B
 
 -- Auto-detected ISO dates compare chronologically
 SELECT count(*) AS created_2026 FROM 'work/**' WHERE created >= '2026-01-01';
+
+-- DATE() with no format argument: strict ISO / RFC3339 detection, same as ingest
+SELECT jira, DATE(created) AS created_on FROM 'work/**' ORDER BY jira LIMIT 5;
 
 -- DATE() with an explicit chrono format parses non-ISO strings
 SELECT title, DATE(purchased, '%m/%d/%Y') AS purchased_on FROM 'reading/2026/**' WHERE purchased IS NOT NULL ORDER BY purchased_on LIMIT 5;

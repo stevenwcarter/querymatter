@@ -295,6 +295,28 @@ SELECT name FROM 'starwars/starships/**' WHERE manufacturer LIKE '%Kuat%' ORDER 
 +-------------------------+
 ```
 
+## NOT LIKE excludes the same wildcard match
+
+```sql
+SELECT name FROM 'starwars/starships/**' WHERE manufacturer NOT LIKE '%Kuat%' ORDER BY name;
+```
+
+```
++-------------------+
+| name              |
++===================+
+| A-wing            |
+|-------------------|
+| Millennium Falcon |
+|-------------------|
+| TIE Advanced x1   |
+|-------------------|
+| X-wing            |
+|-------------------|
+| Y-wing            |
++-------------------+
+```
+
 ## REGEXP against a computed expression
 
 `REGEXP` isn't limited to a bare column — here it's matched against
@@ -342,6 +364,28 @@ SELECT name, home_planet FROM 'starwars/characters/**' WHERE home_planet IN ('Ta
 +-------------------+-------------+
 ```
 
+## NOT IN excludes the same literal list
+
+```sql
+SELECT name, home_planet FROM 'starwars/characters/**' WHERE home_planet NOT IN ('Tatooine', 'Naboo') ORDER BY name LIMIT 5;
+```
+
+```
++----------------+-------------+
+| name           | home_planet |
++==============================+
+| Admiral Ackbar | Mon Cala    |
+|----------------+-------------|
+| Boba Fett      | Kamino      |
+|----------------+-------------|
+| Chewbacca      | Kashyyyk    |
+|----------------+-------------|
+| Greedo         | Rodia       |
+|----------------+-------------|
+| Han Solo       | Corellia    |
++----------------+-------------+
+```
+
 ## IS NULL: absent frontmatter keys read as NULL
 
 ```sql
@@ -374,6 +418,33 @@ SELECT upper(name) AS loud, length(name) AS len FROM 'starwars/characters/**' OR
 |-------------------+-----|
 | ADMIRAL ACKBAR    | 14  |
 +-------------------+-----+
+```
+
+## trim() strips padding, replace() swaps a substring
+
+`replace(status, '-', ' ')` turns `in-review` into a friendlier `in review`;
+`trim('  ' || jira || '  ')` strips the two spaces padded onto each side
+before `length()` measures it — `trimmed_len` comes out equal to the bare
+`jira`'s own length (7), proving the padding is gone.
+
+```sql
+SELECT jira, replace(status, '-', ' ') AS status_label, length(trim('  ' || jira || '  ')) AS trimmed_len FROM 'work/**' ORDER BY jira LIMIT 5;
+```
+
+```
++---------+--------------+-------------+
+| jira    | status_label | trimmed_len |
++======================================+
+| DCP-100 | in review    | 7           |
+|---------+--------------+-------------|
+| DCP-101 | in review    | 7           |
+|---------+--------------+-------------|
+| DCP-102 | draft        | 7           |
+|---------+--------------+-------------|
+| DCP-103 | done         | 7           |
+|---------+--------------+-------------|
+| DCP-104 | draft        | 7           |
++---------+--------------+-------------+
 ```
 
 ## String concatenation with ||
@@ -495,6 +566,31 @@ SELECT name, CASE WHEN mass_kg IS NULL THEN 'unknown' WHEN mass_kg >= 100 THEN '
 |-------------------+---------|
 | Yoda              | light   |
 +-------------------+---------+
+```
+
+## Simple CASE
+
+The *simple* form compares one expression (`status`) against each `WHEN`
+value for equality, instead of a full condition per branch.
+
+```sql
+SELECT jira, CASE status WHEN 'blocked' THEN 'B' WHEN 'draft' THEN 'D' WHEN 'done' THEN 'X' ELSE 'other' END AS code FROM 'work/**' ORDER BY jira LIMIT 5;
+```
+
+```
++---------+-------+
+| jira    | code  |
++=================+
+| DCP-100 | other |
+|---------+-------|
+| DCP-101 | other |
+|---------+-------|
+| DCP-102 | D     |
+|---------+-------|
+| DCP-103 | X     |
+|---------+-------|
+| DCP-104 | D     |
++---------+-------+
 ```
 
 ## CASE as an ORDER BY expression
@@ -636,6 +732,32 @@ SELECT count(*) AS created_2026 FROM 'work/**' WHERE created >= '2026-01-01';
 +==============+
 | 168          |
 +--------------+
+```
+
+## DATE() with no format argument
+
+`created` is already a strict ISO date, so `DATE(created)` with no format
+argument casts it via the same detection ingest applies (strict `%Y-%m-%d`,
+then RFC3339) — an already-`Date` value like this one just passes through.
+
+```sql
+SELECT jira, DATE(created) AS created_on FROM 'work/**' ORDER BY jira LIMIT 5;
+```
+
+```
++---------+------------+
+| jira    | created_on |
++======================+
+| DCP-100 | 2025-08-06 |
+|---------+------------|
+| DCP-101 | 2025-02-25 |
+|---------+------------|
+| DCP-102 | 2026-06-13 |
+|---------+------------|
+| DCP-103 | 2026-06-09 |
+|---------+------------|
+| DCP-104 | 2026-03-17 |
++---------+------------+
 ```
 
 ## DATE() with an explicit chrono format
