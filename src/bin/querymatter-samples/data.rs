@@ -390,3 +390,51 @@ pub const PLANETS: [Planet; 7] = [
         residents: &[],
     },
 ];
+
+// ---- shared/theme pools (plain scalars only: no ':', '#', quotes) ----
+
+pub const NAMES: [&str; 12] = [
+    "Avery Chen",
+    "Jordan Patel",
+    "Sam Rivera",
+    "Morgan Lee",
+    "Casey Nguyen",
+    "Riley Brooks",
+    "Quinn Foster",
+    "Alex Murphy",
+    "Dana Kim",
+    "Jesse Ortiz",
+    "Robin Walsh",
+    "Taylor Singh",
+];
+
+pub const WORK_TAGS: [&str; 8] = [
+    "mobile", "web", "api", "infra", "ux", "docs", "security", "perf",
+];
+
+pub const EPICS: [&str; 6] = [
+    "checkout-revamp",
+    "search-v2",
+    "mobile-parity",
+    "billing-cleanup",
+    "onboarding-flow",
+    "data-platform",
+];
+
+pub const SLUG_WORDS: [&str; 16] = [
+    "login", "cache", "export", "sync", "audit", "metrics", "retry", "webhook", "profile",
+    "search", "billing", "notify", "upload", "archive", "session", "report",
+];
+
+pub const SENTENCES: [&str; 10] = [
+    "The current behavior diverges from the design doc in two places.",
+    "We agreed to gate this behind a feature flag until QA signs off.",
+    "Latency regressions show up only under concurrent writes.",
+    "The migration needs a rollback path before it can ship.",
+    "Error handling swallows the root cause and logs a generic message.",
+    "The retry loop should back off exponentially instead of hammering the API.",
+    "Customer feedback suggests the empty state is confusing.",
+    "This depends on the platform team exposing a stable endpoint.",
+    "Old clients will keep sending the legacy payload for a while.",
+    "The dashboard should surface the failure count per tenant.",
+];

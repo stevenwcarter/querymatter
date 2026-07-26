@@ -5,6 +5,7 @@
 mod data;
 mod rng;
 mod starwars;
+mod themes;
 mod write;
 
 fn main() {}
