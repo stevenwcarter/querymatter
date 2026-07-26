@@ -3,5 +3,6 @@
 //! See docs/superpowers/specs/2026-07-26-sample-generator-design.md.
 
 mod rng;
+mod write;
 
 fn main() {}
