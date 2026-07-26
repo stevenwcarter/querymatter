@@ -181,10 +181,132 @@ fn execute_with_schema_at<'a>(
     if !lenient && !disk_reads_allowed && references_body(q) {
         return Err(ExecError::BodyUnavailable);
     }
+    // Task B1: every `LIKE` pattern `q` contains is translated and compiled
+    // to a `Regex` exactly once, here, rather than once per row — reused by
+    // both the filter pass (`filter_records`) and the projection pass
+    // (`Expr::Predicate` inside `eval_expr`) via `ctx`, see [`EvalCtx`].
+    let like_regexes = compile_like_regexes(q);
+    let ctx = EvalCtx {
+        disk_reads_allowed,
+        like_regexes: &like_regexes,
+    };
     if is_grouped_or_aggregate(q) {
-        return execute_grouped(q, records.into_iter(), disk_reads_allowed);
+        return execute_grouped(q, records.into_iter(), ctx);
     }
-    execute_ungrouped(q, records.into_iter(), disk_reads_allowed)
+    execute_ungrouped(q, records.into_iter(), ctx)
+}
+
+/// Per-query state threaded through the filter/project/order pipeline
+/// (`eval_expr`, `eval_predicate`, and everything built on them) alongside
+/// `disk_reads_allowed`: every `LIKE` pattern the query contains, already
+/// translated and compiled to a [`Regex`] exactly once per query (Task B1) —
+/// see [`compile_like_regexes`] and [`like_matches`]. `Copy` for the same
+/// reason `disk_reads_allowed` was passed by value everywhere before it: a
+/// `bool` plus a shared reference cost nothing to copy at each recursive
+/// call.
+#[derive(Clone, Copy)]
+pub(crate) struct EvalCtx<'a> {
+    /// Whether `file.body` disk reads are allowed for this query (design
+    /// W56); see [`read_body`].
+    disk_reads_allowed: bool,
+    /// Every `LIKE` pattern in the query, translated and compiled once,
+    /// keyed by its literal pattern text.
+    like_regexes: &'a HashMap<String, Regex>,
+}
+
+/// Compiles every `LIKE` pattern `q` contains into its translated [`Regex`]
+/// exactly once, keyed by literal pattern text, so [`like_matches`] never
+/// recompiles the same pattern twice across a query — not in the filter pass
+/// nor the projection pass, and not across rows.
+///
+/// Walks every position a `Predicate::Like` can appear: `SELECT` expressions
+/// (a searched `CASE WHEN` can embed one via [`Expr::Predicate`]), the
+/// `WHERE` filter, and `ORDER BY`'s computed-expression target. `GROUP BY`
+/// (bare `ColRef`s only) and `HAVING` (see [`Having`]) never contain a
+/// `Like`, so neither is walked. Two `Like` nodes sharing the same pattern
+/// text collapse to one map entry — `LIKE` is always case-sensitive (see
+/// [`compile_like_pattern`]), so the pattern text alone determines the
+/// compiled regex.
+fn compile_like_regexes(q: &Query) -> HashMap<String, Regex> {
+    let mut patterns = HashSet::new();
+    for item in &q.select {
+        if let SelectExpr::Expr(expr) = &item.expr {
+            collect_like_patterns_expr(expr, &mut patterns);
+        }
+    }
+    if let Some(pred) = &q.filter {
+        collect_like_patterns_predicate(pred, &mut patterns);
+    }
+    for key in &q.order_by {
+        if let OrderTarget::Expr(expr) = &key.target {
+            collect_like_patterns_expr(expr, &mut patterns);
+        }
+    }
+    patterns
+        .into_iter()
+        .map(|pattern| {
+            let regex = compile_like_pattern(&pattern);
+            (pattern, regex)
+        })
+        .collect()
+}
+
+/// Walks `expr`'s positions for a `LIKE` pattern, for [`compile_like_regexes`]
+/// — mirrors [`collect_expr_fields`]-style walks elsewhere in the crate.
+fn collect_like_patterns_expr(expr: &Expr, patterns: &mut HashSet<String>) {
+    match expr {
+        Expr::Col(_) | Expr::Lit(_) => {}
+        Expr::Scalar(_, args) | Expr::Coalesce(args) => {
+            for arg in args {
+                collect_like_patterns_expr(arg, patterns);
+            }
+        }
+        Expr::Binary(_, l, r) => {
+            collect_like_patterns_expr(l, patterns);
+            collect_like_patterns_expr(r, patterns);
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+        } => {
+            if let Some(op) = operand {
+                collect_like_patterns_expr(op, patterns);
+            }
+            for (cond, then) in whens {
+                collect_like_patterns_expr(cond, patterns);
+                collect_like_patterns_expr(then, patterns);
+            }
+            if let Some(e) = else_expr {
+                collect_like_patterns_expr(e, patterns);
+            }
+        }
+        Expr::Predicate(pred) => collect_like_patterns_predicate(pred, patterns),
+    }
+}
+
+/// Walks a `WHERE`-style predicate tree's positions for a `LIKE` pattern, for
+/// [`compile_like_regexes`].
+fn collect_like_patterns_predicate(pred: &Predicate, patterns: &mut HashSet<String>) {
+    match pred {
+        Predicate::Like(expr, pattern, _) => {
+            collect_like_patterns_expr(expr, patterns);
+            patterns.insert(pattern.clone());
+        }
+        Predicate::Compare(l, _, r) => {
+            collect_like_patterns_expr(l, patterns);
+            collect_like_patterns_expr(r, patterns);
+        }
+        Predicate::Regexp(expr, _, _) | Predicate::IsNull(expr, _) | Predicate::In(expr, _, _) => {
+            collect_like_patterns_expr(expr, patterns)
+        }
+        Predicate::MemberOf(value, _, _) => collect_like_patterns_expr(value, patterns),
+        Predicate::And(a, b) | Predicate::Or(a, b) => {
+            collect_like_patterns_predicate(a, patterns);
+            collect_like_patterns_predicate(b, patterns);
+        }
+        Predicate::Not(inner) => collect_like_patterns_predicate(inner, patterns),
+    }
 }
 
 /// Replaces every `Literal::RelativeDate` in `q` with the `Literal::Str`
@@ -405,7 +527,7 @@ fn is_grouped_or_aggregate(q: &Query) -> bool {
 fn filter_records<'a>(
     q: &Query,
     records: impl Iterator<Item = &'a Record>,
-    disk_reads_allowed: bool,
+    ctx: EvalCtx<'_>,
 ) -> Result<Vec<&'a Record>, ExecError> {
     let candidates = filter_by_glob(records.collect(), q.from_glob.as_deref())?;
     Ok(candidates
@@ -414,7 +536,7 @@ fn filter_records<'a>(
             // SQL 3VL: a row is kept only when the predicate is definitely
             // true; both `Some(false)` and `None` (unknown, i.e. a NULL was
             // involved) exclude it.
-            Some(pred) => eval_predicate(record, pred, disk_reads_allowed) == Some(true),
+            Some(pred) => eval_predicate(record, pred, ctx) == Some(true),
             None => true,
         })
         .collect())
@@ -424,9 +546,9 @@ fn filter_records<'a>(
 fn execute_ungrouped<'a>(
     q: &Query,
     records: impl Iterator<Item = &'a Record>,
-    disk_reads_allowed: bool,
+    ctx: EvalCtx<'_>,
 ) -> Result<ResultTable, ExecError> {
-    let filtered = filter_records(q, records, disk_reads_allowed)?;
+    let filtered = filter_records(q, records, ctx)?;
     let columns = expand_select(q, &filtered);
     let headers: Vec<String> = columns.iter().map(|(header, _)| header.clone()).collect();
     let mut rows: Vec<(&Record, Vec<Value>)> = filtered
@@ -434,7 +556,7 @@ fn execute_ungrouped<'a>(
         .map(|record| {
             let row = columns
                 .iter()
-                .map(|(_, expr)| eval_expr(record, expr, disk_reads_allowed))
+                .map(|(_, expr)| eval_expr(record, expr, ctx))
                 .collect();
             (record, row)
         })
@@ -449,8 +571,8 @@ fn execute_ungrouped<'a>(
         order
             .iter()
             .map(|(target, desc)| {
-                let va = order_key_value(target, ra, rowa, disk_reads_allowed);
-                let vb = order_key_value(target, rb, rowb, disk_reads_allowed);
+                let va = order_key_value(target, ra, rowa, ctx);
+                let vb = order_key_value(target, rb, rowb, ctx);
                 order_cmp(&va, &vb, *desc)
             })
             .find(|ord| *ord != Ordering::Equal)
@@ -541,14 +663,14 @@ fn dedup_rows(rows: &mut Vec<(&Record, Vec<Value>)>) {
 fn execute_grouped<'a>(
     q: &Query,
     records: impl Iterator<Item = &'a Record>,
-    disk_reads_allowed: bool,
+    ctx: EvalCtx<'_>,
 ) -> Result<ResultTable, ExecError> {
-    let filtered = filter_records(q, records, disk_reads_allowed)?;
+    let filtered = filter_records(q, records, ctx)?;
 
     let items = validate_grouped_select(q)?;
     let headers: Vec<String> = q.select.iter().map(|item| item.header()).collect();
 
-    let mut groups = group_rows(&filtered, &q.group_by, disk_reads_allowed);
+    let mut groups = group_rows(&filtered, &q.group_by, ctx.disk_reads_allowed);
     groups.sort_by(|a, b| compare_key_tuple(&a.key, &b.key));
 
     let order = resolve_group_order_targets(&q.order_by, &headers, &q.group_by)?;
@@ -560,10 +682,10 @@ fn execute_grouped<'a>(
     let mut rows: Vec<(Vec<Value>, Vec<Value>)> = groups
         .into_iter()
         .map(|group| {
-            let row = project_group(&group, &items, disk_reads_allowed);
+            let row = project_group(&group, &items, ctx);
             let order_keys: Vec<Value> = order
                 .iter()
-                .map(|(target, _)| group_order_key_value(target, &group, &row, disk_reads_allowed))
+                .map(|(target, _)| group_order_key_value(target, &group, &row, ctx))
                 .collect();
             (group, row, order_keys)
         })
@@ -571,7 +693,7 @@ fn execute_grouped<'a>(
             // SQL 3VL, same rule as WHERE: a group is kept only when HAVING
             // is definitely true; unknown/false both drop it.
             Some(having) => {
-                eval_having(having, group, &q.group_by, disk_reads_allowed) == Some(true)
+                eval_having(having, group, &q.group_by, ctx.disk_reads_allowed) == Some(true)
             }
             None => true,
         })
@@ -941,11 +1063,7 @@ enum ProjectedItem<'a> {
 /// the group on its own (which is what calling [`compute_aggregate`] once
 /// per item would do). The more aggregates a query projects, the more this
 /// saves.
-fn project_group(
-    group: &Group<'_>,
-    items: &[GroupedSelectItem],
-    disk_reads_allowed: bool,
-) -> Vec<Value> {
+fn project_group(group: &Group<'_>, items: &[GroupedSelectItem], ctx: EvalCtx<'_>) -> Vec<Value> {
     let mut projected: Vec<ProjectedItem<'_>> = items
         .iter()
         .map(|item| match item {
@@ -957,7 +1075,7 @@ fn project_group(
     for record in &group.rows {
         for item in &mut projected {
             if let ProjectedItem::Agg(state) = item {
-                state.update(record, disk_reads_allowed);
+                state.update(record, ctx.disk_reads_allowed);
             }
         }
     }
@@ -965,7 +1083,7 @@ fn project_group(
     projected
         .into_iter()
         .map(|item| match item {
-            ProjectedItem::Expr(expr) => eval_group_expr(&group.rows, expr, disk_reads_allowed),
+            ProjectedItem::Expr(expr) => eval_group_expr(&group.rows, expr, ctx),
             ProjectedItem::Agg(state) => state.finish(),
         })
         .collect()
@@ -977,10 +1095,10 @@ fn project_group(
 /// records — see [`group_rows`]); [`validate_grouped_select`] guarantees a
 /// `SELECT` expression surviving that bucket references no columns, so
 /// evaluating it against a fieldless stand-in record is safe.
-fn eval_group_expr(rows: &[&Record], expr: &Expr, disk_reads_allowed: bool) -> Value {
+fn eval_group_expr(rows: &[&Record], expr: &Expr, ctx: EvalCtx<'_>) -> Value {
     match rows.first() {
-        Some(record) => eval_expr(record, expr, disk_reads_allowed),
-        None => eval_expr(&empty_record(), expr, disk_reads_allowed),
+        Some(record) => eval_expr(record, expr, ctx),
+        None => eval_expr(&empty_record(), expr, ctx),
     }
 }
 
@@ -1306,17 +1424,15 @@ fn group_order_key_value(
     target: &ResolvedGroupOrderTarget,
     group: &Group<'_>,
     row: &[Value],
-    disk_reads_allowed: bool,
+    ctx: EvalCtx<'_>,
 ) -> Value {
     match target {
         ResolvedGroupOrderTarget::Row(idx) => row[*idx].clone(),
         ResolvedGroupOrderTarget::GroupKey(idx) => group.key[*idx].clone(),
         ResolvedGroupOrderTarget::Agg(agg) => {
-            compute_aggregate(agg, &group.rows, disk_reads_allowed)
+            compute_aggregate(agg, &group.rows, ctx.disk_reads_allowed)
         }
-        ResolvedGroupOrderTarget::Expr(expr) => {
-            eval_group_expr(&group.rows, expr, disk_reads_allowed)
-        }
+        ResolvedGroupOrderTarget::Expr(expr) => eval_group_expr(&group.rows, expr, ctx),
     }
 }
 
@@ -1429,25 +1545,22 @@ fn read_body(record: &Record, disk_reads_allowed: bool) -> Value {
 /// (`operand: Some`) returns the first arm whose value equals the operand
 /// (via [`eval_compare`], the same equality `IN`/`MEMBER OF` use). Neither
 /// matching falls through to `else_expr`, or `Value::Null` with no `ELSE`.
-pub(crate) fn eval_expr(record: &Record, expr: &Expr, disk_reads_allowed: bool) -> Value {
+pub(crate) fn eval_expr(record: &Record, expr: &Expr, ctx: EvalCtx<'_>) -> Value {
     match expr {
-        Expr::Col(col) => resolve_col(record, col, disk_reads_allowed),
+        Expr::Col(col) => resolve_col(record, col, ctx.disk_reads_allowed),
         Expr::Lit(lit) => literal_value(lit),
         Expr::Scalar(f, args) => {
-            let values: Vec<Value> = args
-                .iter()
-                .map(|arg| eval_expr(record, arg, disk_reads_allowed))
-                .collect();
+            let values: Vec<Value> = args.iter().map(|arg| eval_expr(record, arg, ctx)).collect();
             apply_scalar(f.clone(), &values)
         }
         Expr::Binary(op, left, right) => {
-            let l = eval_expr(record, left, disk_reads_allowed);
-            let r = eval_expr(record, right, disk_reads_allowed);
+            let l = eval_expr(record, left, ctx);
+            let r = eval_expr(record, right, ctx);
             apply_binary(op.clone(), &l, &r)
         }
         Expr::Coalesce(args) => args
             .iter()
-            .map(|arg| eval_expr(record, arg, disk_reads_allowed))
+            .map(|arg| eval_expr(record, arg, ctx))
             .find(|v| !v.is_null())
             .unwrap_or(Value::Null),
         Expr::Case {
@@ -1458,28 +1571,26 @@ pub(crate) fn eval_expr(record: &Record, expr: &Expr, disk_reads_allowed: bool) 
             match operand {
                 None => {
                     for (cond, then) in whens {
-                        if is_truthy(&eval_expr(record, cond, disk_reads_allowed)) {
-                            return eval_expr(record, then, disk_reads_allowed);
+                        if is_truthy(&eval_expr(record, cond, ctx)) {
+                            return eval_expr(record, then, ctx);
                         }
                     }
                 }
                 Some(op) => {
-                    let target = eval_expr(record, op, disk_reads_allowed);
+                    let target = eval_expr(record, op, ctx);
                     for (val, then) in whens {
-                        let candidate = eval_expr(record, val, disk_reads_allowed);
+                        let candidate = eval_expr(record, val, ctx);
                         if eval_compare(&target, &CmpOp::Eq, &candidate) == Some(true) {
-                            return eval_expr(record, then, disk_reads_allowed);
+                            return eval_expr(record, then, ctx);
                         }
                     }
                 }
             }
             else_expr
                 .as_deref()
-                .map_or(Value::Null, |e| eval_expr(record, e, disk_reads_allowed))
+                .map_or(Value::Null, |e| eval_expr(record, e, ctx))
         }
-        Expr::Predicate(pred) => {
-            eval_predicate(record, pred, disk_reads_allowed).map_or(Value::Null, Value::Bool)
-        }
+        Expr::Predicate(pred) => eval_predicate(record, pred, ctx).map_or(Value::Null, Value::Bool),
     }
 }
 
@@ -1681,23 +1792,27 @@ fn numeric_result(v: f64, is_float: bool) -> Value {
 /// the spec's "any comparison where a side is Null yields 'not true'" rule
 /// (§4). Only `IS NULL` / `IS NOT NULL` are ever determinate for a NULL
 /// field.
-fn eval_predicate(record: &Record, pred: &Predicate, disk_reads_allowed: bool) -> Option<bool> {
+fn eval_predicate(record: &Record, pred: &Predicate, ctx: EvalCtx<'_>) -> Option<bool> {
     match pred {
         Predicate::Compare(left, op, right) => eval_compare(
-            &eval_expr(record, left, disk_reads_allowed),
+            &eval_expr(record, left, ctx),
             op,
-            &eval_expr(record, right, disk_reads_allowed),
+            &eval_expr(record, right, ctx),
         ),
         Predicate::Like(expr, pattern, negated) => {
-            let value = eval_expr(record, expr, disk_reads_allowed);
+            let value = eval_expr(record, expr, ctx);
             if value.is_null() {
                 return None;
             }
-            let base = Some(like_matches(&value.to_cmp_string(), pattern));
+            let base = Some(like_matches(
+                &value.to_cmp_string(),
+                pattern,
+                ctx.like_regexes,
+            ));
             maybe_negate(base, *negated)
         }
         Predicate::Regexp(expr, pattern, negated) => {
-            let value = eval_expr(record, expr, disk_reads_allowed);
+            let value = eval_expr(record, expr, ctx);
             if value.is_null() {
                 return None;
             }
@@ -1705,7 +1820,7 @@ fn eval_predicate(record: &Record, pred: &Predicate, disk_reads_allowed: bool) -
             maybe_negate(base, *negated)
         }
         Predicate::In(expr, literals, negated) => {
-            let value = eval_expr(record, expr, disk_reads_allowed);
+            let value = eval_expr(record, expr, ctx);
             if value.is_null() {
                 return None;
             }
@@ -1713,8 +1828,8 @@ fn eval_predicate(record: &Record, pred: &Predicate, disk_reads_allowed: bool) -
             maybe_negate(base, *negated)
         }
         Predicate::MemberOf(value_expr, col, negated) => {
-            let needle = eval_expr(record, value_expr, disk_reads_allowed);
-            let value = resolve_col(record, col, disk_reads_allowed);
+            let needle = eval_expr(record, value_expr, ctx);
+            let value = resolve_col(record, col, ctx.disk_reads_allowed);
             let Value::List(items) = &value else {
                 // Unknown for both a `Null` field and a non-list value —
                 // never a hard `false` — mirroring `In`'s null-column rule.
@@ -1729,19 +1844,17 @@ fn eval_predicate(record: &Record, pred: &Predicate, disk_reads_allowed: bool) -
         }
         // The only predicate that is determinate — and true — for a NULL field.
         Predicate::IsNull(expr, negated) => {
-            Some(eval_expr(record, expr, disk_reads_allowed).is_null() != *negated)
+            Some(eval_expr(record, expr, ctx).is_null() != *negated)
         }
         Predicate::And(a, b) => three_valued_and(
-            eval_predicate(record, a, disk_reads_allowed),
-            eval_predicate(record, b, disk_reads_allowed),
+            eval_predicate(record, a, ctx),
+            eval_predicate(record, b, ctx),
         ),
         Predicate::Or(a, b) => three_valued_or(
-            eval_predicate(record, a, disk_reads_allowed),
-            eval_predicate(record, b, disk_reads_allowed),
+            eval_predicate(record, a, ctx),
+            eval_predicate(record, b, ctx),
         ),
-        Predicate::Not(inner) => {
-            three_valued_not(eval_predicate(record, inner, disk_reads_allowed))
-        }
+        Predicate::Not(inner) => three_valued_not(eval_predicate(record, inner, ctx)),
     }
 }
 
@@ -1817,20 +1930,34 @@ fn apply_cmp(op: &CmpOp, ordering: Ordering) -> bool {
 
 /// Matches `value` against a SQL `LIKE` pattern: `%` becomes `.*`, `_`
 /// becomes `.`, and everything else is matched literally (case-sensitive).
-fn like_matches(value: &str, pattern: &str) -> bool {
+///
+/// `like_regexes` is [`compile_like_regexes`]'s output — `pattern` was
+/// translated and compiled into it exactly once, up front, rather than here
+/// on every call (Task B1), so this is just a lookup.
+fn like_matches(value: &str, pattern: &str, like_regexes: &HashMap<String, Regex>) -> bool {
+    let re = like_regexes
+        .get(pattern)
+        .expect("compile_like_regexes pre-compiles every LIKE pattern the query tree contains");
+    re.is_match(value)
+}
+
+/// Translates a `LIKE` pattern into the compiled [`Regex`] [`like_matches`]
+/// matches against, for [`compile_like_regexes`]: `%` becomes `.*`, `_`
+/// becomes `.`, and everything else is escaped and matched literally
+/// (case-sensitive), anchored over the whole value (`^…$`).
+fn compile_like_pattern(pattern: &str) -> Regex {
     let escaped = regex::escape(pattern);
     let translated = escaped.replace('%', ".*").replace('_', ".");
     // `translated` is `regex::escape`'s output with only `.*`/`.` substituted
     // in, so wrapping it in `^…$` is always a valid regex.
-    let re = Regex::new(&format!("^{translated}$"))
-        .expect("LIKE pattern translates to a well-formed regex");
-    re.is_match(value)
+    Regex::new(&format!("^{translated}$")).expect("LIKE pattern translates to a well-formed regex")
 }
 
 /// Matches `value` against a `REGEXP` pattern. `parse::lower_regexp` already
 /// confirmed `pattern` compiles at parse time, so recompiling it here can't
-/// fail — mirroring [`like_matches`], it's recompiled fresh per call rather
-/// than cached.
+/// fail. Unlike [`like_matches`] (Task B1 hoisted its compile to once per
+/// query), this is still recompiled fresh per call — caching it is a
+/// separate, not-yet-done follow-up, not part of B1's scope.
 fn regexp_matches(value: &str, pattern: &str) -> bool {
     let re = Regex::new(pattern).expect("REGEXP pattern validated to compile at parse time");
     re.is_match(value)
@@ -1884,12 +2011,12 @@ fn order_key_value(
     target: &ResolvedOrderTarget,
     record: &Record,
     row: &[Value],
-    disk_reads_allowed: bool,
+    ctx: EvalCtx<'_>,
 ) -> Value {
     match target {
         ResolvedOrderTarget::AliasIndex(idx) => row[*idx].clone(),
-        ResolvedOrderTarget::Col(col) => resolve_col(record, col, disk_reads_allowed),
-        ResolvedOrderTarget::Expr(expr) => eval_expr(record, expr, disk_reads_allowed),
+        ResolvedOrderTarget::Col(col) => resolve_col(record, col, ctx.disk_reads_allowed),
+        ResolvedOrderTarget::Expr(expr) => eval_expr(record, expr, ctx),
     }
 }
 

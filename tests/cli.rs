@@ -3282,3 +3282,28 @@ fn empty_result_json_is_bracket_bracket_newline() {
         .success()
         .stdout("[]\n");
 }
+
+/// Task 1 (B1): pins `LIKE`'s match semantics across the hoisting of its
+/// pattern-to-`Regex` compile from once-per-row to once-per-query — same
+/// matches, same case-sensitivity, same anchoring as before the refactor.
+#[test]
+fn like_matches_are_stable_after_hoisting() {
+    let td = TempDir::new().unwrap();
+    for (p, s) in [
+        ("a.md", "---\ntitle: alpha\n---\n"),
+        ("b.md", "---\ntitle: beta\n---\n"),
+        ("c.md", "---\ntitle: alphabet\n---\n"),
+    ] {
+        fs::write(td.path().join(p), s).unwrap();
+    }
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg("-e")
+        .arg("SELECT title WHERE title LIKE 'alpha%' ORDER BY title")
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("alpha"))
+        .stdout(predicate::str::contains("alphabet"))
+        .stdout(predicate::str::contains("beta").not());
+}
