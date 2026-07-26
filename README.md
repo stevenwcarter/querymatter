@@ -267,12 +267,9 @@ literal — no change in behavior.
 now a **hard error by default**, naming the offending column and, when one is
 close enough, suggesting the nearest real one:
 
-```
+```console
 $ querymatter -e "SELECT staus" notes/
-Error: failed to execute query: SELECT staus
-
-Caused by:
-    unknown column `staus`, did you mean 'status'?
+querymatter: failed to execute query: SELECT staus: unknown column `staus`, did you mean 'status'?
 ```
 
 This checks every column position — `SELECT` (including inside a scalar
@@ -534,6 +531,30 @@ A few things worth knowing:
   current directory; a scan root *outside* cwd is not governed by it (its
   non-anchored patterns still match by name, but cwd-anchored `/…` patterns
   won't apply elsewhere).
+
+## Sample data & sample queries
+
+The repo ships a deterministic sample-vault generator as a second binary:
+
+```sh
+cargo run --bin querymatter-samples -- --scale 1k samples
+```
+
+This writes exactly 1000 Markdown files (`--scale 10k` / `--scale 100k` for
+10,000 / 100,000) into `samples/` (gitignored): a fixed `starwars/` folder —
+the classic GraphQL star-wars cast, identical at every scale — plus three
+scaled themes (`work/`, `recipes/`, `reading/`). Generation is fully
+deterministic: wiping the directory and regenerating from the same build
+produces byte-identical files, mtimes included. A non-empty target directory
+is refused unless you pass `--force` (which deletes and regenerates it).
+
+[`docs/sample-queries.md`](docs/sample-queries.md) walks through queries
+exercising most of the DSL against this tree, with expected output;
+[`docs/sample-queries.sql`](docs/sample-queries.sql) is the runnable version
+(`querymatter samples < docs/sample-queries.sql`), pinned by an integration
+test so the examples can never silently rot. The 100k scale plus
+`querymatter init samples` is a quick way to feel the cache speedup on a
+large vault.
 
 ## Caching large vaults (`.querymatter`)
 
