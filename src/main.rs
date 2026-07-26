@@ -60,7 +60,26 @@ use crate::store::{InMemoryStore, RecordStore};
 /// concept those subcommands have no analog for — `query run` is the one
 /// subcommand that genuinely is a query (it resolves a saved name to SQL and
 /// runs it the same way `-e` does), so it participates like query mode does.
+///
+/// Before anything else, SIGPIPE is reset to its default disposition
+/// (`SIG_DFL`). Rust's runtime sets `SIG_IGN` on startup, so writing to a
+/// stdout pipe whose reader has gone away (`querymatter -e '…' | head`)
+/// otherwise surfaces as an `EPIPE` `io::Error` instead of terminating the
+/// process — which then either propagates as a noisy "Broken pipe" error out
+/// of the streaming result path ([`run_statements`]) or panics a bare
+/// `println!`/`print!` call (the `query list`/`get`/`config`/`cache status`
+/// sinks below). Restoring `SIG_DFL` makes a closed reader kill the process
+/// via the signal instead, with no stderr noise and no panic — the standard
+/// behavior every other Unix filter (`grep`, `cat`, …) already has. This must
+/// run before any output at all, so both manifestations are covered no
+/// matter which runs first.
 fn main() -> ExitCode {
+    // SAFETY: `signal` with `SIGPIPE`/`SIG_DFL` only changes this process's
+    // signal disposition; it touches no memory and is called once, before
+    // any other thread exists.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let matches = Cli::command().get_matches();
     let cli = match Cli::from_arg_matches(&matches) {
         Ok(cli) => cli,

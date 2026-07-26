@@ -3500,3 +3500,58 @@ fn broken_pipe_exits_without_panic_or_error_noise() {
         "leaked Broken pipe error to stderr"
     );
 }
+
+/// Task 4 (B4) GREEN pin for the OTHER manifestation of the same bug: the
+/// plain `println!` sinks (`query list`, `config list`/`get`, `cache
+/// status`) don't go through [`OutputSink`](crate) at all, so a broken pipe
+/// there doesn't surface as an `io::Error` to propagate — `println!` panics
+/// outright ("failed printing to stdout"), aborting with exit code 101
+/// before `main`'s error handler ever runs. `query list` is exercised here
+/// (the others share the exact same `println!`-to-stdout shape): 2000 saved
+/// queries, each padded past a couple hundred bytes, comfortably exceed a
+/// pipe's 64 KiB kernel buffer, so later rows are still being printed after
+/// the early close below — reproducing the same "flush lands after the pipe
+/// is gone" race as the streaming-path test above, just through `println!`
+/// instead of `OutputSink::write_result`.
+///
+/// Written directly as `queries.toml` (bypassing `query save`, which parses
+/// each SQL string and would make 2000 saves too slow) — `query list` never
+/// re-parses saved SQL, only prints it, so hand-written, deliberately-inert
+/// SQL text is fine here.
+#[test]
+fn query_list_broken_pipe_exits_without_panic() {
+    use std::io::Read;
+    use std::process::{Command as PCommand, Stdio};
+
+    let home = TempDir::new().unwrap();
+    let config_dir = home.path().join("querymatter");
+    fs::create_dir_all(&config_dir).unwrap();
+    let pad = "x".repeat(200);
+    let mut queries_toml = String::new();
+    for i in 0..2000 {
+        queries_toml.push_str(&format!("q{i} = \"SELECT 1 -- {pad}\"\n"));
+    }
+    fs::write(config_dir.join("queries.toml"), queries_toml).unwrap();
+
+    let bin = assert_cmd::cargo::cargo_bin("querymatter");
+    let mut child = PCommand::new(bin)
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path())
+        .env_remove("QUERYMATTER_TABLE_STYLE")
+        .arg("query")
+        .arg("list")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut buf = [0u8; 64];
+    let _ = child.stdout.take().unwrap().read(&mut buf);
+    drop(child.stdout.take());
+    let out = child.wait_with_output().unwrap();
+    let code = out.status.code();
+    assert_ne!(code, Some(101), "panicked on broken pipe");
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("Broken pipe"),
+        "leaked Broken pipe error to stderr"
+    );
+}

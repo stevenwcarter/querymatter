@@ -771,6 +771,7 @@ dependencies = [
  "ignore",
  "indexmap",
  "insta",
+ "libc",
  "predicates",
  "regex",
  "rustyline",
