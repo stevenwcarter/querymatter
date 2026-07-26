@@ -3307,3 +3307,26 @@ fn like_matches_are_stable_after_hoisting() {
         .stdout(predicate::str::contains("alphabet"))
         .stdout(predicate::str::contains("beta").not());
 }
+
+/// Task 2 (B2): pins `REGEXP`'s match semantics across the hoisting of its
+/// pattern-to-`Regex` compile from once-per-row to once-per-query — same
+/// matches as before the refactor.
+#[test]
+fn regexp_matches_are_stable_after_hoisting() {
+    let td = TempDir::new().unwrap();
+    for (p, s) in [
+        ("a.md", "---\ncode: A123\n---\n"),
+        ("b.md", "---\ncode: B999\n---\n"),
+    ] {
+        fs::write(td.path().join(p), s).unwrap();
+    }
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg("-e")
+        .arg("SELECT code WHERE code REGEXP '^A[0-9]+$'")
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("A123"))
+        .stdout(predicate::str::contains("B999").not());
+}
