@@ -4092,6 +4092,50 @@ fn deeply_nested_frontmatter_is_skipped_not_crashed() {
         .stderr(predicates::str::contains("deep.md"));
 }
 
+/// B9 follow-up fix (CRITICAL): `deeply_nested_frontmatter_is_skipped_not_crashed`
+/// above reproduces the *compact* form (`- - - - … v`, all on one line), which
+/// the original `max_nesting_depth` counted directly. It did NOT count
+/// **indentation-nested** block sequences — the ordinary, one-`-`-per-line
+/// style, each line further indented than the last — since each such line
+/// only ever has a single leading `-` for the old estimator to see, scoring
+/// arbitrarily deep indentation-nested YAML as depth 1. That's the exact
+/// shape reproduced here: `x:` followed by ~1100 lines of one `-` each,
+/// indentation increasing by one column per line (comfortably past the
+/// ~900-950 depth where yaml-rust2's own recursive-descent parser overflows
+/// its call stack and aborts the whole process — see
+/// `deeply_nested_frontmatter_is_skipped_not_crashed`'s doc). The file this
+/// produces is ~594 KiB — nowhere near the 8 MiB default `max_file_bytes`
+/// (B8), which does NOT mask this vector. Confirmed FAILING (process exit
+/// 134, `fatal runtime error: stack overflow, aborting`) against the binary
+/// before the indentation-tracking fix to `max_nesting_depth`; PASSING after.
+/// `ok.md` alongside it must still load.
+#[test]
+fn indentation_nested_frontmatter_is_skipped_not_crashed() {
+    let td = TempDir::new().unwrap();
+    let depth = 1100;
+    let mut frontmatter = String::from("x:\n");
+    for i in 0..depth {
+        frontmatter.push_str(&" ".repeat(i + 1));
+        frontmatter.push_str(if i + 1 == depth { "- v\n" } else { "-\n" });
+    }
+    fs::write(
+        td.path().join("deep_indent.md"),
+        format!("---\n{frontmatter}---\n"),
+    )
+    .unwrap();
+    fs::write(td.path().join("ok.md"), "---\ntitle: ok\n---\n").unwrap();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg("-e")
+        .arg("SELECT title")
+        .arg(td.path())
+        .assert()
+        .success() // process did not abort/overflow
+        .stdout(predicates::str::contains("ok"))
+        .stderr(predicates::str::contains("deep_indent.md"))
+        .stderr(predicates::str::contains("nesting"));
+}
+
 /// B9 review fix (Critical false-positive): a file with LEGITIMATE, shallow
 /// frontmatter but a body containing unrelated bracket-heavy or dash-heavy
 /// text must load normally — the pre-parse depth cap that stops the crash in

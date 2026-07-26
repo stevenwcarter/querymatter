@@ -183,19 +183,27 @@ fn frontmatter_fence(content: &str) -> Option<&str> {
 /// prose the YAML engine never even sees (interval notation, a flattened
 /// outline) would wrongly compute a rejection-worthy depth.
 ///
-/// Only two constructs can nest a `Value` at all: `[`/`{` flow collections,
-/// and block sequences (`- ` entries). Over-counting only rejects more
-/// input, never lets a dangerous depth through, so this doesn't need to
-/// track YAML's grammar exactly — it takes the running max of:
+/// Three constructs can nest a `Value`, and the estimate is the running max
+/// of all three — over-counting only rejects more input, never lets a
+/// dangerous depth through, so none of these need to track YAML's grammar
+/// exactly:
 /// - the `[`/`{` bracket depth open at any point in the text (flow
-///   collections can span multiple lines, so this isn't reset per line), and
+///   collections can span multiple lines, so this isn't reset per line);
 /// - the number of leading `- ` block-sequence markers on any single line
-///   (a *compact* nested sequence, e.g. `- - - - v`). Indentation-nested
-///   block sequences (one `-` per line, each further indented) reach a
-///   comparable depth only by making the file quadratically larger, which
-///   `max_file_bytes` (fix B8) already bounds well before this depth would
-///   matter — so this deliberately doesn't try to track indentation levels
-///   across lines.
+///   (a *compact* nested sequence, e.g. `- - - - v`); and
+/// - indentation-nested block collections — the ordinary style, one `- `
+///   entry or `key:` mapping per line, each level a separate, further-
+///   indented line rather than packed onto one. A stack of the indentation
+///   columns currently open tracks this: a line indented deeper than the
+///   previous non-blank, non-comment line opens a level (push); a line
+///   indented at or shallower than an open level's column closes it (pop
+///   back to the matching column); the running maximum stack size is the
+///   estimate. Blank and comment-only lines are skipped entirely rather than
+///   treated as closing every open level at column 0 — YAML's own grammar
+///   treats them the same way (neither affects block structure), and *not*
+///   skipping them would let an attacker interleave them between real
+///   nesting levels to reset the tracked indentation and slip back under the
+///   cap while the real parser keeps recursing regardless.
 ///
 /// A leading `-` only counts as a sequence marker when followed by
 /// whitespace or end-of-line (`- - - - v`), not when it's the leading `-` of
@@ -203,8 +211,11 @@ fn frontmatter_fence(content: &str) -> Option<&str> {
 fn max_nesting_depth(text: &str) -> usize {
     let mut bracket_depth = 0usize;
     let mut max_depth = 0usize;
+    let mut indent_stack: Vec<usize> = Vec::new();
+    let mut prev_indent: Option<usize> = None;
     for line in text.lines() {
-        let mut rest = line.trim_start();
+        let content = line.trim_start();
+        let mut rest = content;
         let mut dash_run = 0usize;
         while let Some(after_dash) = rest.strip_prefix('-') {
             if after_dash.is_empty() || after_dash.starts_with(char::is_whitespace) {
@@ -225,6 +236,29 @@ fn max_nesting_depth(text: &str) -> usize {
                 _ => {}
             }
         }
+
+        // Indentation-nested collections (B9 follow-up): skip lines that
+        // never affect YAML's block structure — blank lines, and
+        // comment-only lines — so an attacker can't interleave them between
+        // real nesting levels to reset `prev_indent`/`indent_stack` back to
+        // column 0 and slip under the cap while the real parser keeps
+        // recursing at the true (unreset) depth.
+        if content.is_empty() || content.starts_with('#') {
+            continue;
+        }
+        let indent = line.len() - content.len();
+        while let Some(&top) = indent_stack.last() {
+            if top > indent {
+                indent_stack.pop();
+            } else {
+                break;
+            }
+        }
+        if prev_indent.is_some_and(|prev| indent > prev) {
+            indent_stack.push(indent);
+        }
+        prev_indent = Some(indent);
+        max_depth = max_depth.max(indent_stack.len());
     }
     max_depth
 }
@@ -478,6 +512,59 @@ mod tests {
         assert_eq!(max_nesting_depth("tags:\n  - a\n  - b\n"), 1);
     }
 
+    // FIX 1 (B9 critical follow-up): an INDENTATION-nested block sequence —
+    // one `-` per line, each further indented than the last — is exactly the
+    // vector the compact-dash/bracket estimate above misses (it only ever
+    // sees one `-` per line, scoring this depth 1 no matter how deep it
+    // actually goes). Pins that the indentation-stack estimate now catches
+    // it directly, independent of gray_matter or the CLI.
+    #[test]
+    fn max_nesting_depth_counts_indentation_nested_block_sequences() {
+        let depth = MAX_NESTING_DEPTH + 20;
+        let mut text = String::from("x:\n");
+        for i in 0..depth {
+            text.push_str(&" ".repeat(i + 1));
+            text.push_str(if i + 1 == depth { "- v\n" } else { "-\n" });
+        }
+        assert!(
+            max_nesting_depth(&text) > MAX_NESTING_DEPTH,
+            "indentation-nested depth {depth} must be detected"
+        );
+    }
+
+    // Companion to the above: legitimate frontmatter that's genuinely
+    // shallow — a 3-level nested mapping — must NOT be scored anywhere near
+    // the cap. Pins the estimator against over-rejecting ordinary documents.
+    #[test]
+    fn max_nesting_depth_stays_small_for_a_legitimate_shallow_nested_mapping() {
+        let text = "estimate:\n  low:\n    min: 1\n    max: 2\n  high: 3\n";
+        assert_eq!(max_nesting_depth(text), 2);
+    }
+
+    // Blank lines and full-line comments must never reset the tracked
+    // indentation back to column 0 — see the doc comment on the skip inside
+    // `max_nesting_depth`. Without the skip, an attacker could interleave
+    // these between real nesting levels to keep every *segment* under the
+    // cap while the real YAML parser keeps recursing at the true, unreset
+    // depth (comments and blank lines never close a YAML block).
+    #[test]
+    fn max_nesting_depth_is_not_reset_by_interleaved_blank_or_comment_lines() {
+        let depth = MAX_NESTING_DEPTH + 20;
+        let mut text = String::from("x:\n");
+        for i in 0..depth {
+            if i % 10 == 0 {
+                text.push('\n');
+                text.push_str("# a comment\n");
+            }
+            text.push_str(&" ".repeat(i + 1));
+            text.push_str(if i + 1 == depth { "- v\n" } else { "-\n" });
+        }
+        assert!(
+            max_nesting_depth(&text) > MAX_NESTING_DEPTH,
+            "interleaved blank/comment lines must not mask the true depth"
+        );
+    }
+
     #[test]
     fn extract_rejects_frontmatter_nested_past_the_cap() {
         let depth = MAX_NESTING_DEPTH + 1;
@@ -529,6 +616,41 @@ mod tests {
             frontmatter_fence("---\ntitle: ok\n---"),
             Some("title: ok\n")
         );
+    }
+
+    // FIX 3 (B9 review, minor): `frontmatter_fence` must recognize a fence in
+    // every case gray_matter 0.3.2 would parse one — if gray_matter ever
+    // accepted an opening fence `frontmatter_fence` rejects, the depth scan
+    // would be skipped and deep YAML would reach the parser unguarded.
+    // Checked against gray_matter's vendored source (`Matter::parse`,
+    // `gray_matter-0.3.2/src/matter.rs`): its own opening-fence check is
+    // `first_line.trim_end() == self.delimiter`, run on the literal first
+    // line of the input — exactly as strict as `frontmatter_fence`'s check
+    // here. A leading blank line, leading whitespace before the dashes, or a
+    // leading BOM all make BOTH sides agree there is no fence at all (the
+    // whole input becomes body content), so there's no bypass today. These
+    // pin that agreement on the edge inputs directly, so a future gray_matter
+    // bump that became more lenient couldn't silently reopen it without a
+    // test noticing.
+    #[test]
+    fn frontmatter_fence_and_gray_matter_agree_a_leading_blank_line_is_no_fence() {
+        let c = "\n---\ntitle: ok\n---\n";
+        assert_eq!(frontmatter_fence(c), None);
+        assert!(matches!(extract(c), Extract::None));
+    }
+
+    #[test]
+    fn frontmatter_fence_and_gray_matter_agree_leading_whitespace_is_no_fence() {
+        let c = "   ---\ntitle: ok\n---\n";
+        assert_eq!(frontmatter_fence(c), None);
+        assert!(matches!(extract(c), Extract::None));
+    }
+
+    #[test]
+    fn frontmatter_fence_and_gray_matter_agree_a_leading_bom_is_no_fence() {
+        let c = "\u{FEFF}---\ntitle: ok\n---\n";
+        assert_eq!(frontmatter_fence(c), None);
+        assert!(matches!(extract(c), Extract::None));
     }
 
     // B9 review fix (Critical false-positive): the depth scan must be scoped
