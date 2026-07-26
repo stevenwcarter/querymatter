@@ -3724,3 +3724,41 @@ fn order_by_and_group_order_stable_after_decorate() {
         .success()
         .stdout(predicate::str::is_match("(?s)x.*y").unwrap()); // x (c=2) before y (c=1)
 }
+
+/// Task 9 (B9, correctness): a frontmatter value nested far beyond any
+/// legitimate document must be skipped with a warning, not take the whole
+/// process down.
+///
+/// Bracket nesting (`[[[…]]]`) is *not* the reproducer: yaml-rust2 0.10 caps
+/// flow-collection (`[`/`{`) nesting itself (a `u8` counter, `flow_level` in
+/// its scanner) at 255 and returns a clean parse error past that — already
+/// exercised by `invalid_yaml_is_invalid`'s sibling paths, no crash to
+/// characterize there. The reproducer empirically found instead is a
+/// **compact block sequence** — `- - - - … v` — which isn't flow syntax at
+/// all, so that counter never engages; nesting it this deeply overflows
+/// yaml-rust2's own recursive-descent parser before `pod_to_value` (this
+/// crate's code) ever runs. On this crate's file-scanning worker threads
+/// (`parallel::map_paths`, default ~2 MiB stacks) that overflow reliably
+/// aborts the whole process (`fatal runtime error: stack overflow,
+/// aborting`) somewhere between depth 900 and 950; depth 2000 here gives
+/// comfortable margin. `ok.md` alongside it must still load.
+#[test]
+fn deeply_nested_frontmatter_is_skipped_not_crashed() {
+    let td = TempDir::new().unwrap();
+    let depth = 2000;
+    fs::write(
+        td.path().join("deep.md"),
+        format!("---\nx:\n  {}v\n---\n", "- ".repeat(depth)),
+    )
+    .unwrap();
+    fs::write(td.path().join("ok.md"), "---\ntitle: ok\n---\n").unwrap();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg("-e")
+        .arg("SELECT title")
+        .arg(td.path())
+        .assert()
+        .success() // process did not abort/overflow
+        .stdout(predicates::str::contains("ok"))
+        .stderr(predicates::str::contains("deep.md"));
+}
