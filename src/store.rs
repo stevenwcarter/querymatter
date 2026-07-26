@@ -205,7 +205,8 @@ impl InMemoryStore {
             report.warnings.push(format!("saving cache: {err}"));
         }
 
-        let slices = slices_from_cached(vault, &fresh, wanted);
+        let (slices, slices_report) = slices_from_cached(vault, &fresh, wanted);
+        report.merge(slices_report);
         (InMemoryStore { slices, opts }, report)
     }
 
@@ -299,7 +300,9 @@ impl InMemoryStore {
 }
 
 /// Builds one [`DirSlice`] per cached directory in `dirs` via
-/// [`cache::records_from`], stamping each with the current time. Shared by
+/// [`cache::records_from`], stamping each with the current time, alongside
+/// the [`LoadReport`] [`cache::records_from`] returns (e.g. any `CachedFile`
+/// rejected as an unsafe cached `rel_path` — B6). Shared by
 /// [`InMemoryStore::from_cache`] and [`RecordStore::refresh`], both of
 /// which rebuild the store's slices from a freshly refreshed `Vec<CachedDir>`.
 ///
@@ -309,9 +312,10 @@ fn slices_from_cached(
     vault: &Path,
     dirs: &[CachedDir],
     wanted: Option<&BTreeSet<String>>,
-) -> Vec<DirSlice> {
+) -> (Vec<DirSlice>, LoadReport) {
     let now = SystemTime::now();
-    cache::records_from(vault, dirs, wanted)
+    let (entries, report) = cache::records_from(vault, dirs, wanted);
+    let slices = entries
         .into_iter()
         .map(|(root, records, field_names)| DirSlice {
             root,
@@ -319,7 +323,8 @@ fn slices_from_cached(
             scanned_at: now,
             field_names,
         })
-        .collect()
+        .collect();
+    (slices, report)
 }
 
 impl RecordStore for InMemoryStore {
@@ -406,7 +411,9 @@ impl RecordStore for InMemoryStore {
             report.warnings.push(format!("saving cache: {err}"));
         }
 
-        self.slices = slices_from_cached(vault, &cached, None);
+        let (slices, slices_report) = slices_from_cached(vault, &cached, None);
+        self.slices = slices;
+        report.merge(slices_report);
         report
     }
 }

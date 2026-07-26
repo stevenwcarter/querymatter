@@ -12,7 +12,7 @@ use indexmap::IndexMap;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use std::{fs, io};
 
@@ -738,8 +738,45 @@ fn content_equal(a: &[CachedDir], b: &[CachedDir]) -> bool {
     normalize(a) == normalize(b)
 }
 
+/// Lexically resolves `dir.join(rel_path)`, rejecting any `rel_path` that
+/// could escape `dir` — the guard between a poisoned on-disk cache blob (a
+/// crafted-but-well-formed [`CachedFile::rel_path`] such as
+/// `../../../../etc/passwd`) and [`records_from`] handing back a `Record`
+/// whose `abs_path` reads outside the vault (B6). `load_cache_under` only
+/// rejects a bad `MAGIC`/version header, not a malicious-but-validly-shaped
+/// blob, so this check has to happen here, at the point a `Record`'s
+/// filesystem path is actually built.
+///
+/// Rejects an absolute path and any `..`/root/prefix [`Component`]; a
+/// leading/embedded `.` component is harmless and stripped. Deliberately
+/// lexical only — it never canonicalizes or otherwise touches the
+/// filesystem, since canonicalizing could itself follow a symlink, and the
+/// goal is to reject traversal in the *stored* data, not resolve it.
+/// `starts_with` is a belt-and-suspenders check on top of the component
+/// scan, not the primary defense.
+fn contained_path(dir: &Path, rel_path: &str) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in Path::new(rel_path).components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    let joined = dir.join(&normalized);
+    joined.starts_with(dir).then_some(joined)
+}
+
+/// [`records_from`]'s per-directory result: the directory's own path, the
+/// `Record`s reconstructed under it, and the full frontmatter field-name
+/// union read from it (see [`records_from`]'s doc comment for what that
+/// union is used for). Named so the tuple doesn't have to be spelled out at
+/// every use site.
+type RecordsByDir = Vec<(PathBuf, Vec<Record>, BTreeSet<String>)>;
+
 /// Reconstructs [`Record`]s from cached directories for querying, grouped
-/// by directory.
+/// by directory, alongside a [`LoadReport`] of any [`CachedFile`] rejected
+/// as unsafe (see [`contained_path`]).
 ///
 /// `root` is the overall scan root — passing it (rather than each
 /// [`CachedDir::dir`]) is what keeps the cache-equals-live invariant intact,
@@ -758,20 +795,39 @@ fn content_equal(a: &[CachedDir], b: &[CachedDir]) -> bool {
 /// cache data is never itself pruned (only [`build_vault`]/`refresh_*`,
 /// which write it, run over every field), so a later query for a different
 /// field still finds it here.
+///
+/// Every `CachedFile::rel_path` is checked via [`contained_path`] before it
+/// becomes a `Record`: an entry whose `rel_path` would escape `cached_dir.dir`
+/// (B6 — a poisoned cache blob planted by a malicious vault) is skipped
+/// entirely, with a warning pushed onto the returned [`LoadReport`] naming
+/// it, rather than silently dropped — consistent with how every other skip
+/// (unreadable file, invalid frontmatter) is surfaced. A skipped file's
+/// fields never contribute to the returned field-name union either, since it
+/// is treated as untrusted, not merely stale.
 pub fn records_from(
     root: &Path,
     dirs: &[CachedDir],
     wanted: Option<&BTreeSet<String>>,
-) -> Vec<(PathBuf, Vec<Record>, BTreeSet<String>)> {
-    dirs.iter()
+) -> (RecordsByDir, LoadReport) {
+    let mut report = LoadReport::default();
+    let entries = dirs
+        .iter()
         .map(|cached_dir| {
             let mut field_names = BTreeSet::new();
             let records = cached_dir
                 .files
                 .iter()
-                .map(|file| {
+                .filter_map(|file| {
+                    let Some(path) = contained_path(&cached_dir.dir, &file.rel_path) else {
+                        report.skipped += 1;
+                        report.warnings.push(format!(
+                            "{}: rejected cached rel_path {:?} escaping the vault",
+                            cached_dir.dir.display(),
+                            file.rel_path
+                        ));
+                        return None;
+                    };
                     field_names.extend(file.fields.keys().cloned());
-                    let path = cached_dir.dir.join(&file.rel_path);
                     let fields = match wanted {
                         None => file.fields.clone(),
                         Some(set) => file
@@ -781,12 +837,20 @@ pub fn records_from(
                             .map(|(name, value)| (name.clone(), value.clone()))
                             .collect(),
                     };
-                    Record::new(root, &path, fields, file.mtime, file.size, file.word_count)
+                    Some(Record::new(
+                        root,
+                        &path,
+                        fields,
+                        file.mtime,
+                        file.size,
+                        file.word_count,
+                    ))
                 })
                 .collect();
             (cached_dir.dir.clone(), records, field_names)
         })
-        .collect()
+        .collect();
+    (entries, report)
 }
 
 /// The `querymatter init` core: a full scan of `base` (there is no previous
@@ -1557,7 +1621,8 @@ mod tests {
         write_file(td.path(), "plans/a.md", "---\nstatus: draft\n---\n");
 
         let cached = build_initial_cache(td.path());
-        let cached_records: Vec<Record> = records_from(td.path(), &cached, None)
+        let (entries, _report) = records_from(td.path(), &cached, None);
+        let cached_records: Vec<Record> = entries
             .into_iter()
             .flat_map(|(_, records, _field_names)| records)
             .collect();
@@ -1607,15 +1672,14 @@ mod tests {
             files: vec![malicious, legitimate],
         };
 
-        let records: Vec<Record> = records_from(vault, &[cached_dir], None)
+        let (entries, report) = records_from(vault, &[cached_dir], None);
+        let records: Vec<Record> = entries
             .into_iter()
             .flat_map(|(_, records, _field_names)| records)
             .collect();
 
         assert!(
-            !records
-                .iter()
-                .any(|r| r.abs_path().ends_with("etc/passwd")),
+            !records.iter().any(|r| r.abs_path().ends_with("etc/passwd")),
             "a traversal rel_path must never become a Record pointing outside the vault, got {records:?}"
         );
         assert_eq!(
@@ -1624,6 +1688,85 @@ mod tests {
             "only the legitimate nested rel_path should survive, got {records:?}"
         );
         assert_eq!(records[0].abs_path(), vault.join("a/b.md").as_path());
+
+        assert_eq!(
+            report.skipped, 1,
+            "the rejected traversal entry must be counted as a skip"
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("../../../../etc/passwd")),
+            "the skip must be observable via a LoadReport warning naming the rel_path, got {:?}",
+            report.warnings
+        );
+    }
+
+    /// B6 positive case: a `rel_path` nested several levels deep (`a/b/c.md`)
+    /// is exactly the shape a legitimate scan produces for a subdirectory
+    /// file (INV-4, cache round-trip) and must still load — the containment
+    /// check must not reject ordinary nesting, only actual escapes.
+    #[test]
+    fn records_from_still_loads_legitimate_nested_rel_path() {
+        let td = TempDir::new().unwrap();
+        let vault = td.path();
+
+        let cached_dir = CachedDir {
+            dir: vault.to_path_buf(),
+            scanned_at: UNIX_EPOCH,
+            dir_mtime: UNIX_EPOCH,
+            files: vec![CachedFile {
+                rel_path: "a/b/c.md".into(),
+                mtime: UNIX_EPOCH,
+                size: 0,
+                fields: IndexMap::new(),
+                word_count: 0,
+            }],
+        };
+
+        let (entries, report) = records_from(vault, &[cached_dir], None);
+        let records: Vec<Record> = entries
+            .into_iter()
+            .flat_map(|(_, records, _field_names)| records)
+            .collect();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].abs_path(), vault.join("a/b/c.md").as_path());
+        assert_eq!(report.skipped, 0);
+        assert!(report.warnings.is_empty());
+    }
+
+    /// B6: an absolute `rel_path` (no `..` needed at all) must be rejected
+    /// the same way a `..`-relative traversal is — [`contained_path`] checks
+    /// via [`Component`] matching, not string-matching for `..`, so this
+    /// pins that an absolute path is caught too.
+    #[test]
+    fn records_from_rejects_absolute_rel_path() {
+        let td = TempDir::new().unwrap();
+        let vault = td.path();
+
+        let cached_dir = CachedDir {
+            dir: vault.to_path_buf(),
+            scanned_at: UNIX_EPOCH,
+            dir_mtime: UNIX_EPOCH,
+            files: vec![CachedFile {
+                rel_path: "/etc/passwd".into(),
+                mtime: UNIX_EPOCH,
+                size: 0,
+                fields: IndexMap::new(),
+                word_count: 0,
+            }],
+        };
+
+        let (entries, report) = records_from(vault, &[cached_dir], None);
+        let records: Vec<Record> = entries
+            .into_iter()
+            .flat_map(|(_, records, _field_names)| records)
+            .collect();
+
+        assert!(records.is_empty(), "got {records:?}");
+        assert_eq!(report.skipped, 1);
     }
 
     /// Every directory's `rel_path`s, in the order they appear in `dirs` and
