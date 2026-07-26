@@ -193,6 +193,184 @@ fn oneshot_emits_no_startup_banner() {
         .stdout(predicates::str::contains("Type .help").not());
 }
 
+/// Opens a pseudo-terminal pair for [`repl_banner_goes_to_stderr_not_stdout`].
+/// Only the returned slave end is ever handed to a child process (as its
+/// stdin); the master stays with the caller to feed input, so no other
+/// test's own stdin/stdout is touched. A non-zero window size is set
+/// up front so rustyline's line-layout math never has to cope with a
+/// zero-width terminal.
+#[cfg(unix)]
+fn open_pty() -> (std::fs::File, std::fs::File) {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::io::RawFd;
+
+    let mut controller: RawFd = -1;
+    let mut follower: RawFd = -1;
+    let winsize = libc::winsize {
+        ws_row: 24,
+        ws_col: 80,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: `controller`/`follower` are valid `&mut RawFd` locals, `winsize`
+    // is a valid `&libc::winsize`, and the name/termios out-params are null,
+    // which openpty(3) accepts to mean "don't care about the tty's name or
+    // initial termios".
+    let rc = unsafe {
+        libc::openpty(
+            &mut controller,
+            &mut follower,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            &winsize,
+        )
+    };
+    assert_eq!(rc, 0, "openpty failed: {}", std::io::Error::last_os_error());
+    // SAFETY: openpty just handed back two freshly opened fds that nothing
+    // else in this process holds, so each is safe to take ownership of.
+    unsafe {
+        (
+            std::fs::File::from_raw_fd(controller),
+            std::fs::File::from_raw_fd(follower),
+        )
+    }
+}
+
+/// Force-kills the process named by `pid` after `timeout` unless the
+/// returned flag is set first — a safety net so a hang in the REPL under
+/// test (e.g. a rustyline regression that stops reading its input) can never
+/// wedge the whole `cargo test` run. The caller must set the flag once it's
+/// done with the child, then join the handle.
+#[cfg(unix)]
+fn spawn_watchdog(
+    pid: u32,
+    timeout: std::time::Duration,
+) -> (
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    std::thread::JoinHandle<()>,
+) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let done = Arc::new(AtomicBool::new(false));
+    let watcher_done = Arc::clone(&done);
+    let handle = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline && !watcher_done.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if !watcher_done.load(Ordering::Relaxed) {
+            // SAFETY: `pid` names this test's own just-spawned child; killing
+            // it only ever unblocks that child's own reads/waits below.
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    });
+    (done, handle)
+}
+
+/// Regression test for the REPL startup banner (record count + `.help`/
+/// `.schema` hint) printing to stdout: stdout also carries query result data
+/// (`OutputSink::Stdout`), so the banner corrupted a redirected results file
+/// ahead of the first query's output. Every other REPL diagnostic (row
+/// counts, errors, redirect notices) already goes to stderr; the banner must
+/// match.
+///
+/// `main.rs`'s dispatch only enters `repl::run` when stdin is a genuine TTY —
+/// piped/non-terminal stdin runs batch mode instead, which never prints the
+/// banner at all (see `batch_mode_stdin_emits_no_startup_banner` /
+/// `oneshot_emits_no_startup_banner` above) — so this is the one test in this
+/// file that needs a real pseudo-terminal on the child's stdin. Stdout and
+/// stderr stay on ordinary pipes, matching the bug's own scenario exactly:
+/// an interactive TTY session with redirected output.
+///
+/// The query line and `.exit` are written as two separate writes, with the
+/// second held back until the query's `-- 1 row` line has actually arrived
+/// on stderr: sending both lines in one burst before rustyline's own
+/// `readline()`/raw-mode setup has run raced with it in practice (verified
+/// manually against this REPL) and silently dropped the second line, hanging
+/// the child forever waiting for an `.exit` that already came and went.
+#[cfg(unix)]
+#[test]
+fn repl_banner_goes_to_stderr_not_stdout() {
+    use std::io::{Read, Write};
+    use std::sync::atomic::Ordering;
+
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    let (mut controller, follower) = open_pty();
+
+    let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("querymatter"));
+    cmd.arg(td.path())
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path())
+        .env_remove("QUERYMATTER_TABLE_STYLE")
+        // A known-supported TERM makes rustyline's "is this terminal usable"
+        // check deterministic, regardless of what the test runner's own
+        // environment happens to export.
+        .env("TERM", "xterm")
+        .stdin(std::process::Stdio::from(follower))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let mut child = cmd.spawn().expect("failed to spawn querymatter");
+    let (watchdog_done, watchdog) = spawn_watchdog(child.id(), std::time::Duration::from_secs(10));
+    let mut child_stdout = child.stdout.take().expect("child stdout was not piped");
+    let mut child_stderr = child.stderr.take().expect("child stderr was not piped");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = child_stdout.read_to_end(&mut buf);
+        buf
+    });
+
+    controller
+        .write_all(b"SELECT count(*) AS n;\n")
+        .expect("failed to write the query line to the pty");
+
+    let mut stderr_so_far = Vec::new();
+    let mut chunk = [0_u8; 256];
+    while !String::from_utf8_lossy(&stderr_so_far).contains("-- 1 row") {
+        let n = child_stderr
+            .read(&mut chunk)
+            .expect("failed to read child stderr");
+        assert_ne!(
+            n,
+            0,
+            "child stderr closed before the query's row-count line arrived; got so far:\n{}",
+            String::from_utf8_lossy(&stderr_so_far)
+        );
+        stderr_so_far.extend_from_slice(&chunk[..n]);
+    }
+
+    // Match the REPL's real exit command (`.exit`; `.quit` is a synonym).
+    controller
+        .write_all(b".exit\n")
+        .expect("failed to write the exit command to the pty");
+    drop(controller); // nothing more to send; frees the fd promptly
+
+    child_stderr
+        .read_to_end(&mut stderr_so_far)
+        .expect("failed to drain the rest of child stderr");
+    let stdout = stdout_reader.join().expect("stdout reader thread panicked");
+    child.wait().expect("failed to reap the REPL child");
+    watchdog_done.store(true, Ordering::Relaxed);
+    watchdog.join().expect("pty watchdog thread panicked");
+
+    let stdout = String::from_utf8_lossy(&stdout);
+    let stderr = String::from_utf8_lossy(&stderr_so_far);
+
+    let banner = "Type .help"; // same distinctive substring the batch/one-shot guards above use
+    assert!(
+        stderr.contains(banner),
+        "banner missing from stderr:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains(banner),
+        "banner leaked onto stdout:\n{stdout}"
+    );
+}
+
 #[test]
 fn query_error_exits_nonzero() {
     let td = tree();

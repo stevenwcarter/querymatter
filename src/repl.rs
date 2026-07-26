@@ -411,7 +411,7 @@ pub fn run(mut session: Session) -> anyhow::Result<()> {
         load_history(&mut editor, path);
     }
 
-    println!("{}", banner(record_count(&session)));
+    eprintln!("{}", banner(record_count(&session)));
 
     let mut buffer = LineBuffer::new();
     let mut sink = OutputSink::Stdout;
@@ -505,10 +505,12 @@ fn row_count_line(n: usize, elapsed: Option<Duration>) -> String {
     }
 }
 
-/// The startup banner [`run`] prints to stdout on entering the REPL: the
+/// The startup banner [`run`] prints to stderr on entering the REPL: the
 /// record count plus a `.help`/`.schema` hint. Pulled out as a pure function
 /// so its content is unit-tested without a TTY; REPL-only — batch and `-e`
-/// mode never print it.
+/// mode never print it. Stderr, not stdout, so a redirected results file
+/// (stdout is data, per the module doc in `main.rs`) never gets this chrome
+/// mixed in ahead of the first query's output.
 fn banner(record_count: i64) -> String {
     format!("querymatter — {record_count} records. Type .help for commands, .schema for fields.")
 }
