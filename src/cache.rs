@@ -1571,6 +1571,61 @@ mod tests {
         assert_eq!(&cached_records[0], live_records[0]);
     }
 
+    /// B6 (security, high risk): a poisoned on-disk cache blob can carry a
+    /// `CachedFile::rel_path` that escapes the vault — `load_cache_under`
+    /// only guards against corruption (a bad MAGIC/version header), not
+    /// malice, so a crafted-but-well-formed blob decodes fine. Crafting a
+    /// real bincode blob is impractical, so this constructs the `CachedDir`
+    /// directly (matching the real field names) with a traversal `rel_path`
+    /// alongside a legitimate nested one, and characterizes `records_from`'s
+    /// behavior: the traversal entry must NOT become a `Record` (today it
+    /// does, pointing outside the vault via `Record::abs_path`), while the
+    /// legitimate nested entry must still load (INV-4 cache round-trip).
+    #[test]
+    fn records_from_rejects_path_traversal_rel_path() {
+        let td = TempDir::new().unwrap();
+        let vault = td.path();
+
+        let malicious = CachedFile {
+            rel_path: "../../../../etc/passwd".into(),
+            mtime: UNIX_EPOCH,
+            size: 0,
+            fields: IndexMap::new(),
+            word_count: 0,
+        };
+        let legitimate = CachedFile {
+            rel_path: "a/b.md".into(),
+            mtime: UNIX_EPOCH,
+            size: 0,
+            fields: IndexMap::new(),
+            word_count: 0,
+        };
+        let cached_dir = CachedDir {
+            dir: vault.to_path_buf(),
+            scanned_at: UNIX_EPOCH,
+            dir_mtime: UNIX_EPOCH,
+            files: vec![malicious, legitimate],
+        };
+
+        let records: Vec<Record> = records_from(vault, &[cached_dir], None)
+            .into_iter()
+            .flat_map(|(_, records, _field_names)| records)
+            .collect();
+
+        assert!(
+            !records
+                .iter()
+                .any(|r| r.abs_path().ends_with("etc/passwd")),
+            "a traversal rel_path must never become a Record pointing outside the vault, got {records:?}"
+        );
+        assert_eq!(
+            records.len(),
+            1,
+            "only the legitimate nested rel_path should survive, got {records:?}"
+        );
+        assert_eq!(records[0].abs_path(), vault.join("a/b.md").as_path());
+    }
+
     /// Every directory's `rel_path`s, in the order they appear in `dirs` and
     /// within each `CachedDir` — used by the Task 2 (parallel scan)
     /// determinism/order tests below to compare two refreshes' shapes
