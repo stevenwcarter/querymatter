@@ -3376,3 +3376,68 @@ fn json_output_unchanged_by_terminal_sanitizer() {
         .success()
         .stdout(predicate::str::contains("\\u001b"));
 }
+
+/// Task 3 (B3) review fix: the other sanitized path besides table — pins
+/// that `render_vertical` (`\G`) also neutralizes the raw ESC byte, mirroring
+/// `table_output_neutralizes_ansi_escapes_from_frontmatter` above.
+#[test]
+fn vertical_output_neutralizes_ansi_escapes_from_frontmatter() {
+    let td = TempDir::new().unwrap();
+    fs::write(
+        td.path().join("evil.md"),
+        "---\ntitle: \"\u{1b}[2J[H spoof\"\n---\n",
+    )
+    .unwrap();
+    let home = TempDir::new().unwrap();
+    let out = qm(home.path())
+        .args(["-e", "SELECT title\\G"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert!(!out.contains(&0x1b), "raw ESC leaked into vertical output");
+}
+
+/// Task 3 (B3) review fix, INV-1 pin: csv stays byte-untouched by the
+/// terminal sanitizer — mirrors `json_output_unchanged_by_terminal_sanitizer`
+/// above, but for `--format csv`, where the ESC byte survives raw (csv has no
+/// escaping mechanism of its own for control bytes the way json's `\uXXXX`
+/// does).
+#[test]
+fn csv_output_unchanged_by_terminal_sanitizer() {
+    let td = TempDir::new().unwrap();
+    fs::write(td.path().join("evil.md"), "---\ntitle: \"\u{1b}x\"\n---\n").unwrap();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg("-e")
+        .arg("SELECT title")
+        .arg("--format")
+        .arg("csv")
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\u{1b}"));
+}
+
+/// Task 3 (B3) review fix (FIX 1 scope pin): Markdown (`Format::Md`) is a
+/// fixed interchange format, not a terminal display, so it must NOT be
+/// sanitized — the raw ESC byte must survive `--format md` untouched. Pins
+/// FIX 1's decision so a future "just pass sanitize through" refactor of
+/// `new_table`'s shared plumbing can't silently start scrubbing Markdown.
+#[test]
+fn md_output_unchanged_by_terminal_sanitizer() {
+    let td = TempDir::new().unwrap();
+    fs::write(td.path().join("evil.md"), "---\ntitle: \"\u{1b}x\"\n---\n").unwrap();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg("-e")
+        .arg("SELECT title")
+        .arg("--format")
+        .arg("md")
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\u{1b}"));
+}

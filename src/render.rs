@@ -251,7 +251,7 @@ fn want_dynamic_width(is_tty: bool) -> bool {
 /// [`want_dynamic_width`]), not in [`new_table`]/[`render_markdown`]: Markdown
 /// is a fixed interchange format and must stay terminal-independent.
 fn render_table(table: &ResultTable, style: TableStyle, header: bool) -> String {
-    let mut ct = new_table(table, header);
+    let mut ct = new_table(table, header, true);
     if want_dynamic_width(std::io::stdout().is_terminal()) {
         ct.set_content_arrangement(comfy_table::ContentArrangement::Dynamic);
     }
@@ -307,8 +307,12 @@ fn render_vertical(table: &ResultTable) -> String {
 }
 
 /// Renders `table` as a Markdown table, independent of any [`TableStyle`].
+///
+/// Passes `sanitize: false` to [`new_table`]: Markdown is a fixed interchange
+/// format (see [`render_table`]'s doc), so — unlike [`Format::Table`] — its
+/// cells must NOT go through [`sanitize_for_terminal`]/[`sanitized_display`].
 fn render_markdown(table: &ResultTable, header: bool) -> String {
-    let mut ct = new_table(table, header);
+    let mut ct = new_table(table, header, false);
     ct.load_preset(ASCII_MARKDOWN);
     ct.trim_fmt()
 }
@@ -317,12 +321,16 @@ fn render_markdown(table: &ResultTable, header: bool) -> String {
 /// frontmatter value can't forge terminal escape sequences (screen clears,
 /// cursor moves, forged rows) when rendered into a table cell or vertical
 /// (`\G`) line. `\t` is left untouched; everything else `char::is_control`
-/// reports becomes U+FFFD.
+/// reports (including `\n`) becomes U+FFFD.
 ///
-/// Used **only** by the table ([`new_table`]) and vertical
-/// ([`render_vertical`]) paths. Never call this from the csv/tsv/json paths —
-/// those are a stable, byte-identity interchange contract (see the module
-/// doc) and must keep receiving raw [`Value::display`] output untouched.
+/// Used by the interactive [`Format::Table`] path (via [`new_table`]'s
+/// `sanitize: true` call from [`render_table`]) and the vertical
+/// ([`render_vertical`]) path. [`Format::Md`] shares [`new_table`] but calls
+/// it with `sanitize: false` from [`render_markdown`], since Markdown is a
+/// fixed interchange format and must stay terminal-independent. Never call
+/// this from the csv/tsv/json paths either — those are the other stable,
+/// byte-identity interchange contract (see the module doc) and must keep
+/// receiving raw [`Value::display`] output untouched.
 fn sanitize_for_terminal(s: &str) -> Cow<'_, str> {
     if !s.chars().any(|c| c.is_control() && c != '\t') {
         return Cow::Borrowed(s);
@@ -341,21 +349,45 @@ fn sanitize_for_terminal(s: &str) -> Cow<'_, str> {
 }
 
 /// [`Value::display`], sanitized for terminal display via
-/// [`sanitize_for_terminal`]. Used by the table and vertical (`\G`) paths
-/// only — see that function's doc for why.
+/// [`sanitize_for_terminal`]. Used by the [`Format::Table`] and vertical
+/// (`\G`) paths only — see that function's doc for why.
+///
+/// Avoids a redundant clone on the common no-control-char path: `s` is
+/// already owned, so when [`sanitize_for_terminal`] hands back a borrow of it
+/// unchanged (`Cow::Borrowed`), this returns that same owned `s` directly
+/// instead of cloning it again via `into_owned()`.
 fn sanitized_display(value: &Value) -> String {
-    sanitize_for_terminal(&value.display()).into_owned()
+    let s = value.display();
+    match sanitize_for_terminal(&s) {
+        Cow::Borrowed(_) => s,
+        Cow::Owned(sanitized) => sanitized,
+    }
 }
 
 /// A `comfy-table` [`Table`] carrying `table`'s headers (unless `header` is
-/// `false`) and rows, with no preset loaded yet.
-fn new_table(table: &ResultTable, header: bool) -> Table {
+/// `false`) and rows, with no preset loaded yet. `sanitize` selects whether
+/// cells go through [`sanitize_for_terminal`]/[`sanitized_display`]:
+/// [`render_table`] (`Format::Table`) passes `true`, [`render_markdown`]
+/// (`Format::Md`, a fixed interchange format) passes `false`.
+fn new_table(table: &ResultTable, header: bool, sanitize: bool) -> Table {
     let mut ct = Table::new();
     if header {
-        ct.set_header(table.headers.iter().map(|h| sanitize_for_terminal(h)));
+        ct.set_header(table.headers.iter().map(|h| {
+            if sanitize {
+                sanitize_for_terminal(h)
+            } else {
+                Cow::Borrowed(h.as_str())
+            }
+        }));
     }
     for row in &table.rows {
-        ct.add_row(row.iter().map(sanitized_display));
+        ct.add_row(row.iter().map(|value| {
+            if sanitize {
+                sanitized_display(value)
+            } else {
+                value.display()
+            }
+        }));
     }
     ct
 }
@@ -419,6 +451,23 @@ mod tests {
                 && sanitized.contains("after")
                 && sanitized.contains("tab"),
             "normal text must survive, got {sanitized:?}"
+        );
+    }
+
+    /// FIX 4 (B3 review): pins that `\n` falls under the "all control chars
+    /// except `\t`" rule and is deliberately neutralized too, not exempted —
+    /// a separate assertion from the ESC/CR/tab characterization above so a
+    /// future "let newlines through" change can't slip past unnoticed.
+    #[test]
+    fn sanitize_for_terminal_neutralizes_newline() {
+        let sanitized = sanitize_for_terminal("before\nafter");
+        assert!(
+            !sanitized.contains('\n'),
+            "newline must be neutralized, got {sanitized:?}"
+        );
+        assert!(
+            sanitized.contains('\u{FFFD}'),
+            "newline must become U+FFFD, got {sanitized:?}"
         );
     }
 
