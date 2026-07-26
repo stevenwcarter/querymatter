@@ -11,6 +11,16 @@ use anyhow::Context;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
 
+/// The built-in default for [`WalkOpts::max_file_bytes`]: 8 MiB.
+///
+/// Large enough that an ordinary Markdown note — even a long one with
+/// embedded base64 images, which this tool has no business reading anyway —
+/// is never affected; small enough to keep a single oversized/padded file
+/// from exhausting memory (security fix B8). [`crate::settings::Settings`]
+/// re-exposes the same value as its own built-in default, so a vault that
+/// never configures `max_file_bytes` sees no behavior change.
+pub const DEFAULT_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Options controlling how [`discover`] walks a directory tree.
 #[derive(Debug, Clone)]
 pub struct WalkOpts {
@@ -28,6 +38,12 @@ pub struct WalkOpts {
     /// Gitignore-style ignore files to apply (earliest first), always honored
     /// regardless of `respect_gitignore`. Resolved by `Cli::ignore_files`.
     pub ignore_files: Vec<PathBuf>,
+    /// The largest file (in bytes) [`crate::cache::scan_file`] will read into
+    /// memory; a file whose on-disk size exceeds this is skipped with a
+    /// warning rather than read (security fix B8). Not consulted by
+    /// [`discover`] itself — only by the callers that actually read a
+    /// discovered file's content.
+    pub max_file_bytes: u64,
 }
 
 impl Default for WalkOpts {
@@ -38,6 +54,7 @@ impl Default for WalkOpts {
             hidden: false,
             excludes: Vec::new(),
             ignore_files: Vec::new(),
+            max_file_bytes: DEFAULT_MAX_FILE_BYTES,
         }
     }
 }

@@ -18,6 +18,19 @@ fn tree() -> TempDir {
     td
 }
 
+/// The `.bin` blob file names directly under `.querymatter/` (i.e. every
+/// per-directory cache blob `save_cache` writes), excluding `manifest.bin`
+/// itself. Used by the B14 orphan-GC test below to count blobs on disk
+/// without depending on the crate's private blob-naming scheme.
+fn blob_file_names(cache_dir: &Path) -> Vec<String> {
+    fs::read_dir(cache_dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".bin") && name != "manifest.bin")
+        .collect()
+}
+
 /// Points HOME and XDG_CONFIG_HOME at `dir` so a command never reads or
 /// writes the developer's real config. HOME covers macOS, where `directories`
 /// uses ~/Library/Application Support and ignores XDG_CONFIG_HOME.
@@ -178,6 +191,184 @@ fn oneshot_emits_no_startup_banner() {
         .assert()
         .success()
         .stdout(predicates::str::contains("Type .help").not());
+}
+
+/// Opens a pseudo-terminal pair for [`repl_banner_goes_to_stderr_not_stdout`].
+/// Only the returned slave end is ever handed to a child process (as its
+/// stdin); the master stays with the caller to feed input, so no other
+/// test's own stdin/stdout is touched. A non-zero window size is set
+/// up front so rustyline's line-layout math never has to cope with a
+/// zero-width terminal.
+#[cfg(unix)]
+fn open_pty() -> (std::fs::File, std::fs::File) {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::io::RawFd;
+
+    let mut controller: RawFd = -1;
+    let mut follower: RawFd = -1;
+    let winsize = libc::winsize {
+        ws_row: 24,
+        ws_col: 80,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: `controller`/`follower` are valid `&mut RawFd` locals, `winsize`
+    // is a valid `&libc::winsize`, and the name/termios out-params are null,
+    // which openpty(3) accepts to mean "don't care about the tty's name or
+    // initial termios".
+    let rc = unsafe {
+        libc::openpty(
+            &mut controller,
+            &mut follower,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            &winsize,
+        )
+    };
+    assert_eq!(rc, 0, "openpty failed: {}", std::io::Error::last_os_error());
+    // SAFETY: openpty just handed back two freshly opened fds that nothing
+    // else in this process holds, so each is safe to take ownership of.
+    unsafe {
+        (
+            std::fs::File::from_raw_fd(controller),
+            std::fs::File::from_raw_fd(follower),
+        )
+    }
+}
+
+/// Force-kills the process named by `pid` after `timeout` unless the
+/// returned flag is set first — a safety net so a hang in the REPL under
+/// test (e.g. a rustyline regression that stops reading its input) can never
+/// wedge the whole `cargo test` run. The caller must set the flag once it's
+/// done with the child, then join the handle.
+#[cfg(unix)]
+fn spawn_watchdog(
+    pid: u32,
+    timeout: std::time::Duration,
+) -> (
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    std::thread::JoinHandle<()>,
+) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let done = Arc::new(AtomicBool::new(false));
+    let watcher_done = Arc::clone(&done);
+    let handle = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline && !watcher_done.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if !watcher_done.load(Ordering::Relaxed) {
+            // SAFETY: `pid` names this test's own just-spawned child; killing
+            // it only ever unblocks that child's own reads/waits below.
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    });
+    (done, handle)
+}
+
+/// Regression test for the REPL startup banner (record count + `.help`/
+/// `.schema` hint) printing to stdout: stdout also carries query result data
+/// (`OutputSink::Stdout`), so the banner corrupted a redirected results file
+/// ahead of the first query's output. Every other REPL diagnostic (row
+/// counts, errors, redirect notices) already goes to stderr; the banner must
+/// match.
+///
+/// `main.rs`'s dispatch only enters `repl::run` when stdin is a genuine TTY —
+/// piped/non-terminal stdin runs batch mode instead, which never prints the
+/// banner at all (see `batch_mode_stdin_emits_no_startup_banner` /
+/// `oneshot_emits_no_startup_banner` above) — so this is the one test in this
+/// file that needs a real pseudo-terminal on the child's stdin. Stdout and
+/// stderr stay on ordinary pipes, matching the bug's own scenario exactly:
+/// an interactive TTY session with redirected output.
+///
+/// The query line and `.exit` are written as two separate writes, with the
+/// second held back until the query's `-- 1 row` line has actually arrived
+/// on stderr: sending both lines in one burst before rustyline's own
+/// `readline()`/raw-mode setup has run raced with it in practice (verified
+/// manually against this REPL) and silently dropped the second line, hanging
+/// the child forever waiting for an `.exit` that already came and went.
+#[cfg(unix)]
+#[test]
+fn repl_banner_goes_to_stderr_not_stdout() {
+    use std::io::{Read, Write};
+    use std::sync::atomic::Ordering;
+
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    let (mut controller, follower) = open_pty();
+
+    let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("querymatter"));
+    cmd.arg(td.path())
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path())
+        .env_remove("QUERYMATTER_TABLE_STYLE")
+        // A known-supported TERM makes rustyline's "is this terminal usable"
+        // check deterministic, regardless of what the test runner's own
+        // environment happens to export.
+        .env("TERM", "xterm")
+        .stdin(std::process::Stdio::from(follower))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let mut child = cmd.spawn().expect("failed to spawn querymatter");
+    let (watchdog_done, watchdog) = spawn_watchdog(child.id(), std::time::Duration::from_secs(10));
+    let mut child_stdout = child.stdout.take().expect("child stdout was not piped");
+    let mut child_stderr = child.stderr.take().expect("child stderr was not piped");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = child_stdout.read_to_end(&mut buf);
+        buf
+    });
+
+    controller
+        .write_all(b"SELECT count(*) AS n;\n")
+        .expect("failed to write the query line to the pty");
+
+    let mut stderr_so_far = Vec::new();
+    let mut chunk = [0_u8; 256];
+    while !String::from_utf8_lossy(&stderr_so_far).contains("-- 1 row") {
+        let n = child_stderr
+            .read(&mut chunk)
+            .expect("failed to read child stderr");
+        assert_ne!(
+            n,
+            0,
+            "child stderr closed before the query's row-count line arrived; got so far:\n{}",
+            String::from_utf8_lossy(&stderr_so_far)
+        );
+        stderr_so_far.extend_from_slice(&chunk[..n]);
+    }
+
+    // Match the REPL's real exit command (`.exit`; `.quit` is a synonym).
+    controller
+        .write_all(b".exit\n")
+        .expect("failed to write the exit command to the pty");
+    drop(controller); // nothing more to send; frees the fd promptly
+
+    child_stderr
+        .read_to_end(&mut stderr_so_far)
+        .expect("failed to drain the rest of child stderr");
+    let stdout = stdout_reader.join().expect("stdout reader thread panicked");
+    child.wait().expect("failed to reap the REPL child");
+    watchdog_done.store(true, Ordering::Relaxed);
+    watchdog.join().expect("pty watchdog thread panicked");
+
+    let stdout = String::from_utf8_lossy(&stdout);
+    let stderr = String::from_utf8_lossy(&stderr_so_far);
+
+    let banner = "Type .help"; // same distinctive substring the batch/one-shot guards above use
+    assert!(
+        stderr.contains(banner),
+        "banner missing from stderr:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains(banner),
+        "banner leaked onto stdout:\n{stdout}"
+    );
 }
 
 #[test]
@@ -342,6 +533,66 @@ fn quiet_suppresses_skipped_file_warnings_but_not_errors() {
         .stderr(predicates::str::is_empty().not());
 }
 
+/// B8 (security, resource exhaustion): a file whose on-disk size exceeds a
+/// configured `max_file_bytes` is skipped — never handed to
+/// `fs::read_to_string` — with a warning naming it on stderr, exactly like an
+/// unreadable file or invalid frontmatter; the small file alongside it still
+/// surfaces normally. A small test cap (`1000`) via the config knob keeps
+/// this test itself fast, rather than writing a real multi-megabyte fixture.
+#[test]
+fn oversized_file_is_skipped_with_warning() {
+    let td = TempDir::new().unwrap();
+    fs::write(
+        td.path().join("big.md"),
+        format!("---\ntitle: big\n---\n{}", "x".repeat(20_000)),
+    )
+    .unwrap();
+    fs::write(td.path().join("small.md"), "---\ntitle: small\n---\n").unwrap();
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "max_file_bytes = 1000\n");
+    qm(home.path())
+        .arg("-e")
+        .arg("SELECT title")
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("small"))
+        .stdout(predicates::str::contains("big").not())
+        .stderr(predicates::str::contains("big.md"));
+}
+
+/// B8: `querymatter init` must apply the same `max_file_bytes` cap while
+/// building the cache — an oversized file is skipped with a warning here too,
+/// not just on a live (`--no-cache`) query, since `init`'s scan is the other
+/// caller of `cache::scan_file`.
+#[test]
+fn init_skips_an_oversized_file_with_warning() {
+    let td = TempDir::new().unwrap();
+    fs::write(
+        td.path().join("big.md"),
+        format!("---\ntitle: big\n---\n{}", "x".repeat(20_000)),
+    )
+    .unwrap();
+    fs::write(td.path().join("small.md"), "---\ntitle: small\n---\n").unwrap();
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "max_file_bytes = 1000\n");
+    qm(home.path())
+        .arg("init")
+        .arg(td.path())
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("big.md"));
+
+    qm(home.path())
+        .arg("-e")
+        .arg("SELECT title")
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("small"))
+        .stdout(predicates::str::contains("big").not());
+}
+
 #[test]
 fn batch_good_then_bad_exits_nonzero() {
     let td = tree();
@@ -426,6 +677,35 @@ fn init_creates_manifest() {
     );
 }
 
+/// `build_vault` already pushes a `path: reason` entry onto `LoadReport.
+/// warnings` for every file it skips (unreadable content, invalid YAML
+/// frontmatter, or — since B6 — a traversal-rejected cached path); before
+/// this fix `run_init` printed only the bare `(N skipped)` count and
+/// discarded `report.warnings`, so the user had no way to learn which file
+/// was skipped or why (silent data loss: that file is then permanently
+/// absent from the cache). `bad.md`'s content is genuinely invalid YAML
+/// (mirrors `frontmatter::tests::invalid_yaml_is_invalid`), so it fails to
+/// parse (`Extract::Invalid` → `ScanResult::Warning`) rather than merely
+/// lacking a fence (`Extract::None`, silently and correctly skipped with no
+/// warning at all).
+#[test]
+fn init_reports_which_files_were_skipped() {
+    let td = TempDir::new().unwrap();
+    fs::write(td.path().join("good.md"), "---\ntitle: ok\n---\n").unwrap();
+    fs::write(
+        td.path().join("bad.md"),
+        "---\nkey: : : broken\n  bad indent\n---\n",
+    )
+    .unwrap();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg("init")
+        .arg(td.path())
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("bad.md"));
+}
+
 #[test]
 fn cache_status_reports_root_and_file_count() {
     let td = tree();
@@ -482,6 +762,82 @@ fn cache_status_with_corrupt_manifest_exits_nonzero_and_mentions_init() {
         .assert()
         .failure()
         .stderr(predicates::str::contains("init"));
+}
+
+/// B14 (resource/cleanup): once `product/` is deleted and the vault
+/// re-`init`ed, `save_cache` must GC `product/`'s now-orphaned blob file
+/// rather than leave it lingering under `.querymatter/` forever. Equally
+/// important — and the sharper failure mode a buggy/over-aggressive GC would
+/// hit — the rewritten manifest plus the surviving `plans/` blob must still
+/// load correctly afterward: `cache status` still reports both `plans/`
+/// files, and a query still returns their real values, not silently-dropped
+/// or corrupted rows.
+#[test]
+fn reinit_gcs_orphaned_blob_for_a_removed_directory() {
+    let td = tree(); // plans/{a,b}.md (draft, synced), product/c.md (synced)
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg("init")
+        .arg(td.path())
+        .assert()
+        .success();
+
+    let cache_dir = td.path().join(".querymatter");
+    assert_eq!(
+        blob_file_names(&cache_dir).len(),
+        2,
+        "sanity: one blob per directory (plans/, product/) right after init"
+    );
+
+    fs::remove_dir_all(td.path().join("product")).unwrap();
+
+    qm(home.path())
+        .arg("init")
+        .arg(td.path())
+        .assert()
+        .success();
+
+    let blobs_after = blob_file_names(&cache_dir);
+    assert_eq!(
+        blobs_after.len(),
+        1,
+        "product/'s orphaned blob must be GC'd once it's no longer in the \
+         manifest, got {blobs_after:?}"
+    );
+
+    let status_out = qm(home.path())
+        .args(["cache", "status"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert!(
+        String::from_utf8(status_out)
+            .unwrap()
+            .contains("files:       2"),
+        "the manifest must still report plans/'s 2 surviving files, not lose \
+         them to an over-aggressive GC"
+    );
+
+    let query_out = qm(home.path())
+        .current_dir(td.path())
+        .args(["-e", "SELECT status", "--format", "csv", "--force-cache"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(query_out).unwrap();
+    let mut rows: Vec<&str> = s.lines().skip(1).map(str::trim).collect();
+    rows.sort_unstable();
+    assert_eq!(
+        rows,
+        vec!["draft", "synced"],
+        "plans/'s surviving rows must still load correctly from the \
+         rewritten manifest + kept blob after GC; got {s:?}"
+    );
 }
 
 /// `init`'s walk flags parse into the "init" subcommand's own nested
@@ -1086,6 +1442,122 @@ fn file_body_like_matches_a_fixture_containing_todo() {
         .clone();
     let s = String::from_utf8(out).unwrap();
     assert_eq!(s.lines().last().unwrap().trim(), "has-todo.md");
+}
+
+/// Task 10 (B10) code-review fix: replaces
+/// `file_body_referenced_twice_is_consistent`, which claimed to reference
+/// `file.body` "from BOTH WHERE and SELECT" but actually projected `title` —
+/// `file.body` appeared exactly once (in `WHERE`) — and asserted only that
+/// stdout contained `"t"`, a substring the literal table header `"title"`
+/// satisfies even if `WHERE` wrongly excluded every row. That left the
+/// multi-reference cache-threading `filter_records`/`execute_ungrouped`
+/// actually wire up (see their doc comments) with no end-to-end regression
+/// guard.
+///
+/// This test references `file.body` from all three memoized sites in one
+/// query — `SELECT file.body`, `WHERE file.body LIKE '%TODO%'`, and `ORDER
+/// BY file.body` — against TWO fixtures whose bodies both match the `WHERE`
+/// predicate but are otherwise distinct. If a future refactor ever built a
+/// fresh cache per stage (instead of threading the one per-record
+/// `body_cache` `filter_records` creates through `WHERE`/`SELECT`/`ORDER
+/// BY`), or — the sharper failure mode — shared a single `body_cache` across
+/// *records* instead of creating one fresh per record, the second record
+/// evaluated would see the first record's memoized body leak into its own
+/// evaluation: both rows would show the SAME body text (the first record's)
+/// instead of each showing its own. The exact full-stdout assertion below —
+/// not a substring — pins each row to its OWN body, in `ORDER BY` order, so
+/// either regression is caught.
+#[test]
+fn file_body_multi_reference_is_consistent_and_isolated_per_record() {
+    let td = TempDir::new().unwrap();
+    fs::write(
+        td.path().join("alpha.md"),
+        "---\ntitle: Alpha\n---\nTODO alpha only text\n",
+    )
+    .unwrap();
+    fs::write(
+        td.path().join("beta.md"),
+        "---\ntitle: Beta\n---\nTODO beta only text\n",
+    )
+    .unwrap();
+    let home = TempDir::new().unwrap();
+
+    let out = qm(home.path())
+        .current_dir(td.path())
+        .args([
+            "-e",
+            "SELECT file.body WHERE file.body LIKE '%TODO%' ORDER BY file.body",
+            "--format",
+            "csv",
+            "--no-cache",
+            ".",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    assert_eq!(
+        s, "file.body\nTODO alpha only text\nTODO beta only text\n",
+        "each row must carry ITS OWN file.body value, in ORDER BY order — a \
+         cross-record body_cache leak would instead duplicate one record's \
+         body onto the other's row; got: {s:?}"
+    );
+}
+
+/// B8: `file.body` always re-reads fresh from disk (design W56 — the cache
+/// never stores body text), so it must respect `max_file_bytes` even for a
+/// file whose cached (mtime, size) entry was written under a LARGER cap and
+/// hasn't changed since — `refresh_one_file`'s per-file freshness shortcut
+/// reuses that entry verbatim (a cheap, safe reuse: no raw content is read),
+/// so tightening the cap alone does not retroactively drop the file from the
+/// vault, but a later `SELECT file.body` against it must still resolve to
+/// NULL rather than buffer the now-too-large body into memory.
+#[test]
+fn file_body_is_null_for_a_cached_file_over_a_later_lowered_max_file_bytes() {
+    let td = TempDir::new().unwrap();
+    fs::write(
+        td.path().join("big.md"),
+        format!("---\nstatus: draft\n---\n{}", "x".repeat(20_000)),
+    )
+    .unwrap();
+    let home = TempDir::new().unwrap();
+
+    // Build the cache under the default (large) cap: the file scans fine.
+    qm(home.path())
+        .arg("init")
+        .arg(td.path())
+        .assert()
+        .success();
+
+    // Lower the cap after the fact. The file's mtime/size are unchanged, so
+    // the default per-file freshness check reuses the cached record without
+    // re-reading it — `status` still resolves normally.
+    write_config(home.path(), "max_file_bytes = 1000\n");
+    qm(home.path())
+        .current_dir(td.path())
+        .args(["-e", "SELECT status", "."])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("draft"));
+
+    // But `file.body` must now respect the lowered cap rather than reading
+    // the 20 KB body fresh off disk.
+    let out = qm(home.path())
+        .current_dir(td.path())
+        .args(["-e", "SELECT file.body", "--format", "csv", "."])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    assert_eq!(
+        s.lines().last().unwrap().trim(),
+        "\"\"",
+        "file.body over a lowered max_file_bytes must be NULL, got: {s:?}"
+    );
 }
 
 /// Task 7 (W56 part 2), test 2 (brief): under `--force-cache`, a `file.body`
@@ -3281,4 +3753,498 @@ fn empty_result_json_is_bracket_bracket_newline() {
         .assert()
         .success()
         .stdout("[]\n");
+}
+
+/// Task 1 (B1): pins `LIKE`'s match semantics across the hoisting of its
+/// pattern-to-`Regex` compile from once-per-row to once-per-query — same
+/// matches, same case-sensitivity, same anchoring as before the refactor.
+#[test]
+fn like_matches_are_stable_after_hoisting() {
+    let td = TempDir::new().unwrap();
+    for (p, s) in [
+        ("a.md", "---\ntitle: alpha\n---\n"),
+        ("b.md", "---\ntitle: beta\n---\n"),
+        ("c.md", "---\ntitle: alphabet\n---\n"),
+    ] {
+        fs::write(td.path().join(p), s).unwrap();
+    }
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg("-e")
+        .arg("SELECT title WHERE title LIKE 'alpha%' ORDER BY title")
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("alpha"))
+        .stdout(predicate::str::contains("alphabet"))
+        .stdout(predicate::str::contains("beta").not());
+}
+
+/// Task 2 (B2): pins `REGEXP`'s match semantics across the hoisting of its
+/// pattern-to-`Regex` compile from once-per-row to once-per-query — same
+/// matches as before the refactor.
+#[test]
+fn regexp_matches_are_stable_after_hoisting() {
+    let td = TempDir::new().unwrap();
+    for (p, s) in [
+        ("a.md", "---\ncode: A123\n---\n"),
+        ("b.md", "---\ncode: B999\n---\n"),
+    ] {
+        fs::write(td.path().join(p), s).unwrap();
+    }
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg("-e")
+        .arg("SELECT code WHERE code REGEXP '^A[0-9]+$'")
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("A123"))
+        .stdout(predicate::str::contains("B999").not());
+}
+
+/// Task 3 (B3) RED: frontmatter is fully attacker-controlled (any Markdown
+/// file in a queried vault). A `title` carrying a raw ESC screen-clear
+/// sequence must not reach the terminal unsanitized in the default table
+/// render — today it does, since `Value::display()` is written verbatim.
+#[test]
+fn table_output_neutralizes_ansi_escapes_from_frontmatter() {
+    let td = TempDir::new().unwrap();
+    // title carries a raw ESC (0x1b) screen-clear sequence
+    fs::write(
+        td.path().join("evil.md"),
+        "---\ntitle: \"\u{1b}[2J[H spoof\"\n---\n",
+    )
+    .unwrap();
+    let home = TempDir::new().unwrap();
+    let out = qm(home.path())
+        .arg("-e")
+        .arg("SELECT title")
+        .arg(td.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    // The default (table) render must not emit the raw ESC byte.
+    assert!(!out.contains(&0x1b), "raw ESC leaked into table output");
+}
+
+/// Task 3 (B3) INV-1 pin: the table/vertical sanitizer must not touch the
+/// json interchange path. The same ESC-bearing value must still come through
+/// as serde's own `` escape, byte-identical to before this fix.
+#[test]
+fn json_output_unchanged_by_terminal_sanitizer() {
+    let td = TempDir::new().unwrap();
+    fs::write(td.path().join("evil.md"), "---\ntitle: \"\u{1b}x\"\n---\n").unwrap();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg("-e")
+        .arg("SELECT title")
+        .arg("--format")
+        .arg("json")
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\\u001b"));
+}
+
+/// Task 3 (B3) review fix: the other sanitized path besides table — pins
+/// that `render_vertical` (`\G`) also neutralizes the raw ESC byte, mirroring
+/// `table_output_neutralizes_ansi_escapes_from_frontmatter` above.
+#[test]
+fn vertical_output_neutralizes_ansi_escapes_from_frontmatter() {
+    let td = TempDir::new().unwrap();
+    fs::write(
+        td.path().join("evil.md"),
+        "---\ntitle: \"\u{1b}[2J[H spoof\"\n---\n",
+    )
+    .unwrap();
+    let home = TempDir::new().unwrap();
+    let out = qm(home.path())
+        .args(["-e", "SELECT title\\G"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert!(!out.contains(&0x1b), "raw ESC leaked into vertical output");
+}
+
+/// Task 3 (B3) review fix, INV-1 pin: csv stays byte-untouched by the
+/// terminal sanitizer — mirrors `json_output_unchanged_by_terminal_sanitizer`
+/// above, but for `--format csv`, where the ESC byte survives raw (csv has no
+/// escaping mechanism of its own for control bytes the way json's `\uXXXX`
+/// does).
+#[test]
+fn csv_output_unchanged_by_terminal_sanitizer() {
+    let td = TempDir::new().unwrap();
+    fs::write(td.path().join("evil.md"), "---\ntitle: \"\u{1b}x\"\n---\n").unwrap();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg("-e")
+        .arg("SELECT title")
+        .arg("--format")
+        .arg("csv")
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\u{1b}"));
+}
+
+/// Task 3 (B3) review fix (FIX 1 scope pin): Markdown (`Format::Md`) is a
+/// fixed interchange format, not a terminal display, so it must NOT be
+/// sanitized — the raw ESC byte must survive `--format md` untouched. Pins
+/// FIX 1's decision so a future "just pass sanitize through" refactor of
+/// `new_table`'s shared plumbing can't silently start scrubbing Markdown.
+#[test]
+fn md_output_unchanged_by_terminal_sanitizer() {
+    let td = TempDir::new().unwrap();
+    fs::write(td.path().join("evil.md"), "---\ntitle: \"\u{1b}x\"\n---\n").unwrap();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg("-e")
+        .arg("SELECT title")
+        .arg("--format")
+        .arg("md")
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\u{1b}"));
+}
+
+/// Task 4 (B4) characterization: a downstream reader that closes its end of
+/// the pipe early (`| head`) must NOT make querymatter panic (Rust's default
+/// SIGPIPE=SIG_IGN turns the resulting write into an `EPIPE` `io::Error`,
+/// which `println!`/`write!` on stdout convert into a panic) or print
+/// `Broken pipe` noise to stderr from the streaming result path. Uses raw
+/// `std::process::Command`, NOT `assert_cmd`: `assert_cmd::Command::assert`
+/// captures the whole child's stdout before returning, so the pipe is never
+/// closed while the child is still writing — this needs a real early close.
+///
+/// Each row carries a 300-byte `pad` field (selected alongside `idx`), not
+/// just the bare index: a Linux pipe's kernel buffer is 64 KiB, and
+/// `io::Stdout` line-buffers, flushing (i.e. issuing a real `write(2)`) on
+/// every row. With `idx` alone, 500 rows total under 2 KiB of CSV — it all
+/// fits in one flush that lands before the reader below has a chance to
+/// close its end, so the bug never fires. Padded, 500 rows total well over
+/// 64 KiB, so later rows' flushes land after the pipe closes and hit EPIPE —
+/// reproducing the real `| head` scenario this pins.
+#[test]
+fn broken_pipe_exits_without_panic_or_error_noise() {
+    use std::io::Read;
+    use std::process::{Command as PCommand, Stdio};
+
+    let td = TempDir::new().unwrap();
+    let pad = "x".repeat(300);
+    for i in 0..500 {
+        fs::write(
+            td.path().join(format!("n{i}.md")),
+            format!("---\nidx: {i}\npad: \"{pad}\"\n---\n"),
+        )
+        .unwrap();
+    }
+    let home = TempDir::new().unwrap();
+    let bin = assert_cmd::cargo::cargo_bin("querymatter");
+    let mut child = PCommand::new(bin)
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path())
+        .env_remove("QUERYMATTER_TABLE_STYLE")
+        .arg("-e")
+        .arg("SELECT idx, pad")
+        .arg("--format")
+        .arg("csv")
+        .arg(td.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Read a little, then drop the read end to close the pipe early.
+    let mut buf = [0u8; 64];
+    let _ = child.stdout.take().unwrap().read(&mut buf);
+    drop(child.stdout.take());
+    let out = child.wait_with_output().unwrap();
+    let code = out.status.code();
+    assert_ne!(code, Some(101), "panicked on broken pipe");
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("Broken pipe"),
+        "leaked Broken pipe error to stderr"
+    );
+}
+
+/// Task 4 (B4) GREEN pin for the OTHER manifestation of the same bug: the
+/// plain `println!` sinks (`query list`, `config list`/`get`, `cache
+/// status`) don't go through [`OutputSink`](crate) at all, so a broken pipe
+/// there doesn't surface as an `io::Error` to propagate — `println!` panics
+/// outright ("failed printing to stdout"), aborting with exit code 101
+/// before `main`'s error handler ever runs. `query list` is exercised here
+/// (the others share the exact same `println!`-to-stdout shape): 2000 saved
+/// queries, each padded past a couple hundred bytes, comfortably exceed a
+/// pipe's 64 KiB kernel buffer, so later rows are still being printed after
+/// the early close below — reproducing the same "flush lands after the pipe
+/// is gone" race as the streaming-path test above, just through `println!`
+/// instead of `OutputSink::write_result`.
+///
+/// Written directly as `queries.toml` (bypassing `query save`, which parses
+/// each SQL string and would make 2000 saves too slow) — `query list` never
+/// re-parses saved SQL, only prints it, so hand-written, deliberately-inert
+/// SQL text is fine here.
+#[test]
+fn query_list_broken_pipe_exits_without_panic() {
+    use std::io::Read;
+    use std::process::{Command as PCommand, Stdio};
+
+    let home = TempDir::new().unwrap();
+    let config_dir = home.path().join("querymatter");
+    fs::create_dir_all(&config_dir).unwrap();
+    let pad = "x".repeat(200);
+    let mut queries_toml = String::new();
+    for i in 0..2000 {
+        queries_toml.push_str(&format!("q{i} = \"SELECT 1 -- {pad}\"\n"));
+    }
+    fs::write(config_dir.join("queries.toml"), queries_toml).unwrap();
+
+    let bin = assert_cmd::cargo::cargo_bin("querymatter");
+    let mut child = PCommand::new(bin)
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path())
+        .env_remove("QUERYMATTER_TABLE_STYLE")
+        .arg("query")
+        .arg("list")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut buf = [0u8; 64];
+    let _ = child.stdout.take().unwrap().read(&mut buf);
+    drop(child.stdout.take());
+    let out = child.wait_with_output().unwrap();
+    let code = out.status.code();
+    assert_ne!(code, Some(101), "panicked on broken pipe");
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("Broken pipe"),
+        "leaked Broken pipe error to stderr"
+    );
+}
+
+/// Task 5 (B5): pins `ORDER BY`/`GROUP BY ... ORDER BY`'s row/group order
+/// across the decorate-sort-undecorate refactor — each row's (or group's)
+/// sort key is now computed once, up front, instead of on every pairwise
+/// comparison, but the output order must stay byte-identical (INV-2).
+/// `g = x` has two rows (`count(*) = 2`) and `g = y` has one (`count(*) =
+/// 1`), so `ORDER BY c DESC` must place `x` before `y`.
+#[test]
+fn order_by_and_group_order_stable_after_decorate() {
+    let td = TempDir::new().unwrap();
+    for (p, s) in [
+        ("a.md", "---\ng: x\nn: 3\n---\n"),
+        ("b.md", "---\ng: x\nn: 1\n---\n"),
+        ("c.md", "---\ng: y\nn: 2\n---\n"),
+    ] {
+        fs::write(td.path().join(p), s).unwrap();
+    }
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg("-e")
+        .arg("SELECT g, count(*) AS c GROUP BY g ORDER BY c DESC, g ASC")
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::is_match("(?s)x.*y").unwrap()); // x (c=2) before y (c=1)
+}
+
+/// Task 9 (B9, correctness): a frontmatter value nested far beyond any
+/// legitimate document must be skipped with a warning, not take the whole
+/// process down.
+///
+/// Bracket nesting (`[[[…]]]`) is *not* the reproducer: yaml-rust2 0.10 caps
+/// flow-collection (`[`/`{`) nesting itself (a `u8` counter, `flow_level` in
+/// its scanner) at 255 and returns a clean parse error past that — already
+/// exercised by `invalid_yaml_is_invalid`'s sibling paths, no crash to
+/// characterize there. The reproducer empirically found instead is a
+/// **compact block sequence** — `- - - - … v` — which isn't flow syntax at
+/// all, so that counter never engages; nesting it this deeply overflows
+/// yaml-rust2's own recursive-descent parser before `pod_to_value` (this
+/// crate's code) ever runs. On this crate's file-scanning worker threads
+/// (`parallel::map_paths`, default ~2 MiB stacks) that overflow reliably
+/// aborts the whole process (`fatal runtime error: stack overflow,
+/// aborting`) somewhere between depth 900 and 950; depth 2000 here gives
+/// comfortable margin. `ok.md` alongside it must still load.
+#[test]
+fn deeply_nested_frontmatter_is_skipped_not_crashed() {
+    let td = TempDir::new().unwrap();
+    let depth = 2000;
+    fs::write(
+        td.path().join("deep.md"),
+        format!("---\nx:\n  {}v\n---\n", "- ".repeat(depth)),
+    )
+    .unwrap();
+    fs::write(td.path().join("ok.md"), "---\ntitle: ok\n---\n").unwrap();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg("-e")
+        .arg("SELECT title")
+        .arg(td.path())
+        .assert()
+        .success() // process did not abort/overflow
+        .stdout(predicates::str::contains("ok"))
+        .stderr(predicates::str::contains("deep.md"));
+}
+
+/// B9 follow-up fix (CRITICAL): `deeply_nested_frontmatter_is_skipped_not_crashed`
+/// above reproduces the *compact* form (`- - - - … v`, all on one line), which
+/// the original `max_nesting_depth` counted directly. It did NOT count
+/// **indentation-nested** block sequences — the ordinary, one-`-`-per-line
+/// style, each line further indented than the last — since each such line
+/// only ever has a single leading `-` for the old estimator to see, scoring
+/// arbitrarily deep indentation-nested YAML as depth 1. That's the exact
+/// shape reproduced here: `x:` followed by ~1100 lines of one `-` each,
+/// indentation increasing by one column per line (comfortably past the
+/// ~900-950 depth where yaml-rust2's own recursive-descent parser overflows
+/// its call stack and aborts the whole process — see
+/// `deeply_nested_frontmatter_is_skipped_not_crashed`'s doc). The file this
+/// produces is ~594 KiB — nowhere near the 8 MiB default `max_file_bytes`
+/// (B8), which does NOT mask this vector. Confirmed FAILING (process exit
+/// 134, `fatal runtime error: stack overflow, aborting`) against the binary
+/// before the indentation-tracking fix to `max_nesting_depth`; PASSING after.
+/// `ok.md` alongside it must still load.
+#[test]
+fn indentation_nested_frontmatter_is_skipped_not_crashed() {
+    let td = TempDir::new().unwrap();
+    let depth = 1100;
+    let mut frontmatter = String::from("x:\n");
+    for i in 0..depth {
+        frontmatter.push_str(&" ".repeat(i + 1));
+        frontmatter.push_str(if i + 1 == depth { "- v\n" } else { "-\n" });
+    }
+    fs::write(
+        td.path().join("deep_indent.md"),
+        format!("---\n{frontmatter}---\n"),
+    )
+    .unwrap();
+    fs::write(td.path().join("ok.md"), "---\ntitle: ok\n---\n").unwrap();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg("-e")
+        .arg("SELECT title")
+        .arg(td.path())
+        .assert()
+        .success() // process did not abort/overflow
+        .stdout(predicates::str::contains("ok"))
+        .stderr(predicates::str::contains("deep_indent.md"))
+        .stderr(predicates::str::contains("nesting"));
+}
+
+/// Builds `levels` lines of `dashes_per_line` compact `- ` markers each,
+/// every line indented just far enough (`2 * dashes_per_line` columns deeper
+/// than the last) to align with the *value slot* of the previous line's
+/// final, otherwise-empty dash — the exact alignment yaml-rust2 requires for
+/// the next line to continue nesting *inside* that dash rather than being
+/// read as a new, shallower sibling. The final line closes the chain with a
+/// scalar. Used by
+/// [`composed_dash_and_indentation_frontmatter_is_skipped_not_crashed`] to
+/// reproduce the B9 second-critical-followup vector: neither the compact
+/// dash count nor the indentation depth alone is unusual, but composed they
+/// reach `dashes_per_line * levels`.
+fn mixed_dash_and_indent_frontmatter(dashes_per_line: usize, levels: usize) -> String {
+    let mut frontmatter = String::from("x:\n");
+    let mut indent = 2;
+    for i in 0..levels {
+        frontmatter.push_str(&" ".repeat(indent));
+        let dashes = "- ".repeat(dashes_per_line);
+        if i + 1 == levels {
+            frontmatter.push_str(&dashes);
+            frontmatter.push_str("v\n");
+        } else {
+            frontmatter.push_str(dashes.trim_end());
+            frontmatter.push('\n');
+            indent += 2 * dashes_per_line;
+        }
+    }
+    frontmatter
+}
+
+/// B9 second follow-up fix (CRITICAL): `indentation_nested_frontmatter_is_skipped_not_crashed`
+/// above fixed the PURE indentation vector; this reproduces what the
+/// reviewer found still slips past it — a *composed* vector where the old
+/// estimator's three sub-estimates (flow-bracket depth, same-line compact
+/// dash run, indentation-stack depth) were combined with `max`, not added.
+/// 64 compact dashes on one line, indented 20 levels deep — each line nested
+/// under the *previous* line's innermost dash — reaches true parser
+/// recursion ≈ 64 × 20 = 1280 (well past yaml-rust2's own ~900-950 call-stack
+/// overflow point), yet the old `max(dash_run=64, indent_depth=20) = 64`
+/// stayed comfortably under the 128 cap: neither sub-estimate alone looks
+/// unusual. This exact (dashes_per_line, levels) pair — and its ~27 KiB file
+/// size, nowhere near the 8 MiB `max_file_bytes` cap (B8) — mirrors the
+/// reviewer's own confirmed reproduction table. Empirically confirmed
+/// FAILING (process exit 134, `fatal runtime error: stack overflow,
+/// aborting`) against the pre-fix binary; PASSING (skipped with a nesting
+/// warning) after composing the estimates additively. `ok.md` alongside it
+/// must still load.
+#[test]
+fn composed_dash_and_indentation_frontmatter_is_skipped_not_crashed() {
+    let td = TempDir::new().unwrap();
+    let frontmatter = mixed_dash_and_indent_frontmatter(64, 20);
+    fs::write(
+        td.path().join("mixed.md"),
+        format!("---\n{frontmatter}---\n"),
+    )
+    .unwrap();
+    fs::write(td.path().join("ok.md"), "---\ntitle: ok\n---\n").unwrap();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg("-e")
+        .arg("SELECT title")
+        .arg(td.path())
+        .assert()
+        .success() // process did not abort/overflow
+        .stdout(predicates::str::contains("ok"))
+        .stderr(predicates::str::contains("mixed.md"))
+        .stderr(predicates::str::contains("nesting"));
+}
+
+/// B9 review fix (Critical false-positive): a file with LEGITIMATE, shallow
+/// frontmatter but a body containing unrelated bracket-heavy or dash-heavy
+/// text must load normally — the pre-parse depth cap that stops the crash in
+/// `deeply_nested_frontmatter_is_skipped_not_crashed` above must only ever
+/// fire on the fenced frontmatter YAML gray_matter actually parses, never on
+/// Markdown body content. `intervals.md`'s body is interval notation (`[0,1)
+/// [1,2) …`, 200 unclosed `[`); `outline.md`'s is a flattened pasted outline
+/// (`- - - - … v`, 200 levels) — both comfortably past the 128 cap. Before
+/// the fix that scopes `check_nesting_depth` to just the fenced block, BOTH
+/// were wrongly rejected as `Extract::Invalid("frontmatter nesting exceeds
+/// 128 levels — skipped")` even though their frontmatter (`status: draft`)
+/// is trivially shallow.
+#[test]
+fn body_bracket_or_dash_heavy_text_does_not_reject_legitimate_frontmatter() {
+    let td = TempDir::new().unwrap();
+    let intervals: String = (0..200).map(|i| format!("[{i},{}) ", i + 1)).collect();
+    fs::write(
+        td.path().join("intervals.md"),
+        format!("---\nstatus: draft\n---\n{intervals}\n"),
+    )
+    .unwrap();
+    let outline = "- ".repeat(200) + "v";
+    fs::write(
+        td.path().join("outline.md"),
+        format!("---\nstatus: draft\n---\n{outline}\n"),
+    )
+    .unwrap();
+    let home = TempDir::new().unwrap();
+    let out = qm(home.path())
+        .args(["-e", "SELECT status", "--format", "json"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("nesting").not())
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        v.as_array().unwrap().len(),
+        2,
+        "both files must load, neither skipped as over-nested: {v}"
+    );
 }

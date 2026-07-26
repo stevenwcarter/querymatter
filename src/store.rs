@@ -205,7 +205,8 @@ impl InMemoryStore {
             report.warnings.push(format!("saving cache: {err}"));
         }
 
-        let slices = slices_from_cached(vault, &fresh, wanted);
+        let (slices, slices_report) = slices_from_cached(vault, &fresh, wanted);
+        report.merge(slices_report);
         (InMemoryStore { slices, opts }, report)
     }
 
@@ -299,7 +300,9 @@ impl InMemoryStore {
 }
 
 /// Builds one [`DirSlice`] per cached directory in `dirs` via
-/// [`cache::records_from`], stamping each with the current time. Shared by
+/// [`cache::records_from`], stamping each with the current time, alongside
+/// the [`LoadReport`] [`cache::records_from`] returns (e.g. any `CachedFile`
+/// rejected as an unsafe cached `rel_path` — B6). Shared by
 /// [`InMemoryStore::from_cache`] and [`RecordStore::refresh`], both of
 /// which rebuild the store's slices from a freshly refreshed `Vec<CachedDir>`.
 ///
@@ -309,9 +312,10 @@ fn slices_from_cached(
     vault: &Path,
     dirs: &[CachedDir],
     wanted: Option<&BTreeSet<String>>,
-) -> Vec<DirSlice> {
+) -> (Vec<DirSlice>, LoadReport) {
     let now = SystemTime::now();
-    cache::records_from(vault, dirs, wanted)
+    let (entries, report) = cache::records_from(vault, dirs, wanted);
+    let slices = entries
         .into_iter()
         .map(|(root, records, field_names)| DirSlice {
             root,
@@ -319,7 +323,8 @@ fn slices_from_cached(
             scanned_at: now,
             field_names,
         })
-        .collect()
+        .collect();
+    (slices, report)
 }
 
 impl RecordStore for InMemoryStore {
@@ -406,7 +411,9 @@ impl RecordStore for InMemoryStore {
             report.warnings.push(format!("saving cache: {err}"));
         }
 
-        self.slices = slices_from_cached(vault, &cached, None);
+        let (slices, slices_report) = slices_from_cached(vault, &cached, None);
+        self.slices = slices;
+        report.merge(slices_report);
         report
     }
 }
@@ -439,7 +446,9 @@ fn scan_root(
     wanted: Option<&BTreeSet<String>>,
 ) -> (Vec<Record>, BTreeSet<String>, LoadReport) {
     let paths = discover::discover(root, opts);
-    let scanned = parallel::map_paths(paths, |path| cache::scan_file(root, path));
+    let scanned = parallel::map_paths(paths, |path| {
+        cache::scan_file(root, path, opts.max_file_bytes)
+    });
 
     let mut records = Vec::new();
     let mut field_names = BTreeSet::new();
@@ -713,13 +722,27 @@ mod tests {
 
         let parsed = crate::query::parse("SELECT roadmap").unwrap();
         assert!(
-            crate::query::execute_with_schema(&parsed, store.records(), &schema, false, true)
-                .is_err(),
+            crate::query::execute_with_schema(
+                &parsed,
+                store.records(),
+                &schema,
+                false,
+                true,
+                u64::MAX,
+            )
+            .is_err(),
             "a product-only column must be unknown under a plans-scoped default-mode query"
         );
         assert!(
-            crate::query::execute_with_schema(&parsed, store.records(), &schema, true, true)
-                .is_ok(),
+            crate::query::execute_with_schema(
+                &parsed,
+                store.records(),
+                &schema,
+                true,
+                true,
+                u64::MAX,
+            )
+            .is_ok(),
             "--lenient must bypass the subtree-scoped validation surface"
         );
     }
@@ -1198,7 +1221,7 @@ mod tests {
         let mut expected_paths = Vec::new();
         let mut expected_warnings = Vec::new();
         for path in discover::discover(td.path(), &WalkOpts::default()) {
-            match cache::scan_file(td.path(), &path) {
+            match cache::scan_file(td.path(), &path, WalkOpts::default().max_file_bytes) {
                 ScanResult::Cached(_) => expected_paths.push(path),
                 ScanResult::NoFrontmatter => {}
                 ScanResult::Warning(msg) => expected_warnings.push(msg),

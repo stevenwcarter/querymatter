@@ -19,6 +19,7 @@ globset = "0.4.19"
 gray_matter = "0.3.2"
 ignore = "0.4.31"
 indexmap = { version = "2.14.0", features = ["serde"] }
+libc = "0.2"
 regex = "1.13.1"
 rustyline = { version = "18.0.1", features = ["derive"] }
 serde = { version = "1.0.229", features = ["derive"] }

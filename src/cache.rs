@@ -12,7 +12,7 @@ use indexmap::IndexMap;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use std::{fs, io};
 
@@ -192,7 +192,10 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 /// Persists `dirs` to `<vault_dir>/.querymatter/`: one blob file per
 /// [`CachedDir`], then `manifest.bin` last, all via [`write_atomic`] so a
-/// reader never sees a manifest that outraces its blobs.
+/// reader never sees a manifest that outraces its blobs — then GCs any blob
+/// file no longer referenced by the manifest just written (B14), so a
+/// directory removed or renamed out from under the vault doesn't leave its
+/// old blob (a new path hashes to a new [`blob_file_name`]) on disk forever.
 ///
 /// A `CachedDir` that fails to encode (see [`encode`]'s panic note — in
 /// practice a pre-1970 mtime from clock skew or archive extraction) is
@@ -235,7 +238,69 @@ pub fn save_cache(vault_dir: &Path, dirs: &[CachedDir], ttl_secs: u64) -> anyhow
     let manifest_bytes = try_write_manifest_bytes(&body).context("encoding manifest.bin")?;
     write_atomic(&cache_dir.join(MANIFEST_FILE_NAME), &manifest_bytes)
         .context("writing manifest.bin")?;
+
+    // Strictly after the manifest rename above completes (INV-4/crash-safety
+    // — see `gc_orphaned_blobs`'s doc comment): the keep-set below is built
+    // from `body`, the very manifest just made durable, so a crash at any
+    // point from here on can only ever leave a harmless orphan blob behind,
+    // never a manifest pointing at a blob this function already deleted.
+    let keep: BTreeSet<&str> = std::iter::once(MANIFEST_FILE_NAME)
+        .chain(body.dirs.iter().map(|entry| entry.blob.as_str()))
+        .collect();
+    gc_orphaned_blobs(&cache_dir, &keep);
+
     Ok(())
+}
+
+/// Deletes every `.bin` file directly under `cache_dir` whose name is not in
+/// `keep` — i.e. every blob belonging to a [`CachedDir`] no longer in the
+/// manifest [`save_cache`] just wrote, typically because its directory was
+/// deleted or renamed (a renamed directory hashes to a different
+/// [`blob_file_name`], orphaning the old one).
+///
+/// Must be called strictly *after* `manifest.bin` is durably written: a crash
+/// before that point leaves the previous manifest — and every blob it names —
+/// untouched, while a crash during or after this cleanup can only ever strand
+/// a harmless orphan blob, never delete a blob the just-written manifest
+/// still references (INV-4). `keep` is expected to already include
+/// `manifest.bin` itself alongside every current [`ManifestEntry::blob`].
+///
+/// Conservative by construction, in two ways: only names matching the exact
+/// blob-naming scheme ([`is_blob_file_name`]) are even considered — an
+/// unrelated file that happens to end in `.bin` (or `manifest.bin`, which
+/// never matches that shape) is left alone — and only regular files are
+/// touched, never a directory. Best-effort: a failed `remove_file` for one
+/// stray blob (permissions, a concurrent process) is silently ignored rather
+/// than failing the whole cache save, since orphans are a harmless leak, not
+/// a correctness problem.
+fn gc_orphaned_blobs(cache_dir: &Path, keep: &BTreeSet<&str>) {
+    let Ok(entries) = fs::read_dir(cache_dir) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if keep.contains(name.as_str()) || !is_blob_file_name(&name) {
+            continue;
+        }
+        if !entry.file_type().is_ok_and(|file_type| file_type.is_file()) {
+            continue;
+        }
+        let _ = fs::remove_file(entry.path());
+    }
+}
+
+/// True when `name` has exactly the shape [`blob_file_name`] produces: 16
+/// lowercase hex digits followed by `.bin`. The one place
+/// [`gc_orphaned_blobs`] decides whether a filename is a candidate blob at
+/// all, so it never mistakes an unrelated `.bin` file (or `manifest.bin`) for
+/// an orphan.
+fn is_blob_file_name(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".bin") else {
+        return false;
+    };
+    stem.len() == 16 && stem.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// True when `path` lies at or under at least one directory in `scope`, or
@@ -432,11 +497,23 @@ fn stat_file(path: &Path) -> io::Result<(SystemTime, u64)> {
 /// `dir` is the directory a [`CachedFile::rel_path`] is resolved relative
 /// to; a caller that doesn't need `rel_path` (`store::scan_root`) may pass
 /// any ancestor of `path`.
-pub fn scan_file(dir: &Path, path: &Path) -> ScanResult {
+///
+/// `max_file_bytes` (security fix B8) is checked against the stat *before*
+/// any content is read: a file whose on-disk size exceeds it is skipped with
+/// a [`ScanResult::Warning`] naming it, exactly like an unreadable file or
+/// invalid frontmatter, rather than handed to `fs::read_to_string` — which
+/// would otherwise buffer the whole file (however large) into memory.
+pub fn scan_file(dir: &Path, path: &Path, max_file_bytes: u64) -> ScanResult {
     let (mtime, size) = match stat_file(path) {
         Ok(stat) => stat,
         Err(err) => return ScanResult::Warning(format!("{}: {err}", path.display())),
     };
+    if size > max_file_bytes {
+        return ScanResult::Warning(format!(
+            "{}: {size} bytes exceeds max_file_bytes ({max_file_bytes}) — skipped",
+            path.display()
+        ));
+    }
     let content = match fs::read_to_string(path) {
         Ok(content) => content,
         Err(err) => return ScanResult::Warning(format!("{}: {err}", path.display())),
@@ -547,7 +624,7 @@ fn refresh_per_file(
     let outcomes = parallel::map_paths(paths, |path| {
         let dir = file_dir(vault, path);
         let previous = cached_by_path.get(path).copied();
-        refresh_one_file(&dir, path, previous)
+        refresh_one_file(&dir, path, previous, opts.max_file_bytes)
     });
 
     let mut report = LoadReport::default();
@@ -596,7 +673,18 @@ enum RefreshOutcome {
 /// Refreshes one current file against its previous cached entry (if any):
 /// reuses the cached fields when `(mtime, size)` are unchanged, otherwise
 /// re-scans via [`scan_file`].
-fn refresh_one_file(dir: &Path, path: &Path, previous: Option<&CachedFile>) -> RefreshOutcome {
+///
+/// The reuse shortcut is not itself subject to `max_file_bytes`: it never
+/// reads the file's raw content (only `previous`'s already-parsed fields, the
+/// same small shape [`scan_file`] would have produced), so a lowered cap
+/// since the last scan cannot newly exhaust memory here — it only takes
+/// effect the next time this file actually falls through to [`scan_file`].
+fn refresh_one_file(
+    dir: &Path,
+    path: &Path,
+    previous: Option<&CachedFile>,
+    max_file_bytes: u64,
+) -> RefreshOutcome {
     if let Some(previous) = previous
         && let Ok((mtime, size)) = stat_file(path)
         && mtime == previous.mtime
@@ -605,7 +693,7 @@ fn refresh_one_file(dir: &Path, path: &Path, previous: Option<&CachedFile>) -> R
         return RefreshOutcome::Loaded(previous.clone());
     }
 
-    match scan_file(dir, path) {
+    match scan_file(dir, path, max_file_bytes) {
         ScanResult::Cached(file) => RefreshOutcome::Loaded(file),
         ScanResult::NoFrontmatter => RefreshOutcome::NoFrontmatter,
         ScanResult::Warning(msg) => RefreshOutcome::Warning(msg),
@@ -699,7 +787,7 @@ fn refresh_fast(
 
             let outcomes = parallel::map_paths(paths, |path| {
                 let previous = cached_by_path.get(path).copied();
-                refresh_one_file(&dir, path, previous)
+                refresh_one_file(&dir, path, previous, opts.max_file_bytes)
             });
             let files: Vec<CachedFile> = outcomes
                 .into_iter()
@@ -738,8 +826,45 @@ fn content_equal(a: &[CachedDir], b: &[CachedDir]) -> bool {
     normalize(a) == normalize(b)
 }
 
+/// Lexically resolves `dir.join(rel_path)`, rejecting any `rel_path` that
+/// could escape `dir` — the guard between a poisoned on-disk cache blob (a
+/// crafted-but-well-formed [`CachedFile::rel_path`] such as
+/// `../../../../etc/passwd`) and [`records_from`] handing back a `Record`
+/// whose `abs_path` reads outside the vault (B6). `load_cache_under` only
+/// rejects a bad `MAGIC`/version header, not a malicious-but-validly-shaped
+/// blob, so this check has to happen here, at the point a `Record`'s
+/// filesystem path is actually built.
+///
+/// Rejects an absolute path and any `..`/root/prefix [`Component`]; a
+/// leading/embedded `.` component is harmless and stripped. Deliberately
+/// lexical only — it never canonicalizes or otherwise touches the
+/// filesystem, since canonicalizing could itself follow a symlink, and the
+/// goal is to reject traversal in the *stored* data, not resolve it.
+/// `starts_with` is a belt-and-suspenders check on top of the component
+/// scan, not the primary defense.
+fn contained_path(dir: &Path, rel_path: &str) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in Path::new(rel_path).components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    let joined = dir.join(&normalized);
+    joined.starts_with(dir).then_some(joined)
+}
+
+/// [`records_from`]'s per-directory result: the directory's own path, the
+/// `Record`s reconstructed under it, and the full frontmatter field-name
+/// union read from it (see [`records_from`]'s doc comment for what that
+/// union is used for). Named so the tuple doesn't have to be spelled out at
+/// every use site.
+type RecordsByDir = Vec<(PathBuf, Vec<Record>, BTreeSet<String>)>;
+
 /// Reconstructs [`Record`]s from cached directories for querying, grouped
-/// by directory.
+/// by directory, alongside a [`LoadReport`] of any [`CachedFile`] rejected
+/// as unsafe (see [`contained_path`]).
 ///
 /// `root` is the overall scan root — passing it (rather than each
 /// [`CachedDir::dir`]) is what keeps the cache-equals-live invariant intact,
@@ -758,20 +883,39 @@ fn content_equal(a: &[CachedDir], b: &[CachedDir]) -> bool {
 /// cache data is never itself pruned (only [`build_vault`]/`refresh_*`,
 /// which write it, run over every field), so a later query for a different
 /// field still finds it here.
+///
+/// Every `CachedFile::rel_path` is checked via [`contained_path`] before it
+/// becomes a `Record`: an entry whose `rel_path` would escape `cached_dir.dir`
+/// (B6 — a poisoned cache blob planted by a malicious vault) is skipped
+/// entirely, with a warning pushed onto the returned [`LoadReport`] naming
+/// it, rather than silently dropped — consistent with how every other skip
+/// (unreadable file, invalid frontmatter) is surfaced. A skipped file's
+/// fields never contribute to the returned field-name union either, since it
+/// is treated as untrusted, not merely stale.
 pub fn records_from(
     root: &Path,
     dirs: &[CachedDir],
     wanted: Option<&BTreeSet<String>>,
-) -> Vec<(PathBuf, Vec<Record>, BTreeSet<String>)> {
-    dirs.iter()
+) -> (RecordsByDir, LoadReport) {
+    let mut report = LoadReport::default();
+    let entries = dirs
+        .iter()
         .map(|cached_dir| {
             let mut field_names = BTreeSet::new();
             let records = cached_dir
                 .files
                 .iter()
-                .map(|file| {
+                .filter_map(|file| {
+                    let Some(path) = contained_path(&cached_dir.dir, &file.rel_path) else {
+                        report.skipped += 1;
+                        report.warnings.push(format!(
+                            "{}: rejected cached rel_path {:?} escaping the vault",
+                            cached_dir.dir.display(),
+                            file.rel_path
+                        ));
+                        return None;
+                    };
                     field_names.extend(file.fields.keys().cloned());
-                    let path = cached_dir.dir.join(&file.rel_path);
                     let fields = match wanted {
                         None => file.fields.clone(),
                         Some(set) => file
@@ -781,12 +925,20 @@ pub fn records_from(
                             .map(|(name, value)| (name.clone(), value.clone()))
                             .collect(),
                     };
-                    Record::new(root, &path, fields, file.mtime, file.size, file.word_count)
+                    Some(Record::new(
+                        root,
+                        &path,
+                        fields,
+                        file.mtime,
+                        file.size,
+                        file.word_count,
+                    ))
                 })
                 .collect();
             (cached_dir.dir.clone(), records, field_names)
         })
-        .collect()
+        .collect();
+    (entries, report)
 }
 
 /// The `querymatter init` core: a full scan of `base` (there is no previous
@@ -883,7 +1035,7 @@ pub fn refresh_subtree(
         let dir = file_dir(vault, &path);
         // `previous: None` forces `refresh_one_file` straight to `scan_file`
         // for every file, ignoring any cached (mtime, size) shortcut.
-        let outcome = refresh_one_file(&dir, &path, None);
+        let outcome = refresh_one_file(&dir, &path, None, opts.max_file_bytes);
         if let Some(file) = fold_refresh_outcome(outcome, &mut report) {
             by_dir.entry(dir).or_default().push(file);
         }
@@ -1171,6 +1323,41 @@ mod tests {
         assert_eq!(loaded, vec![good]);
     }
 
+    /// B14: a save's orphan GC deletes an unreferenced blob (regression test
+    /// below covers that end to end via the CLI), but this pins the
+    /// conservative other half directly — it must NEVER delete anything that
+    /// isn't unambiguously a blob file, even though none of these planted
+    /// files are referenced by the (empty) manifest either. Covers: an
+    /// unrelated file, a `.bin` file with uppercase hex (our scheme is always
+    /// lowercase — see `blob_file_name`), a `.bin` file whose stem is the
+    /// wrong length, and a subdirectory.
+    #[test]
+    fn save_cache_gc_leaves_non_blob_and_malformed_bin_files_alone() {
+        let td = TempDir::new().unwrap();
+        save_cache(td.path(), &[], 300).unwrap();
+
+        let cache_dir = td.path().join(".querymatter");
+        fs::write(cache_dir.join("notes.txt"), b"unrelated file").unwrap();
+        fs::write(
+            cache_dir.join("DEADBEEF00000000.bin"),
+            b"uppercase hex, not our scheme",
+        )
+        .unwrap();
+        fs::write(cache_dir.join("short.bin"), b"too short to be a blob name").unwrap();
+        fs::create_dir(cache_dir.join("subdir")).unwrap();
+
+        // Re-save with the same (empty) dir set: the GC re-runs over
+        // `cache_dir` with nothing in the keep-set beyond `manifest.bin`
+        // itself, so an incorrect GC would delete every planted file above.
+        save_cache(td.path(), &[], 300).unwrap();
+
+        assert!(cache_dir.join("notes.txt").is_file());
+        assert!(cache_dir.join("DEADBEEF00000000.bin").is_file());
+        assert!(cache_dir.join("short.bin").is_file());
+        assert!(cache_dir.join("subdir").is_dir());
+        assert!(cache_dir.join("manifest.bin").is_file());
+    }
+
     #[test]
     fn find_vault_finds_ancestor() {
         let td = TempDir::new().unwrap();
@@ -1249,6 +1436,35 @@ mod tests {
 
     fn set_mtime(path: &Path, time: SystemTime) {
         File::open(path).unwrap().set_modified(time).unwrap();
+    }
+
+    /// B8: a file whose on-disk size exceeds `max_file_bytes` is skipped with
+    /// a [`ScanResult::Warning`] naming it — never handed to
+    /// `fs::read_to_string` — while a file within the cap scans normally.
+    #[test]
+    fn scan_file_skips_a_file_over_max_file_bytes_naming_it() {
+        let td = TempDir::new().unwrap();
+        write_file(
+            td.path(),
+            "big.md",
+            &format!("---\nstatus: draft\n---\n{}", "x".repeat(2000)),
+        );
+        write_file(td.path(), "small.md", "---\nstatus: draft\n---\n");
+
+        let big = td.path().join("big.md");
+        match scan_file(td.path(), &big, 1000) {
+            ScanResult::Warning(msg) => assert!(
+                msg.contains("big.md"),
+                "warning must name the oversized file, got: {msg}"
+            ),
+            other => panic!("expected a size-cap Warning, got {other:?}"),
+        }
+
+        let small = td.path().join("small.md");
+        assert!(matches!(
+            scan_file(td.path(), &small, 1000),
+            ScanResult::Cached(_)
+        ));
     }
 
     /// Builds an initial cache for `vault` by refreshing an empty cache
@@ -1557,7 +1773,8 @@ mod tests {
         write_file(td.path(), "plans/a.md", "---\nstatus: draft\n---\n");
 
         let cached = build_initial_cache(td.path());
-        let cached_records: Vec<Record> = records_from(td.path(), &cached, None)
+        let (entries, _report) = records_from(td.path(), &cached, None);
+        let cached_records: Vec<Record> = entries
             .into_iter()
             .flat_map(|(_, records, _field_names)| records)
             .collect();
@@ -1569,6 +1786,139 @@ mod tests {
         assert_eq!(cached_records.len(), 1);
         assert_eq!(live_records.len(), 1);
         assert_eq!(&cached_records[0], live_records[0]);
+    }
+
+    /// B6 (security, high risk): a poisoned on-disk cache blob can carry a
+    /// `CachedFile::rel_path` that escapes the vault — `load_cache_under`
+    /// only guards against corruption (a bad MAGIC/version header), not
+    /// malice, so a crafted-but-well-formed blob decodes fine. Crafting a
+    /// real bincode blob is impractical, so this constructs the `CachedDir`
+    /// directly (matching the real field names) with a traversal `rel_path`
+    /// alongside a legitimate nested one, and characterizes `records_from`'s
+    /// behavior: the traversal entry must NOT become a `Record` (today it
+    /// does, pointing outside the vault via `Record::abs_path`), while the
+    /// legitimate nested entry must still load (INV-4 cache round-trip).
+    #[test]
+    fn records_from_rejects_path_traversal_rel_path() {
+        let td = TempDir::new().unwrap();
+        let vault = td.path();
+
+        let malicious = CachedFile {
+            rel_path: "../../../../etc/passwd".into(),
+            mtime: UNIX_EPOCH,
+            size: 0,
+            fields: IndexMap::new(),
+            word_count: 0,
+        };
+        let legitimate = CachedFile {
+            rel_path: "a/b.md".into(),
+            mtime: UNIX_EPOCH,
+            size: 0,
+            fields: IndexMap::new(),
+            word_count: 0,
+        };
+        let cached_dir = CachedDir {
+            dir: vault.to_path_buf(),
+            scanned_at: UNIX_EPOCH,
+            dir_mtime: UNIX_EPOCH,
+            files: vec![malicious, legitimate],
+        };
+
+        let (entries, report) = records_from(vault, &[cached_dir], None);
+        let records: Vec<Record> = entries
+            .into_iter()
+            .flat_map(|(_, records, _field_names)| records)
+            .collect();
+
+        assert!(
+            !records.iter().any(|r| r.abs_path().ends_with("etc/passwd")),
+            "a traversal rel_path must never become a Record pointing outside the vault, got {records:?}"
+        );
+        assert_eq!(
+            records.len(),
+            1,
+            "only the legitimate nested rel_path should survive, got {records:?}"
+        );
+        assert_eq!(records[0].abs_path(), vault.join("a/b.md").as_path());
+
+        assert_eq!(
+            report.skipped, 1,
+            "the rejected traversal entry must be counted as a skip"
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("../../../../etc/passwd")),
+            "the skip must be observable via a LoadReport warning naming the rel_path, got {:?}",
+            report.warnings
+        );
+    }
+
+    /// B6 positive case: a `rel_path` nested several levels deep (`a/b/c.md`)
+    /// is exactly the shape a legitimate scan produces for a subdirectory
+    /// file (INV-4, cache round-trip) and must still load — the containment
+    /// check must not reject ordinary nesting, only actual escapes.
+    #[test]
+    fn records_from_still_loads_legitimate_nested_rel_path() {
+        let td = TempDir::new().unwrap();
+        let vault = td.path();
+
+        let cached_dir = CachedDir {
+            dir: vault.to_path_buf(),
+            scanned_at: UNIX_EPOCH,
+            dir_mtime: UNIX_EPOCH,
+            files: vec![CachedFile {
+                rel_path: "a/b/c.md".into(),
+                mtime: UNIX_EPOCH,
+                size: 0,
+                fields: IndexMap::new(),
+                word_count: 0,
+            }],
+        };
+
+        let (entries, report) = records_from(vault, &[cached_dir], None);
+        let records: Vec<Record> = entries
+            .into_iter()
+            .flat_map(|(_, records, _field_names)| records)
+            .collect();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].abs_path(), vault.join("a/b/c.md").as_path());
+        assert_eq!(report.skipped, 0);
+        assert!(report.warnings.is_empty());
+    }
+
+    /// B6: an absolute `rel_path` (no `..` needed at all) must be rejected
+    /// the same way a `..`-relative traversal is — [`contained_path`] checks
+    /// via [`Component`] matching, not string-matching for `..`, so this
+    /// pins that an absolute path is caught too.
+    #[test]
+    fn records_from_rejects_absolute_rel_path() {
+        let td = TempDir::new().unwrap();
+        let vault = td.path();
+
+        let cached_dir = CachedDir {
+            dir: vault.to_path_buf(),
+            scanned_at: UNIX_EPOCH,
+            dir_mtime: UNIX_EPOCH,
+            files: vec![CachedFile {
+                rel_path: "/etc/passwd".into(),
+                mtime: UNIX_EPOCH,
+                size: 0,
+                fields: IndexMap::new(),
+                word_count: 0,
+            }],
+        };
+
+        let (entries, report) = records_from(vault, &[cached_dir], None);
+        let records: Vec<Record> = entries
+            .into_iter()
+            .flat_map(|(_, records, _field_names)| records)
+            .collect();
+
+        assert!(records.is_empty(), "got {records:?}");
+        assert_eq!(report.skipped, 1);
     }
 
     /// Every directory's `rel_path`s, in the order they appear in `dirs` and
@@ -1617,7 +1967,7 @@ mod tests {
         let mut warnings = Vec::new();
         for path in discover::discover(dir, &WalkOpts::default()) {
             let parent = file_dir(dir, &path);
-            match scan_file(&parent, &path) {
+            match scan_file(&parent, &path, WalkOpts::default().max_file_bytes) {
                 ScanResult::Cached(file) => {
                     by_dir.entry(parent).or_default().push(file.rel_path);
                 }

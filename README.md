@@ -205,7 +205,9 @@ was cached, `file.body` can't be read and resolves to `NULL` rather than a
 wrong or stale answer. (Strict mode fails the whole query up front instead,
 naming `--force-cache`, so a `NULL` you didn't expect is never silently
 mistaken for "the file has an empty body"; pass `--lenient` to get the
-per-row `NULL` instead.)
+per-row `NULL` instead.) A file larger than `max_file_bytes` (see
+[Configuration](#configuration)) resolves to `NULL` the same way, rather than
+being read into memory.
 
 ```sql
 SELECT file.name, file.word_count WHERE file.body REGEXP 'TODO|FIXME'
@@ -694,6 +696,7 @@ lenient           = false
 timer             = false
 header            = true
 quiet             = false
+max_file_bytes    = 8388608     # 8 MiB; caps file.body and per-file scanning
 ```
 
 Every key is optional; an absent key falls through to the next layer. Values
@@ -722,6 +725,15 @@ way to turn it on. Either way, a REPL session's own `.header [on|off]` /
 `.timer [on|off]` (see [REPL dot-commands](#repl-dot-commands)) toggle just
 that session, on top of whatever the flag/config layers already resolved.
 
+`max_file_bytes` also has no CLI flag — `config set max_file_bytes <N>` is the
+only durable way to change it. It caps the largest file (in bytes) querymatter
+will read into memory, both while scanning/`init`-ing (a larger file is
+skipped with a warning, exactly like invalid frontmatter) and while resolving
+`file.body` (a larger file resolves to `NULL`, exactly like an unreadable
+file) — a defense against a single multi-gigabyte or padded file in a scanned
+vault exhausting memory. The built-in default is 8 MiB, generous enough that
+an ordinary Markdown note is never affected.
+
 | Command | Meaning |
 | --- | --- |
 | `config list` | Every setting, its resolved value, and which layer supplied it. |
@@ -745,6 +757,7 @@ lenient            false        (default)
 timer              false        (default)
 header             true         (default)
 quiet              false        (default)
+max_file_bytes     8388608      (default)
 ```
 
 A key supplied by a `.querymatter.toml` above the current directory shows
@@ -933,7 +946,10 @@ rather than a fragment of it.
 - **Files with no frontmatter block are skipped entirely** — they never show
   up as an all-`NULL` row. A file whose frontmatter exists but fails to parse
   as YAML is also skipped, with a warning on stderr (stdout stays clean for
-  piping) — silenced by `--quiet`/`-q` (see [Flags](#flags)).
+  piping) — silenced by `--quiet`/`-q` (see [Flags](#flags)). A file larger
+  than `max_file_bytes` (default 8 MiB — see
+  [Configuration](#configuration)) is skipped the same way, before it's ever
+  read into memory.
 - **Unquoted leading-zero YAML values parse as integers.** `prd: 010` loads
   as the integer `10`, not the string `"010"` — quote it (`prd: '010'`) if
   you need it to stay a string.

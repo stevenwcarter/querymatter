@@ -47,6 +47,11 @@ pub struct Config {
     pub header: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quiet: Option<bool>,
+    /// The largest file, in bytes, that will be read into memory while
+    /// scanning or resolving `file.body` (security fix B8). Absent falls
+    /// through to [`crate::discover::DEFAULT_MAX_FILE_BYTES`] (8 MiB).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_file_bytes: Option<u64>,
 }
 
 /// One configurable setting, named identically on the command line and in the
@@ -76,6 +81,8 @@ pub enum ConfigKey {
     Header,
     #[value(name = "quiet")]
     Quiet,
+    #[value(name = "max_file_bytes")]
+    MaxFileBytes,
 }
 
 /// What a [`ConfigKey`] accepts, for `config get` and for error messages.
@@ -85,6 +92,8 @@ pub enum Allowed {
     OneOf(&'static [&'static str]),
     /// A comma-separated list of free-form strings.
     List,
+    /// Any non-negative integer, interpreted as a byte count.
+    Bytes,
 }
 
 impl fmt::Display for Allowed {
@@ -92,13 +101,14 @@ impl fmt::Display for Allowed {
         match self {
             Allowed::OneOf(values) => write!(f, "{}", values.join(", ")),
             Allowed::List => write!(f, "a comma-separated list"),
+            Allowed::Bytes => write!(f, "a non-negative integer (bytes)"),
         }
     }
 }
 
 impl ConfigKey {
     /// Every key, in listing order.
-    pub const ALL: [ConfigKey; 10] = [
+    pub const ALL: [ConfigKey; 11] = [
         ConfigKey::Format,
         ConfigKey::TableStyle,
         ConfigKey::Ext,
@@ -109,6 +119,7 @@ impl ConfigKey {
         ConfigKey::Timer,
         ConfigKey::Header,
         ConfigKey::Quiet,
+        ConfigKey::MaxFileBytes,
     ];
 
     /// The key's name, identical on the command line and in the TOML file.
@@ -124,6 +135,7 @@ impl ConfigKey {
             ConfigKey::Timer => "timer",
             ConfigKey::Header => "header",
             ConfigKey::Quiet => "quiet",
+            ConfigKey::MaxFileBytes => "max_file_bytes",
         }
     }
 
@@ -139,6 +151,7 @@ impl ConfigKey {
             | ConfigKey::Header
             | ConfigKey::Quiet => Allowed::OneOf(&["true", "false"]),
             ConfigKey::Ext | ConfigKey::Exclude => Allowed::List,
+            ConfigKey::MaxFileBytes => Allowed::Bytes,
         }
     }
 }
@@ -214,6 +227,7 @@ pub fn set(config: &mut Config, key: ConfigKey, value: &str) -> anyhow::Result<(
         ConfigKey::Timer => config.timer = Some(parse_bool(key, value)?),
         ConfigKey::Header => config.header = Some(parse_bool(key, value)?),
         ConfigKey::Quiet => config.quiet = Some(parse_bool(key, value)?),
+        ConfigKey::MaxFileBytes => config.max_file_bytes = Some(parse_bytes(key, value)?),
     }
     Ok(())
 }
@@ -243,6 +257,7 @@ pub fn unset(config: &mut Config, key: ConfigKey) {
         ConfigKey::Timer => config.timer = None,
         ConfigKey::Header => config.header = None,
         ConfigKey::Quiet => config.quiet = None,
+        ConfigKey::MaxFileBytes => config.max_file_bytes = None,
     }
 }
 
@@ -260,6 +275,7 @@ pub fn get(config: &Config, key: ConfigKey) -> Option<String> {
         ConfigKey::Timer => config.timer.map(|b| b.to_string()),
         ConfigKey::Header => config.header.map(|b| b.to_string()),
         ConfigKey::Quiet => config.quiet.map(|b| b.to_string()),
+        ConfigKey::MaxFileBytes => config.max_file_bytes.map(|n| n.to_string()),
     }
 }
 
@@ -285,6 +301,17 @@ fn parse_bool(key: ConfigKey, value: &str) -> anyhow::Result<bool> {
             key.allowed()
         ),
     }
+}
+
+/// Parses a byte count: a base-10, non-negative integer with no unit suffix.
+fn parse_bytes(key: ConfigKey, value: &str) -> anyhow::Result<u64> {
+    value.parse().map_err(|_| {
+        anyhow::anyhow!(
+            "invalid {} value {value:?} (expected {})",
+            key.as_str(),
+            key.allowed()
+        )
+    })
 }
 
 /// Splits a comma-separated list, trimming each entry and dropping blanks.
@@ -606,5 +633,37 @@ mod tests {
         assert_eq!(get(&config, ConfigKey::Header).as_deref(), Some("false"));
         assert_eq!(get(&config, ConfigKey::Quiet).as_deref(), Some("true"));
         assert_eq!(ConfigKey::Timer.allowed().to_string(), "true, false");
+    }
+
+    /// B8: `max_file_bytes` round-trips through `set`/`get` and the file
+    /// itself, exactly like every other numeric-shaped setting above.
+    #[test]
+    fn max_file_bytes_round_trips_through_set_get_and_the_file() {
+        let td = tempdir().unwrap();
+        let path = td.path().join("config.toml");
+        let mut config = Config::default();
+        set(&mut config, ConfigKey::MaxFileBytes, "1000").unwrap();
+        assert_eq!(
+            get(&config, ConfigKey::MaxFileBytes).as_deref(),
+            Some("1000")
+        );
+        assert_eq!(config.max_file_bytes, Some(1000));
+        save_to(&path, &config).unwrap();
+        assert_eq!(load_from(&path).unwrap(), config);
+    }
+
+    /// A non-numeric value must be rejected up front, naming the bad value,
+    /// and must not mutate `config` — the same "reject loudly, don't touch
+    /// on failure" rule every other `set` case follows.
+    #[test]
+    fn set_rejects_a_non_numeric_max_file_bytes_leaving_config_untouched() {
+        let mut config = Config::default();
+        let before = config.clone();
+        let err = format!(
+            "{:#}",
+            set(&mut config, ConfigKey::MaxFileBytes, "huge").unwrap_err()
+        );
+        assert!(err.contains("huge"), "must name the bad value, got: {err}");
+        assert_eq!(config, before, "a rejected set must not mutate");
     }
 }
