@@ -232,6 +232,7 @@ impl Session {
             &schema,
             self.settings.lenient.value,
             self.disk_reads_allowed,
+            self.settings.max_file_bytes.value,
         )
         .with_context(|| format!("failed to execute query: {sql}"))
     }

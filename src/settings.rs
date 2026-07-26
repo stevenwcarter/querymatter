@@ -19,7 +19,7 @@ use clap::parser::ValueSource;
 
 use crate::cli::{Cli, WalkFlags};
 use crate::config::{Config, ConfigKey};
-use crate::discover::WalkOpts;
+use crate::discover::{DEFAULT_MAX_FILE_BYTES, WalkOpts};
 use crate::render::{Format, TableStyle};
 
 /// Which precedence layer supplied a resolved value.
@@ -79,6 +79,7 @@ pub struct Settings {
     pub timer: Resolved<bool>,
     pub header: Resolved<bool>,
     pub quiet: Resolved<bool>,
+    pub max_file_bytes: Resolved<u64>,
 }
 
 impl Default for Settings {
@@ -98,6 +99,7 @@ impl Default for Settings {
             timer: Resolved::new(false, Source::Default),
             header: Resolved::new(true, Source::Default),
             quiet: Resolved::new(false, Source::Default),
+            max_file_bytes: Resolved::new(DEFAULT_MAX_FILE_BYTES, Source::Default),
         }
     }
 }
@@ -204,6 +206,17 @@ impl Settings {
                 defaults.exclude.value.clone(),
                 source_of(matches, "exclude"),
             ),
+            // No CLI flag/env var: a config/default is sufficient for a
+            // security cap nobody needs to override per-invocation (see the
+            // B8 task brief). `resolve_value`'s `cli`/`cli_source` are simply
+            // `None`, so this always resolves to `vault > config > default`.
+            max_file_bytes: resolve_value(
+                None,
+                vault.max_file_bytes,
+                config.max_file_bytes,
+                defaults.max_file_bytes.value,
+                None,
+            ),
             ..defaults
         }
     }
@@ -217,6 +230,7 @@ impl Settings {
             hidden: self.hidden.value,
             excludes: self.exclude.value.clone(),
             ignore_files: Vec::new(),
+            max_file_bytes: self.max_file_bytes.value,
         }
     }
 
@@ -296,6 +310,13 @@ impl Settings {
             (
                 ConfigKey::Quiet,
                 (self.quiet.value.to_string(), self.quiet.source),
+            ),
+            (
+                ConfigKey::MaxFileBytes,
+                (
+                    self.max_file_bytes.value.to_string(),
+                    self.max_file_bytes.source,
+                ),
             ),
         ])
     }
@@ -759,6 +780,63 @@ mod tests {
         let s = resolve_with_vault(&["querymatter"], &vault, &config);
         assert!(s.timer.value);
         assert_eq!(s.timer.source, Source::Vault);
+    }
+
+    /// B8: no CLI flag exists for `max_file_bytes` (a config/default is
+    /// sufficient — see the task brief), so its default must be the built-in
+    /// [`crate::discover::DEFAULT_MAX_FILE_BYTES`], sourced `Default`.
+    #[test]
+    fn max_file_bytes_defaults_to_the_built_in_default() {
+        let s = resolve(&["querymatter"], &Config::default());
+        assert_eq!(
+            s.max_file_bytes.value,
+            crate::discover::DEFAULT_MAX_FILE_BYTES
+        );
+        assert_eq!(s.max_file_bytes.source, Source::Default);
+    }
+
+    #[test]
+    fn max_file_bytes_config_beats_default() {
+        let config = config_with(|c| c.max_file_bytes = Some(1000));
+        let s = resolve(&["querymatter"], &config);
+        assert_eq!(s.max_file_bytes.value, 1000);
+        assert_eq!(s.max_file_bytes.source, Source::Config);
+    }
+
+    #[test]
+    fn max_file_bytes_vault_beats_config() {
+        let vault = config_with(|c| c.max_file_bytes = Some(1000));
+        let config = config_with(|c| c.max_file_bytes = Some(2000));
+        let s = resolve_with_vault(&["querymatter"], &vault, &config);
+        assert_eq!(s.max_file_bytes.value, 1000);
+        assert_eq!(s.max_file_bytes.source, Source::Vault);
+    }
+
+    /// `init` resolves scan settings via `resolve_walk` directly (not
+    /// `resolve`) — see `resolve_walk_picks_up_a_configured_hidden_true`
+    /// above; `max_file_bytes` must reach it the same way, since `init` is
+    /// exactly the path that must skip an oversized file while building the
+    /// cache.
+    #[test]
+    fn resolve_walk_picks_up_a_configured_max_file_bytes() {
+        let mut command = Cli::command().mut_arg("table_style", |a| a.env(None::<&str>));
+        let matches = command
+            .try_get_matches_from_mut(["querymatter", "init"])
+            .unwrap();
+        let cli = Cli::from_arg_matches(&matches).unwrap();
+        let Some(Command::Init(init_args)) = &cli.command else {
+            panic!("expected an Init subcommand");
+        };
+        let sub_matches = matches
+            .subcommand_matches("init")
+            .expect("Command::Init parsed implies the init subcommand matched");
+        let config = config_with(|c| c.max_file_bytes = Some(1000));
+
+        let settings =
+            Settings::resolve_walk(&init_args.walk, &Config::default(), &config, sub_matches);
+        assert_eq!(settings.max_file_bytes.value, 1000);
+        assert_eq!(settings.max_file_bytes.source, Source::Config);
+        assert_eq!(settings.walk_opts().max_file_bytes, 1000);
     }
 
     #[test]

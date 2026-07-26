@@ -446,7 +446,9 @@ fn scan_root(
     wanted: Option<&BTreeSet<String>>,
 ) -> (Vec<Record>, BTreeSet<String>, LoadReport) {
     let paths = discover::discover(root, opts);
-    let scanned = parallel::map_paths(paths, |path| cache::scan_file(root, path));
+    let scanned = parallel::map_paths(paths, |path| {
+        cache::scan_file(root, path, opts.max_file_bytes)
+    });
 
     let mut records = Vec::new();
     let mut field_names = BTreeSet::new();
@@ -720,13 +722,27 @@ mod tests {
 
         let parsed = crate::query::parse("SELECT roadmap").unwrap();
         assert!(
-            crate::query::execute_with_schema(&parsed, store.records(), &schema, false, true)
-                .is_err(),
+            crate::query::execute_with_schema(
+                &parsed,
+                store.records(),
+                &schema,
+                false,
+                true,
+                u64::MAX,
+            )
+            .is_err(),
             "a product-only column must be unknown under a plans-scoped default-mode query"
         );
         assert!(
-            crate::query::execute_with_schema(&parsed, store.records(), &schema, true, true)
-                .is_ok(),
+            crate::query::execute_with_schema(
+                &parsed,
+                store.records(),
+                &schema,
+                true,
+                true,
+                u64::MAX,
+            )
+            .is_ok(),
             "--lenient must bypass the subtree-scoped validation surface"
         );
     }
@@ -1205,7 +1221,7 @@ mod tests {
         let mut expected_paths = Vec::new();
         let mut expected_warnings = Vec::new();
         for path in discover::discover(td.path(), &WalkOpts::default()) {
-            match cache::scan_file(td.path(), &path) {
+            match cache::scan_file(td.path(), &path, WalkOpts::default().max_file_bytes) {
                 ScanResult::Cached(_) => expected_paths.push(path),
                 ScanResult::NoFrontmatter => {}
                 ScanResult::Warning(msg) => expected_warnings.push(msg),

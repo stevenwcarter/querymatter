@@ -342,6 +342,66 @@ fn quiet_suppresses_skipped_file_warnings_but_not_errors() {
         .stderr(predicates::str::is_empty().not());
 }
 
+/// B8 (security, resource exhaustion): a file whose on-disk size exceeds a
+/// configured `max_file_bytes` is skipped — never handed to
+/// `fs::read_to_string` — with a warning naming it on stderr, exactly like an
+/// unreadable file or invalid frontmatter; the small file alongside it still
+/// surfaces normally. A small test cap (`1000`) via the config knob keeps
+/// this test itself fast, rather than writing a real multi-megabyte fixture.
+#[test]
+fn oversized_file_is_skipped_with_warning() {
+    let td = TempDir::new().unwrap();
+    fs::write(
+        td.path().join("big.md"),
+        format!("---\ntitle: big\n---\n{}", "x".repeat(20_000)),
+    )
+    .unwrap();
+    fs::write(td.path().join("small.md"), "---\ntitle: small\n---\n").unwrap();
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "max_file_bytes = 1000\n");
+    qm(home.path())
+        .arg("-e")
+        .arg("SELECT title")
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("small"))
+        .stdout(predicates::str::contains("big").not())
+        .stderr(predicates::str::contains("big.md"));
+}
+
+/// B8: `querymatter init` must apply the same `max_file_bytes` cap while
+/// building the cache — an oversized file is skipped with a warning here too,
+/// not just on a live (`--no-cache`) query, since `init`'s scan is the other
+/// caller of `cache::scan_file`.
+#[test]
+fn init_skips_an_oversized_file_with_warning() {
+    let td = TempDir::new().unwrap();
+    fs::write(
+        td.path().join("big.md"),
+        format!("---\ntitle: big\n---\n{}", "x".repeat(20_000)),
+    )
+    .unwrap();
+    fs::write(td.path().join("small.md"), "---\ntitle: small\n---\n").unwrap();
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "max_file_bytes = 1000\n");
+    qm(home.path())
+        .arg("init")
+        .arg(td.path())
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("big.md"));
+
+    qm(home.path())
+        .arg("-e")
+        .arg("SELECT title")
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("small"))
+        .stdout(predicates::str::contains("big").not());
+}
+
 #[test]
 fn batch_good_then_bad_exits_nonzero() {
     let td = tree();
@@ -1115,6 +1175,60 @@ fn file_body_like_matches_a_fixture_containing_todo() {
         .clone();
     let s = String::from_utf8(out).unwrap();
     assert_eq!(s.lines().last().unwrap().trim(), "has-todo.md");
+}
+
+/// B8: `file.body` always re-reads fresh from disk (design W56 — the cache
+/// never stores body text), so it must respect `max_file_bytes` even for a
+/// file whose cached (mtime, size) entry was written under a LARGER cap and
+/// hasn't changed since — `refresh_one_file`'s per-file freshness shortcut
+/// reuses that entry verbatim (a cheap, safe reuse: no raw content is read),
+/// so tightening the cap alone does not retroactively drop the file from the
+/// vault, but a later `SELECT file.body` against it must still resolve to
+/// NULL rather than buffer the now-too-large body into memory.
+#[test]
+fn file_body_is_null_for_a_cached_file_over_a_later_lowered_max_file_bytes() {
+    let td = TempDir::new().unwrap();
+    fs::write(
+        td.path().join("big.md"),
+        format!("---\nstatus: draft\n---\n{}", "x".repeat(20_000)),
+    )
+    .unwrap();
+    let home = TempDir::new().unwrap();
+
+    // Build the cache under the default (large) cap: the file scans fine.
+    qm(home.path())
+        .arg("init")
+        .arg(td.path())
+        .assert()
+        .success();
+
+    // Lower the cap after the fact. The file's mtime/size are unchanged, so
+    // the default per-file freshness check reuses the cached record without
+    // re-reading it — `status` still resolves normally.
+    write_config(home.path(), "max_file_bytes = 1000\n");
+    qm(home.path())
+        .current_dir(td.path())
+        .args(["-e", "SELECT status", "."])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("draft"));
+
+    // But `file.body` must now respect the lowered cap rather than reading
+    // the 20 KB body fresh off disk.
+    let out = qm(home.path())
+        .current_dir(td.path())
+        .args(["-e", "SELECT file.body", "--format", "csv", "."])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    assert_eq!(
+        s.lines().last().unwrap().trim(),
+        "\"\"",
+        "file.body over a lowered max_file_bytes must be NULL, got: {s:?}"
+    );
 }
 
 /// Task 7 (W56 part 2), test 2 (brief): under `--force-cache`, a `file.body`

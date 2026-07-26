@@ -92,6 +92,10 @@ pub enum ExecError {
 /// point (unit tests, and callers with an unpruned record set) has no notion
 /// of `--force-cache`; a caller that does must call [`execute_with_schema`]
 /// instead, passing its own `disk_reads_allowed`.
+///
+/// Also reads `file.body` with no size cap (`max_file_bytes: u64::MAX`): this
+/// entry point has no notion of the `max_file_bytes` setting either, for the
+/// same reason.
 pub fn execute<'a>(
     q: &Query,
     records: impl Iterator<Item = &'a Record>,
@@ -105,6 +109,7 @@ pub fn execute<'a>(
         &schema,
         lenient,
         true,
+        u64::MAX,
         SystemTime::now(),
     )
 }
@@ -127,6 +132,11 @@ pub fn execute<'a>(
 /// `file.body` (see [`references_body`]), or resolves it to `Value::Null`
 /// per row under `--lenient` (see [`read_body`]).
 ///
+/// `max_file_bytes` (security fix B8) caps how large a file `file.body` will
+/// read off disk: a file whose on-disk size exceeds it resolves to
+/// `Value::Null`, exactly like an unreadable file — see [`read_body`].
+/// Callers pass their resolved [`crate::settings::Settings::max_file_bytes`].
+///
 /// Dispatches on whether `q` is grouped/aggregate; see
 /// [`is_grouped_or_aggregate`].
 pub fn execute_with_schema<'a>(
@@ -135,6 +145,7 @@ pub fn execute_with_schema<'a>(
     schema: &[String],
     lenient: bool,
     disk_reads_allowed: bool,
+    max_file_bytes: u64,
 ) -> Result<ResultTable, ExecError> {
     execute_with_schema_at(
         q,
@@ -142,6 +153,7 @@ pub fn execute_with_schema<'a>(
         schema,
         lenient,
         disk_reads_allowed,
+        max_file_bytes,
         SystemTime::now(),
     )
 }
@@ -163,6 +175,7 @@ fn execute_with_schema_at<'a>(
     schema: &[String],
     lenient: bool,
     disk_reads_allowed: bool,
+    max_file_bytes: u64,
     now: SystemTime,
 ) -> Result<ResultTable, ExecError> {
     let mut resolved = q.clone();
@@ -188,6 +201,7 @@ fn execute_with_schema_at<'a>(
     let (like_regexes, regexp_regexes) = compile_pattern_regexes(q);
     let ctx = EvalCtx {
         disk_reads_allowed,
+        max_file_bytes,
         like_regexes: &like_regexes,
         regexp_regexes: &regexp_regexes,
     };
@@ -210,6 +224,9 @@ pub(crate) struct EvalCtx<'a> {
     /// Whether `file.body` disk reads are allowed for this query (design
     /// W56); see [`read_body`].
     disk_reads_allowed: bool,
+    /// The largest file `file.body` will read off disk for this query
+    /// (security fix B8); see [`read_body`].
+    max_file_bytes: u64,
     /// Every `LIKE` pattern in the query, translated and compiled once,
     /// keyed by its literal pattern text.
     like_regexes: &'a HashMap<String, Regex>,
@@ -721,7 +738,12 @@ fn execute_grouped<'a>(
     let items = validate_grouped_select(q)?;
     let headers: Vec<String> = q.select.iter().map(|item| item.header()).collect();
 
-    let mut groups = group_rows(&filtered, &q.group_by, ctx.disk_reads_allowed);
+    let mut groups = group_rows(
+        &filtered,
+        &q.group_by,
+        ctx.disk_reads_allowed,
+        ctx.max_file_bytes,
+    );
     groups.sort_by(|a, b| compare_key_tuple(&a.key, &b.key));
 
     let order = resolve_group_order_targets(&q.order_by, &headers, &q.group_by)?;
@@ -744,7 +766,13 @@ fn execute_grouped<'a>(
             // SQL 3VL, same rule as WHERE: a group is kept only when HAVING
             // is definitely true; unknown/false both drop it.
             Some(having) => {
-                eval_having(having, group, &q.group_by, ctx.disk_reads_allowed) == Some(true)
+                eval_having(
+                    having,
+                    group,
+                    &q.group_by,
+                    ctx.disk_reads_allowed,
+                    ctx.max_file_bytes,
+                ) == Some(true)
             }
             None => true,
         })
@@ -981,6 +1009,7 @@ fn group_rows<'a>(
     records: &[&'a Record],
     group_by: &[ColRef],
     disk_reads_allowed: bool,
+    max_file_bytes: u64,
 ) -> Vec<Group<'a>> {
     if group_by.is_empty() {
         return vec![Group {
@@ -993,7 +1022,7 @@ fn group_rows<'a>(
     for &record in records {
         let key: Vec<Value> = group_by
             .iter()
-            .map(|col| resolve_col(record, col, disk_reads_allowed))
+            .map(|col| resolve_col(record, col, disk_reads_allowed, max_file_bytes))
             .collect();
         let hash_key: Vec<String> = key.iter().map(hashable_cell_key).collect();
         match index.entry(hash_key) {
@@ -1126,7 +1155,7 @@ fn project_group(group: &Group<'_>, items: &[GroupedSelectItem], ctx: EvalCtx<'_
     for record in &group.rows {
         for item in &mut projected {
             if let ProjectedItem::Agg(state) = item {
-                state.update(record, ctx.disk_reads_allowed);
+                state.update(record, ctx.disk_reads_allowed, ctx.max_file_bytes);
             }
         }
     }
@@ -1250,33 +1279,37 @@ impl<'a> AggState<'a> {
 
     /// Folds one more row into the running state. Call once per row in the
     /// group, in row order — order matters for `GROUP_CONCAT`.
-    fn update(&mut self, record: &Record, disk_reads_allowed: bool) {
+    fn update(&mut self, record: &Record, disk_reads_allowed: bool, max_file_bytes: u64) {
         match self {
             AggState::CountStar(count) => *count += 1,
             AggState::Count { col, count } => {
-                if !resolve_col(record, col, disk_reads_allowed).is_null() {
+                if !resolve_col(record, col, disk_reads_allowed, max_file_bytes).is_null() {
                     *count += 1;
                 }
             }
             AggState::CountDistinct { col, seen } => {
-                let value = resolve_col(record, col, disk_reads_allowed);
+                let value = resolve_col(record, col, disk_reads_allowed, max_file_bytes);
                 if !value.is_null() {
                     seen.insert(value.to_cmp_string());
                 }
             }
             AggState::Sum { col, sum } => {
-                if let Some(n) = resolve_col(record, col, disk_reads_allowed).as_number() {
+                if let Some(n) =
+                    resolve_col(record, col, disk_reads_allowed, max_file_bytes).as_number()
+                {
                     *sum += n;
                 }
             }
             AggState::Avg { col, sum, count } => {
-                if let Some(n) = resolve_col(record, col, disk_reads_allowed).as_number() {
+                if let Some(n) =
+                    resolve_col(record, col, disk_reads_allowed, max_file_bytes).as_number()
+                {
                     *sum += n;
                     *count += 1;
                 }
             }
             AggState::Extreme { col, want, best } => {
-                let value = resolve_col(record, col, disk_reads_allowed);
+                let value = resolve_col(record, col, disk_reads_allowed, max_file_bytes);
                 if !value.is_null() {
                     match compare_values(&value, best) {
                         Some(ord) if ord == *want => *best = value,
@@ -1287,7 +1320,7 @@ impl<'a> AggState<'a> {
                 }
             }
             AggState::GroupConcat { col, parts } => {
-                let value = resolve_col(record, col, disk_reads_allowed);
+                let value = resolve_col(record, col, disk_reads_allowed, max_file_bytes);
                 if !value.is_null() {
                     parts.push(value.display());
                 }
@@ -1320,10 +1353,15 @@ impl<'a> AggState<'a> {
 /// single [`AggState`] and folds every row into it. See [`AggState`]'s doc
 /// for why this and [`project_group`] share the same accumulator instead of
 /// each re-implementing per-aggregate NULL handling.
-fn compute_aggregate(agg: &Aggregate, rows: &[&Record], disk_reads_allowed: bool) -> Value {
+fn compute_aggregate(
+    agg: &Aggregate,
+    rows: &[&Record],
+    disk_reads_allowed: bool,
+    max_file_bytes: u64,
+) -> Value {
     let mut state = AggState::new(agg);
     for record in rows {
-        state.update(record, disk_reads_allowed);
+        state.update(record, disk_reads_allowed, max_file_bytes);
     }
     state.finish()
 }
@@ -1338,23 +1376,28 @@ fn eval_having(
     group: &Group<'_>,
     group_by: &[ColRef],
     disk_reads_allowed: bool,
+    max_file_bytes: u64,
 ) -> Option<bool> {
     match having {
         Having::Compare(leaf, op, lit) => {
-            let value = eval_having_leaf(leaf, group, group_by, disk_reads_allowed);
+            let value = eval_having_leaf(leaf, group, group_by, disk_reads_allowed, max_file_bytes);
             eval_compare(&value, op, &literal_value(lit))
         }
         Having::And(a, b) => three_valued_and(
-            eval_having(a, group, group_by, disk_reads_allowed),
-            eval_having(b, group, group_by, disk_reads_allowed),
+            eval_having(a, group, group_by, disk_reads_allowed, max_file_bytes),
+            eval_having(b, group, group_by, disk_reads_allowed, max_file_bytes),
         ),
         Having::Or(a, b) => three_valued_or(
-            eval_having(a, group, group_by, disk_reads_allowed),
-            eval_having(b, group, group_by, disk_reads_allowed),
+            eval_having(a, group, group_by, disk_reads_allowed, max_file_bytes),
+            eval_having(b, group, group_by, disk_reads_allowed, max_file_bytes),
         ),
-        Having::Not(inner) => {
-            three_valued_not(eval_having(inner, group, group_by, disk_reads_allowed))
-        }
+        Having::Not(inner) => three_valued_not(eval_having(
+            inner,
+            group,
+            group_by,
+            disk_reads_allowed,
+            max_file_bytes,
+        )),
     }
 }
 
@@ -1371,9 +1414,12 @@ fn eval_having_leaf(
     group: &Group<'_>,
     group_by: &[ColRef],
     disk_reads_allowed: bool,
+    max_file_bytes: u64,
 ) -> Value {
     match leaf {
-        HavingLeaf::Agg(agg) => compute_aggregate(agg, &group.rows, disk_reads_allowed),
+        HavingLeaf::Agg(agg) => {
+            compute_aggregate(agg, &group.rows, disk_reads_allowed, max_file_bytes)
+        }
         HavingLeaf::Group(col) => group_by
             .iter()
             .position(|g| g == col)
@@ -1481,7 +1527,7 @@ fn group_order_key_value(
         ResolvedGroupOrderTarget::Row(idx) => row[*idx].clone(),
         ResolvedGroupOrderTarget::GroupKey(idx) => group.key[*idx].clone(),
         ResolvedGroupOrderTarget::Agg(agg) => {
-            compute_aggregate(agg, &group.rows, ctx.disk_reads_allowed)
+            compute_aggregate(agg, &group.rows, ctx.disk_reads_allowed, ctx.max_file_bytes)
         }
         ResolvedGroupOrderTarget::Expr(expr) => eval_group_expr(&group.rows, expr, ctx),
     }
@@ -1543,11 +1589,17 @@ fn sorted_field_union(records: &[&Record]) -> Vec<String> {
 /// through to [`Record::file_attr`] (which is pure and can only return its
 /// `Null` sentinel for `Body` — see its doc comment): it's the one column
 /// that needs a real disk read, gated by `disk_reads_allowed` (design W56;
-/// `false` under `Freshness::ForceCache`) — see [`read_body`].
-fn resolve_col(record: &Record, col: &ColRef, disk_reads_allowed: bool) -> Value {
+/// `false` under `Freshness::ForceCache`) and capped by `max_file_bytes`
+/// (security fix B8) — see [`read_body`].
+fn resolve_col(
+    record: &Record,
+    col: &ColRef,
+    disk_reads_allowed: bool,
+    max_file_bytes: u64,
+) -> Value {
     match col {
         ColRef::Field(path) => record.field(path),
-        ColRef::File(FileAttr::Body) => read_body(record, disk_reads_allowed),
+        ColRef::File(FileAttr::Body) => read_body(record, disk_reads_allowed, max_file_bytes),
         ColRef::File(attr) => record.file_attr(*attr),
     }
 }
@@ -1561,15 +1613,22 @@ fn resolve_col(record: &Record, col: &ColRef, disk_reads_allowed: bool) -> Value
 /// caller gets — strict mode instead fails the whole query up front via
 /// [`references_body`]/[`ExecError::BodyUnavailable`] before this is ever
 /// called), the file is unreadable (moved/deleted/permission-denied since it
-/// was cached), or its frontmatter fence is no longer valid YAML (see
-/// [`crate::frontmatter::body`]). Every one of these is indistinguishable
-/// from "no value" elsewhere in the query engine (a missing/invalid
-/// frontmatter field is `Null` too), so `Null` — never a panic — is the
-/// right total answer for a per-row condition that can't be predicted ahead
-/// of time.
-fn read_body(record: &Record, disk_reads_allowed: bool) -> Value {
+/// was cached), its on-disk size exceeds `max_file_bytes` (security fix B8 —
+/// checked from a `stat`, before any content is read, so an oversized file is
+/// never buffered into memory), or its frontmatter fence is no longer valid
+/// YAML (see [`crate::frontmatter::body`]). Every one of these is
+/// indistinguishable from "no value" elsewhere in the query engine (a
+/// missing/invalid frontmatter field is `Null` too), so `Null` — never a
+/// panic — is the right total answer for a per-row condition that can't be
+/// predicted ahead of time.
+fn read_body(record: &Record, disk_reads_allowed: bool, max_file_bytes: u64) -> Value {
     if !disk_reads_allowed {
         return Value::Null;
+    }
+    match fs::metadata(record.abs_path()) {
+        Ok(meta) if meta.len() > max_file_bytes => return Value::Null,
+        Ok(_) => {}
+        Err(_) => return Value::Null,
     }
     match fs::read_to_string(record.abs_path()) {
         Ok(content) => match frontmatter::body(&content) {
@@ -1598,7 +1657,7 @@ fn read_body(record: &Record, disk_reads_allowed: bool) -> Value {
 /// matching falls through to `else_expr`, or `Value::Null` with no `ELSE`.
 pub(crate) fn eval_expr(record: &Record, expr: &Expr, ctx: EvalCtx<'_>) -> Value {
     match expr {
-        Expr::Col(col) => resolve_col(record, col, ctx.disk_reads_allowed),
+        Expr::Col(col) => resolve_col(record, col, ctx.disk_reads_allowed, ctx.max_file_bytes),
         Expr::Lit(lit) => literal_value(lit),
         Expr::Scalar(f, args) => {
             let values: Vec<Value> = args.iter().map(|arg| eval_expr(record, arg, ctx)).collect();
@@ -1884,7 +1943,7 @@ fn eval_predicate(record: &Record, pred: &Predicate, ctx: EvalCtx<'_>) -> Option
         }
         Predicate::MemberOf(value_expr, col, negated) => {
             let needle = eval_expr(record, value_expr, ctx);
-            let value = resolve_col(record, col, ctx.disk_reads_allowed);
+            let value = resolve_col(record, col, ctx.disk_reads_allowed, ctx.max_file_bytes);
             let Value::List(items) = &value else {
                 // Unknown for both a `Null` field and a non-list value —
                 // never a hard `false` — mirroring `In`'s null-column rule.
@@ -2072,7 +2131,9 @@ fn order_key_value(
 ) -> Value {
     match target {
         ResolvedOrderTarget::AliasIndex(idx) => row[*idx].clone(),
-        ResolvedOrderTarget::Col(col) => resolve_col(record, col, ctx.disk_reads_allowed),
+        ResolvedOrderTarget::Col(col) => {
+            resolve_col(record, col, ctx.disk_reads_allowed, ctx.max_file_bytes)
+        }
         ResolvedOrderTarget::Expr(expr) => eval_expr(record, expr, ctx),
     }
 }
@@ -3217,6 +3278,7 @@ mod tests {
             &["created".to_string()],
             false,
             true,
+            u64::MAX,
             now,
         )
         .unwrap();
@@ -3233,6 +3295,7 @@ mod tests {
             &["created".to_string()],
             false,
             true,
+            u64::MAX,
             now,
         )
         .unwrap();
@@ -3298,6 +3361,7 @@ mod tests {
             &["created".to_string()],
             false,
             true,
+            u64::MAX,
             now,
         )
         .unwrap();
@@ -3314,6 +3378,7 @@ mod tests {
             &["created".to_string()],
             false,
             true,
+            u64::MAX,
             now,
         )
         .unwrap();
@@ -3338,6 +3403,7 @@ mod tests {
             &["dates".to_string()],
             false,
             true,
+            u64::MAX,
             now,
         )
         .unwrap();
@@ -3354,6 +3420,7 @@ mod tests {
             &["dates".to_string()],
             false,
             true,
+            u64::MAX,
             now,
         )
         .unwrap();
@@ -3391,6 +3458,7 @@ mod tests {
             &["status".to_string(), "created".to_string()],
             false,
             true,
+            u64::MAX,
             now,
         )
         .unwrap();
@@ -3404,7 +3472,8 @@ mod tests {
         let now = fixed_now();
         let row = rec("s", "s/a.md", &[]);
         let q = parse("SELECT '-7d' AS d").unwrap();
-        let t = execute_with_schema_at(&q, std::iter::once(&row), &[], false, true, now).unwrap();
+        let t = execute_with_schema_at(&q, std::iter::once(&row), &[], false, true, u64::MAX, now)
+            .unwrap();
         assert_eq!(t.rows, vec![vec![Value::Str("2026-07-17".into())]]);
     }
 
@@ -3423,7 +3492,8 @@ mod tests {
         let now = fixed_now();
         let row = rec("s", "s/a.md", &[]);
         let q = parse("SELECT COALESCE(epic, '-7d') AS d").unwrap();
-        let t = execute_with_schema_at(&q, std::iter::once(&row), &[], false, true, now).unwrap();
+        let t = execute_with_schema_at(&q, std::iter::once(&row), &[], false, true, u64::MAX, now)
+            .unwrap();
         assert_eq!(t.rows, vec![vec![Value::Str("2026-07-17".into())]]);
     }
 
@@ -3480,6 +3550,7 @@ mod tests {
             &["created".to_string()],
             false,
             true,
+            u64::MAX,
             now,
         )
         .unwrap();
@@ -4443,6 +4514,26 @@ mod agg_tests {
             assert_eq!(t.rows, vec![vec![Value::Str("hello world".into())]]);
         }
 
+        /// B8: a file whose on-disk size exceeds `max_file_bytes` resolves to
+        /// `Value::Null` — checked from a `stat`, before any content is read
+        /// — proven directly against [`read_body`], the function every
+        /// `file.body` reference ultimately delegates to.
+        #[test]
+        fn read_body_is_null_when_the_file_exceeds_max_file_bytes() {
+            let td = TempDir::new().unwrap();
+            let r = rec_on_disk(
+                td.path(),
+                "a.md",
+                "---\nstatus: draft\n---\nhello world\n",
+                &[],
+            );
+            assert_eq!(read_body(&r, true, 5), Value::Null);
+            assert_eq!(
+                read_body(&r, true, u64::MAX),
+                Value::Str("hello world".into())
+            );
+        }
+
         /// Test 2 (brief), lenient half: under `--force-cache`
         /// (`disk_reads_allowed = false`), `file.body` resolves to `Null` per
         /// row rather than a wrong/stale answer — `--lenient` set.
@@ -4458,6 +4549,7 @@ mod agg_tests {
                 &[],
                 true,  // lenient
                 false, // disk_reads_allowed
+                u64::MAX,
                 SystemTime::now(),
             )
             .unwrap();
@@ -4480,6 +4572,7 @@ mod agg_tests {
                 &[],
                 false, // strict
                 false, // disk_reads_allowed
+                u64::MAX,
                 SystemTime::now(),
             )
             .unwrap_err();
@@ -4502,6 +4595,7 @@ mod agg_tests {
                 &[],
                 false,
                 false,
+                u64::MAX,
                 SystemTime::now(),
             )
             .unwrap_err();

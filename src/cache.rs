@@ -432,11 +432,23 @@ fn stat_file(path: &Path) -> io::Result<(SystemTime, u64)> {
 /// `dir` is the directory a [`CachedFile::rel_path`] is resolved relative
 /// to; a caller that doesn't need `rel_path` (`store::scan_root`) may pass
 /// any ancestor of `path`.
-pub fn scan_file(dir: &Path, path: &Path) -> ScanResult {
+///
+/// `max_file_bytes` (security fix B8) is checked against the stat *before*
+/// any content is read: a file whose on-disk size exceeds it is skipped with
+/// a [`ScanResult::Warning`] naming it, exactly like an unreadable file or
+/// invalid frontmatter, rather than handed to `fs::read_to_string` — which
+/// would otherwise buffer the whole file (however large) into memory.
+pub fn scan_file(dir: &Path, path: &Path, max_file_bytes: u64) -> ScanResult {
     let (mtime, size) = match stat_file(path) {
         Ok(stat) => stat,
         Err(err) => return ScanResult::Warning(format!("{}: {err}", path.display())),
     };
+    if size > max_file_bytes {
+        return ScanResult::Warning(format!(
+            "{}: {size} bytes exceeds max_file_bytes ({max_file_bytes}) — skipped",
+            path.display()
+        ));
+    }
     let content = match fs::read_to_string(path) {
         Ok(content) => content,
         Err(err) => return ScanResult::Warning(format!("{}: {err}", path.display())),
@@ -547,7 +559,7 @@ fn refresh_per_file(
     let outcomes = parallel::map_paths(paths, |path| {
         let dir = file_dir(vault, path);
         let previous = cached_by_path.get(path).copied();
-        refresh_one_file(&dir, path, previous)
+        refresh_one_file(&dir, path, previous, opts.max_file_bytes)
     });
 
     let mut report = LoadReport::default();
@@ -596,7 +608,18 @@ enum RefreshOutcome {
 /// Refreshes one current file against its previous cached entry (if any):
 /// reuses the cached fields when `(mtime, size)` are unchanged, otherwise
 /// re-scans via [`scan_file`].
-fn refresh_one_file(dir: &Path, path: &Path, previous: Option<&CachedFile>) -> RefreshOutcome {
+///
+/// The reuse shortcut is not itself subject to `max_file_bytes`: it never
+/// reads the file's raw content (only `previous`'s already-parsed fields, the
+/// same small shape [`scan_file`] would have produced), so a lowered cap
+/// since the last scan cannot newly exhaust memory here — it only takes
+/// effect the next time this file actually falls through to [`scan_file`].
+fn refresh_one_file(
+    dir: &Path,
+    path: &Path,
+    previous: Option<&CachedFile>,
+    max_file_bytes: u64,
+) -> RefreshOutcome {
     if let Some(previous) = previous
         && let Ok((mtime, size)) = stat_file(path)
         && mtime == previous.mtime
@@ -605,7 +628,7 @@ fn refresh_one_file(dir: &Path, path: &Path, previous: Option<&CachedFile>) -> R
         return RefreshOutcome::Loaded(previous.clone());
     }
 
-    match scan_file(dir, path) {
+    match scan_file(dir, path, max_file_bytes) {
         ScanResult::Cached(file) => RefreshOutcome::Loaded(file),
         ScanResult::NoFrontmatter => RefreshOutcome::NoFrontmatter,
         ScanResult::Warning(msg) => RefreshOutcome::Warning(msg),
@@ -699,7 +722,7 @@ fn refresh_fast(
 
             let outcomes = parallel::map_paths(paths, |path| {
                 let previous = cached_by_path.get(path).copied();
-                refresh_one_file(&dir, path, previous)
+                refresh_one_file(&dir, path, previous, opts.max_file_bytes)
             });
             let files: Vec<CachedFile> = outcomes
                 .into_iter()
@@ -947,7 +970,7 @@ pub fn refresh_subtree(
         let dir = file_dir(vault, &path);
         // `previous: None` forces `refresh_one_file` straight to `scan_file`
         // for every file, ignoring any cached (mtime, size) shortcut.
-        let outcome = refresh_one_file(&dir, &path, None);
+        let outcome = refresh_one_file(&dir, &path, None, opts.max_file_bytes);
         if let Some(file) = fold_refresh_outcome(outcome, &mut report) {
             by_dir.entry(dir).or_default().push(file);
         }
@@ -1313,6 +1336,35 @@ mod tests {
 
     fn set_mtime(path: &Path, time: SystemTime) {
         File::open(path).unwrap().set_modified(time).unwrap();
+    }
+
+    /// B8: a file whose on-disk size exceeds `max_file_bytes` is skipped with
+    /// a [`ScanResult::Warning`] naming it — never handed to
+    /// `fs::read_to_string` — while a file within the cap scans normally.
+    #[test]
+    fn scan_file_skips_a_file_over_max_file_bytes_naming_it() {
+        let td = TempDir::new().unwrap();
+        write_file(
+            td.path(),
+            "big.md",
+            &format!("---\nstatus: draft\n---\n{}", "x".repeat(2000)),
+        );
+        write_file(td.path(), "small.md", "---\nstatus: draft\n---\n");
+
+        let big = td.path().join("big.md");
+        match scan_file(td.path(), &big, 1000) {
+            ScanResult::Warning(msg) => assert!(
+                msg.contains("big.md"),
+                "warning must name the oversized file, got: {msg}"
+            ),
+            other => panic!("expected a size-cap Warning, got {other:?}"),
+        }
+
+        let small = td.path().join("small.md");
+        assert!(matches!(
+            scan_file(td.path(), &small, 1000),
+            ScanResult::Cached(_)
+        ));
     }
 
     /// Builds an initial cache for `vault` by refreshing an empty cache
@@ -1815,7 +1867,7 @@ mod tests {
         let mut warnings = Vec::new();
         for path in discover::discover(dir, &WalkOpts::default()) {
             let parent = file_dir(dir, &path);
-            match scan_file(&parent, &path) {
+            match scan_file(&parent, &path, WalkOpts::default().max_file_bytes) {
                 ScanResult::Cached(file) => {
                     by_dir.entry(parent).or_default().push(file.rel_path);
                 }
