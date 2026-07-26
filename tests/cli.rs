@@ -1177,29 +1177,66 @@ fn file_body_like_matches_a_fixture_containing_todo() {
     assert_eq!(s.lines().last().unwrap().trim(), "has-todo.md");
 }
 
-/// Task 10 (B10): a query referencing `file.body` from BOTH `WHERE` and
-/// `SELECT` (indirectly, via projecting an unrelated column that's only kept
-/// because the `WHERE` matched) must still return the same row/value as
-/// before the per-record memo was added — the equivalence pin the brief
-/// calls for. The in-process unit test alongside `read_body_cached` proves
-/// the memoization itself (one disk read, not two); this end-to-end test
-/// proves memoizing it didn't change what the query returns.
+/// Task 10 (B10) code-review fix: replaces
+/// `file_body_referenced_twice_is_consistent`, which claimed to reference
+/// `file.body` "from BOTH WHERE and SELECT" but actually projected `title` —
+/// `file.body` appeared exactly once (in `WHERE`) — and asserted only that
+/// stdout contained `"t"`, a substring the literal table header `"title"`
+/// satisfies even if `WHERE` wrongly excluded every row. That left the
+/// multi-reference cache-threading `filter_records`/`execute_ungrouped`
+/// actually wire up (see their doc comments) with no end-to-end regression
+/// guard.
+///
+/// This test references `file.body` from all three memoized sites in one
+/// query — `SELECT file.body`, `WHERE file.body LIKE '%TODO%'`, and `ORDER
+/// BY file.body` — against TWO fixtures whose bodies both match the `WHERE`
+/// predicate but are otherwise distinct. If a future refactor ever built a
+/// fresh cache per stage (instead of threading the one per-record
+/// `body_cache` `filter_records` creates through `WHERE`/`SELECT`/`ORDER
+/// BY`), or — the sharper failure mode — shared a single `body_cache` across
+/// *records* instead of creating one fresh per record, the second record
+/// evaluated would see the first record's memoized body leak into its own
+/// evaluation: both rows would show the SAME body text (the first record's)
+/// instead of each showing its own. The exact full-stdout assertion below —
+/// not a substring — pins each row to its OWN body, in `ORDER BY` order, so
+/// either regression is caught.
 #[test]
-fn file_body_referenced_twice_is_consistent() {
+fn file_body_multi_reference_is_consistent_and_isolated_per_record() {
     let td = TempDir::new().unwrap();
     fs::write(
-        td.path().join("n.md"),
-        "---\ntitle: t\n---\nhello TODO world\n",
+        td.path().join("alpha.md"),
+        "---\ntitle: Alpha\n---\nTODO alpha only text\n",
+    )
+    .unwrap();
+    fs::write(
+        td.path().join("beta.md"),
+        "---\ntitle: Beta\n---\nTODO beta only text\n",
     )
     .unwrap();
     let home = TempDir::new().unwrap();
-    qm(home.path())
-        .arg("-e")
-        .arg("SELECT title WHERE file.body LIKE '%TODO%'")
-        .arg(td.path())
+
+    let out = qm(home.path())
+        .current_dir(td.path())
+        .args([
+            "-e",
+            "SELECT file.body WHERE file.body LIKE '%TODO%' ORDER BY file.body",
+            "--format",
+            "csv",
+            "--no-cache",
+            ".",
+        ])
         .assert()
         .success()
-        .stdout(predicates::str::contains("t"));
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    assert_eq!(
+        s, "file.body\nTODO alpha only text\nTODO beta only text\n",
+        "each row must carry ITS OWN file.body value, in ORDER BY order — a \
+         cross-record body_cache leak would instead duplicate one record's \
+         body onto the other's row; got: {s:?}"
+    );
 }
 
 /// B8: `file.body` always re-reads fresh from disk (design W56 — the cache
