@@ -173,6 +173,28 @@ fn frontmatter_fence(content: &str) -> Option<&str> {
     }
 }
 
+/// Where a line sits relative to the currently-open indentation levels,
+/// determined once per line by [`max_nesting_depth`] and used to decide how
+/// its same-line packing composes with what came before it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LinePlacement {
+    /// Indented deeper than the previous meaningful line: this line opens a
+    /// brand new level, nested inside whatever the enclosing (parent) level
+    /// last reached.
+    OpensLevel,
+    /// Indented exactly to an already-open level's column: a sibling entry
+    /// (e.g. the second item of a list). It composes with that level's
+    /// *parent*, not with the previous sibling — otherwise repeated siblings
+    /// would keep stacking on each other even though none of them nest
+    /// inside one another.
+    Sibling,
+    /// Neither of the above: the very first meaningful line of the text, or
+    /// a dedent to a column with no matching open level. There's no
+    /// enclosing level to compose with, but this line's own same-line
+    /// packing still must not be dropped.
+    Detached,
+}
+
 /// A cheap, conservative pre-parse estimate of how deeply gray_matter's YAML
 /// parser would need to recurse to parse `text`, computed without invoking
 /// the parser at all.
@@ -183,38 +205,86 @@ fn frontmatter_fence(content: &str) -> Option<&str> {
 /// prose the YAML engine never even sees (interval notation, a flattened
 /// outline) would wrongly compute a rejection-worthy depth.
 ///
-/// Three constructs can nest a `Value`, and the estimate is the running max
-/// of all three — over-counting only rejects more input, never lets a
-/// dangerous depth through, so none of these need to track YAML's grammar
-/// exactly:
-/// - the `[`/`{` bracket depth open at any point in the text (flow
-///   collections can span multiple lines, so this isn't reset per line);
-/// - the number of leading `- ` block-sequence markers on any single line
-///   (a *compact* nested sequence, e.g. `- - - - v`); and
-/// - indentation-nested block collections — the ordinary style, one `- `
-///   entry or `key:` mapping per line, each level a separate, further-
-///   indented line rather than packed onto one. A stack of the indentation
-///   columns currently open tracks this: a line indented deeper than the
-///   previous non-blank, non-comment line opens a level (push); a line
-///   indented at or shallower than an open level's column closes it (pop
-///   back to the matching column); the running maximum stack size is the
-///   estimate. Blank and comment-only lines are skipped entirely rather than
-///   treated as closing every open level at column 0 — YAML's own grammar
-///   treats them the same way (neither affects block structure), and *not*
-///   skipping them would let an attacker interleave them between real
-///   nesting levels to reset the tracked indentation and slip back under the
-///   cap while the real parser keeps recursing regardless.
+/// Two constructs nest a `Value`: indentation (block collections, one entry
+/// per line) and same-line packing (a compact dash run `- - - - v`, and/or
+/// `[`/`{` flow collections). The critical property this must get right is
+/// that these **compose**: the parser's actual recursion at a given line is
+/// (however many indentation levels are already open above it) **plus**
+/// (whatever extra packing that line itself adds) — not the max of the two
+/// estimated separately. Scoring them independently under-counts: `D`
+/// compact dashes per line, with each successive line indented one level
+/// under the previous line's innermost dash (`L` such lines), reaches true
+/// parser recursion ≈ `D × L`, while `max(D, L)` can stay small even when
+/// `D × L` is in the thousands (e.g. `D=8` — an utterly ordinary
+/// `- - - - - - - -` — with `L=120` reaches ~960, comfortably past
+/// yaml-rust2's own call-stack overflow point, while `max(8, 120) = 120`
+/// evades a 128 cap entirely). So the estimate here is a **running max of
+/// each line's own composed depth**, where a line's composed depth adds its
+/// same-line packing on top of whatever depth its enclosing indentation
+/// level already reached — never maxes the two independently. Over-counting
+/// only rejects more input, never lets a dangerous depth through, so none of
+/// this needs to track YAML's grammar exactly; when in doubt, round up.
 ///
-/// A leading `-` only counts as a sequence marker when followed by
-/// whitespace or end-of-line (`- - - - v`), not when it's the leading `-` of
-/// a negative number (`x: -5`) or a `---`/`...` document marker.
+/// Per line:
+/// - `dash_run` is the number of leading `- ` block-sequence markers packed
+///   onto this one line (a *compact* nested sequence, e.g. `- - - - v` scores
+///   4). A leading `-` only counts as a sequence marker when followed by
+///   whitespace or end-of-line, not when it's the leading `-` of a negative
+///   number (`x: -5`) or a `---`/`...` document marker.
+/// - `line_bracket_peak` is the highest `[`/`{` nesting reached while
+///   scanning this line, carrying over any flow-collection depth still open
+///   from a previous line (flow collections can span multiple lines).
+/// - `extra = dash_run.saturating_sub(1) + line_bracket_peak` is this line's
+///   same-line packing *beyond* the one level it already occupies just by
+///   being a block-sequence/mapping entry (the first `- ` of a compact run
+///   coincides with that entry — subtracting 1 avoids double-counting it
+///   against the indentation component below).
+/// - a stack of `(column, composed depth)` pairs tracks currently-open
+///   indentation levels: a line indented deeper than the previous
+///   non-blank, non-comment line opens a new level ([`LinePlacement::OpensLevel`]);
+///   one indented level opens further composes as `parent_depth + 1 +
+///   extra` (the `+ 1` is the ordinary per-level increment — a plain
+///   `key:`/`- item` line with no packing of its own still nests one level
+///   deeper than its parent); a line at an already-open column is a
+///   [`LinePlacement::Sibling`] and composes with that level's *parent*
+///   (not the previous sibling), so repeated siblings don't stack; anything
+///   else ([`LinePlacement::Detached`]) just contributes its own `extra`.
+///
+/// Blank and comment-only lines are skipped entirely — both for the
+/// indentation stack (rather than treated as closing every open level at
+/// column 0 — YAML's own grammar treats them the same way, neither affects
+/// block structure, and *not* skipping them would let an attacker interleave
+/// them between real nesting levels to reset the tracked indentation and
+/// slip back under the cap while the real parser keeps recursing
+/// regardless) and for same-line packing (a comment's `-`/`[`/`{` characters
+/// are never YAML structure).
+///
+/// Limitation (minor, B9 review): a literal/folded block scalar's content
+/// lines (`description: |` followed by indented prose) aren't given special
+/// treatment — they're scanned like any other lines even though the real
+/// parser treats them as opaque text, not structure. This is safe (only
+/// risks over-counting, never under-counting) and in practice doesn't
+/// false-positive on realistic prose: those content lines sit at one flat
+/// indentation (siblings of each other), and a sibling composes with its
+/// *parent*'s depth rather than accumulating across siblings, so a block of
+/// ordinary prose — even with an occasional `-` or `[...]` — stays shallow
+/// regardless of how many lines it has (see
+/// `realistic_literal_block_with_dashes_and_brackets_still_loads` below).
 fn max_nesting_depth(text: &str) -> usize {
     let mut bracket_depth = 0usize;
     let mut max_depth = 0usize;
-    let mut indent_stack: Vec<usize> = Vec::new();
+    // Each entry is (indentation column, composed depth reached by the line
+    // that opened, or last occupied, that column).
+    let mut indent_stack: Vec<(usize, usize)> = Vec::new();
     let mut prev_indent: Option<usize> = None;
+
     for line in text.lines() {
         let content = line.trim_start();
+        if content.is_empty() || content.starts_with('#') {
+            continue;
+        }
+        let indent = line.len() - content.len();
+
         let mut rest = content;
         let mut dash_run = 0usize;
         while let Some(after_dash) = rest.strip_prefix('-') {
@@ -225,40 +295,56 @@ fn max_nesting_depth(text: &str) -> usize {
                 break;
             }
         }
-        max_depth = max_depth.max(bracket_depth + dash_run);
+
+        let mut line_bracket_peak = bracket_depth;
         for c in line.chars() {
             match c {
                 '[' | '{' => {
                     bracket_depth += 1;
-                    max_depth = max_depth.max(bracket_depth);
+                    line_bracket_peak = line_bracket_peak.max(bracket_depth);
                 }
                 ']' | '}' => bracket_depth = bracket_depth.saturating_sub(1),
                 _ => {}
             }
         }
+        let extra = dash_run.saturating_sub(1) + line_bracket_peak;
 
-        // Indentation-nested collections (B9 follow-up): skip lines that
-        // never affect YAML's block structure — blank lines, and
-        // comment-only lines — so an attacker can't interleave them between
-        // real nesting levels to reset `prev_indent`/`indent_stack` back to
-        // column 0 and slip under the cap while the real parser keeps
-        // recursing at the true (unreset) depth.
-        if content.is_empty() || content.starts_with('#') {
-            continue;
+        while indent_stack.last().is_some_and(|&(col, _)| col > indent) {
+            indent_stack.pop();
         }
-        let indent = line.len() - content.len();
-        while let Some(&top) = indent_stack.last() {
-            if top > indent {
-                indent_stack.pop();
-            } else {
-                break;
+
+        let opens_level = prev_indent.is_some_and(|prev| indent > prev);
+        let placement = if opens_level {
+            LinePlacement::OpensLevel
+        } else if indent_stack.last().is_some_and(|&(col, _)| col == indent) {
+            LinePlacement::Sibling
+        } else {
+            LinePlacement::Detached
+        };
+
+        let total = match placement {
+            LinePlacement::OpensLevel => {
+                let parent_depth = indent_stack.last().map_or(0, |&(_, depth)| depth);
+                let total = parent_depth + 1 + extra;
+                indent_stack.push((indent, total));
+                total
             }
-        }
-        if prev_indent.is_some_and(|prev| indent > prev) {
-            indent_stack.push(indent);
-        }
+            LinePlacement::Sibling => {
+                let parent_depth = indent_stack
+                    .len()
+                    .checked_sub(2)
+                    .map_or(0, |i| indent_stack[i].1);
+                let total = parent_depth + 1 + extra;
+                if let Some(last) = indent_stack.last_mut() {
+                    last.1 = total;
+                }
+                total
+            }
+            LinePlacement::Detached => extra,
+        };
+
         prev_indent = Some(indent);
-        max_depth = max_depth.max(indent_stack.len());
+        max_depth = max_depth.max(total);
     }
     max_depth
 }
@@ -563,6 +649,73 @@ mod tests {
             max_nesting_depth(&text) > MAX_NESTING_DEPTH,
             "interleaved blank/comment lines must not mask the true depth"
         );
+    }
+
+    // FIX 2 (B9 second critical follow-up): the compact-dash estimate and the
+    // indentation estimate above were previously *maxed*, not *composed* — so
+    // a line with only 8 compact dashes (`dash_run`, comfortably under the
+    // cap by itself) nested 20 indentation levels deep (also comfortably
+    // under the cap by itself) scored only `max(8, 20) = 20`, even though the
+    // real YAML parser's recursion at that point is closer to `8 × 20 = 160`
+    // (each indentation level nests *inside* the previous line's compact
+    // chain, so the depths multiply, not cap). Pins that the composed
+    // estimate now catches this directly: neither the dash count (8) nor the
+    // indentation depth (20) alone would trip `MAX_NESTING_DEPTH` (128), but
+    // their true composition does.
+    #[test]
+    fn max_nesting_depth_counts_composed_dash_and_indentation_nesting() {
+        let dashes_per_line = 8;
+        let levels = 20;
+        let mut text = String::from("x:\n");
+        for i in 0..levels {
+            text.push_str(&" ".repeat(i + 1));
+            text.push_str(&"- ".repeat(dashes_per_line));
+            text.push('\n');
+        }
+        let estimate = max_nesting_depth(&text);
+        assert!(
+            estimate > MAX_NESTING_DEPTH,
+            "composed depth (~{}) from {dashes_per_line} dashes/line × {levels} \
+             indentation levels must exceed the cap, got {estimate}",
+            dashes_per_line * levels,
+        );
+    }
+
+    // FIX 3 (B9 minor, false-positive guard): a realistic literal/folded
+    // block scalar (`description: |`) whose prose incidentally contains a
+    // dash or a bracketed aside must NOT be scored anywhere near the cap.
+    // These content lines sit at one flat indentation — siblings of each
+    // other under `description:` — and a sibling composes with its *parent*
+    // depth, not the previous sibling's, so this stays shallow regardless of
+    // line count (see the "Limitation" paragraph on `max_nesting_depth`'s
+    // doc: no explicit block-scalar skip is needed for this realistic case).
+    #[test]
+    fn realistic_literal_block_with_dashes_and_brackets_still_loads() {
+        let c = "---\n\
+                 title: launch checklist\n\
+                 description: |\n\
+                 \x20\x20This paragraph documents the rollout plan end to end.\n\
+                 \x20\x20It might reference a dash - like this one - in passing.\n\
+                 \x20\x20A pasted reminder: - check the dashboard before go-live.\n\
+                 \x20\x20Another: - confirm the on-call rotation is staffed.\n\
+                 \x20\x20Valid ranges look like [0,1) or [1,2) in interval notation.\n\
+                 \x20\x20Or a coordinate pair such as [3,4] shows up here too.\n\
+                 \x20\x20The rest of this paragraph is just ordinary prose text.\n\
+                 \x20\x20One more line to round out a realistic-length block.\n\
+                 \x20\x20And a final line closing out the description field.\n\
+                 ---\n";
+        match extract(c) {
+            Extract::Fields { fields, .. } => {
+                assert_eq!(
+                    fields.get("title"),
+                    Some(&Value::Str("launch checklist".into()))
+                );
+            }
+            other => panic!(
+                "expected Fields, a realistic literal block must not be \
+                 rejected as over-nested, got {other:?}"
+            ),
+        }
     }
 
     #[test]

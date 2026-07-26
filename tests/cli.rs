@@ -4136,6 +4136,74 @@ fn indentation_nested_frontmatter_is_skipped_not_crashed() {
         .stderr(predicates::str::contains("nesting"));
 }
 
+/// Builds `levels` lines of `dashes_per_line` compact `- ` markers each,
+/// every line indented just far enough (`2 * dashes_per_line` columns deeper
+/// than the last) to align with the *value slot* of the previous line's
+/// final, otherwise-empty dash — the exact alignment yaml-rust2 requires for
+/// the next line to continue nesting *inside* that dash rather than being
+/// read as a new, shallower sibling. The final line closes the chain with a
+/// scalar. Used by
+/// [`composed_dash_and_indentation_frontmatter_is_skipped_not_crashed`] to
+/// reproduce the B9 second-critical-followup vector: neither the compact
+/// dash count nor the indentation depth alone is unusual, but composed they
+/// reach `dashes_per_line * levels`.
+fn mixed_dash_and_indent_frontmatter(dashes_per_line: usize, levels: usize) -> String {
+    let mut frontmatter = String::from("x:\n");
+    let mut indent = 2;
+    for i in 0..levels {
+        frontmatter.push_str(&" ".repeat(indent));
+        let dashes = "- ".repeat(dashes_per_line);
+        if i + 1 == levels {
+            frontmatter.push_str(&dashes);
+            frontmatter.push_str("v\n");
+        } else {
+            frontmatter.push_str(dashes.trim_end());
+            frontmatter.push('\n');
+            indent += 2 * dashes_per_line;
+        }
+    }
+    frontmatter
+}
+
+/// B9 second follow-up fix (CRITICAL): `indentation_nested_frontmatter_is_skipped_not_crashed`
+/// above fixed the PURE indentation vector; this reproduces what the
+/// reviewer found still slips past it — a *composed* vector where the old
+/// estimator's three sub-estimates (flow-bracket depth, same-line compact
+/// dash run, indentation-stack depth) were combined with `max`, not added.
+/// 64 compact dashes on one line, indented 20 levels deep — each line nested
+/// under the *previous* line's innermost dash — reaches true parser
+/// recursion ≈ 64 × 20 = 1280 (well past yaml-rust2's own ~900-950 call-stack
+/// overflow point), yet the old `max(dash_run=64, indent_depth=20) = 64`
+/// stayed comfortably under the 128 cap: neither sub-estimate alone looks
+/// unusual. This exact (dashes_per_line, levels) pair — and its ~27 KiB file
+/// size, nowhere near the 8 MiB `max_file_bytes` cap (B8) — mirrors the
+/// reviewer's own confirmed reproduction table. Empirically confirmed
+/// FAILING (process exit 134, `fatal runtime error: stack overflow,
+/// aborting`) against the pre-fix binary; PASSING (skipped with a nesting
+/// warning) after composing the estimates additively. `ok.md` alongside it
+/// must still load.
+#[test]
+fn composed_dash_and_indentation_frontmatter_is_skipped_not_crashed() {
+    let td = TempDir::new().unwrap();
+    let frontmatter = mixed_dash_and_indent_frontmatter(64, 20);
+    fs::write(
+        td.path().join("mixed.md"),
+        format!("---\n{frontmatter}---\n"),
+    )
+    .unwrap();
+    fs::write(td.path().join("ok.md"), "---\ntitle: ok\n---\n").unwrap();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg("-e")
+        .arg("SELECT title")
+        .arg(td.path())
+        .assert()
+        .success() // process did not abort/overflow
+        .stdout(predicates::str::contains("ok"))
+        .stderr(predicates::str::contains("mixed.md"))
+        .stderr(predicates::str::contains("nesting"));
+}
+
 /// B9 review fix (Critical false-positive): a file with LEGITIMATE, shallow
 /// frontmatter but a body containing unrelated bracket-heavy or dash-heavy
 /// text must load normally — the pre-parse depth cap that stops the crash in
