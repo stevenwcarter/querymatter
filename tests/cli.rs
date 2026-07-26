@@ -3555,3 +3555,29 @@ fn query_list_broken_pipe_exits_without_panic() {
         "leaked Broken pipe error to stderr"
     );
 }
+
+/// Task 5 (B5): pins `ORDER BY`/`GROUP BY ... ORDER BY`'s row/group order
+/// across the decorate-sort-undecorate refactor — each row's (or group's)
+/// sort key is now computed once, up front, instead of on every pairwise
+/// comparison, but the output order must stay byte-identical (INV-2).
+/// `g = x` has two rows (`count(*) = 2`) and `g = y` has one (`count(*) =
+/// 1`), so `ORDER BY c DESC` must place `x` before `y`.
+#[test]
+fn order_by_and_group_order_stable_after_decorate() {
+    let td = TempDir::new().unwrap();
+    for (p, s) in [
+        ("a.md", "---\ng: x\nn: 3\n---\n"),
+        ("b.md", "---\ng: x\nn: 1\n---\n"),
+        ("c.md", "---\ng: y\nn: 2\n---\n"),
+    ] {
+        fs::write(td.path().join(p), s).unwrap();
+    }
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg("-e")
+        .arg("SELECT g, count(*) AS c GROUP BY g ORDER BY c DESC, g ASC")
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::is_match("(?s)x.*y").unwrap()); // x (c=2) before y (c=1)
+}

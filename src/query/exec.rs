@@ -603,14 +603,29 @@ fn execute_ungrouped<'a>(
     }
 
     let order = resolve_order_targets(&q.order_by, &headers)?;
-    let cmp = |(ra, rowa): &(&Record, Vec<Value>), (rb, rowb): &(&Record, Vec<Value>)| {
+
+    // Each row's sort key(s) are resolved here, once, up front — the same
+    // decorate-sort-undecorate shape `execute_grouped` uses for its groups —
+    // instead of letting the comparator re-derive them (re-reading
+    // `file.body` from disk, or re-evaluating a scalar expression) on every
+    // pairwise comparison the sort/selection below makes.
+    let mut rows: Vec<(Vec<Value>, Vec<Value>)> = rows
+        .into_iter()
+        .map(|(record, row)| {
+            let order_keys: Vec<Value> = order
+                .iter()
+                .map(|(target, _)| order_key_value(target, record, &row, ctx))
+                .collect();
+            (row, order_keys)
+        })
+        .collect();
+
+    let cmp = |(_, ka): &(Vec<Value>, Vec<Value>), (_, kb): &(Vec<Value>, Vec<Value>)| {
         order
             .iter()
-            .map(|(target, desc)| {
-                let va = order_key_value(target, ra, rowa, ctx);
-                let vb = order_key_value(target, rb, rowb, ctx);
-                order_cmp(&va, &vb, *desc)
-            })
+            .zip(ka)
+            .zip(kb)
+            .map(|(((_, desc), va), vb)| order_cmp(va, vb, *desc))
             .find(|ord| *ord != Ordering::Equal)
             .unwrap_or(Ordering::Equal)
     };
@@ -631,7 +646,7 @@ fn execute_ungrouped<'a>(
 
     let rows: Vec<Vec<Value>> = rows
         .into_iter()
-        .map(|(_, row)| row)
+        .map(|(row, _)| row)
         .skip(offset)
         .take(q.limit.unwrap_or(usize::MAX))
         .collect();
