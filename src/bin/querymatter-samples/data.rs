@@ -438,3 +438,121 @@ pub const SENTENCES: [&str; 10] = [
     "Old clients will keep sending the legacy payload for a while.",
     "The dashboard should surface the failure count per tenant.",
 ];
+
+pub const CUISINES: [&str; 8] = [
+    "italian", "thai", "mexican", "japanese", "indian", "french", "greek", "korean",
+];
+
+pub const DISH_ADJ: [&str; 8] = [
+    "Spicy", "Creamy", "Crispy", "Smoky", "Sweet", "Tangy", "Herbed", "Roasted",
+];
+
+pub const DISH_ING: [&str; 12] = [
+    "Chicken",
+    "Chickpea",
+    "Tofu",
+    "Beef",
+    "Mushroom",
+    "Salmon",
+    "Eggplant",
+    "Lentil",
+    "Shrimp",
+    "Paneer",
+    "Pork",
+    "Cauliflower",
+];
+
+pub const DISH_FORM: [&str; 8] = [
+    "Curry", "Stir-Fry", "Tacos", "Soup", "Salad", "Noodles", "Skewers", "Stew",
+];
+
+pub const INGREDIENTS: [&str; 16] = [
+    "garlic",
+    "onion",
+    "ginger",
+    "soy sauce",
+    "olive oil",
+    "cumin",
+    "basil",
+    "lime",
+    "coconut milk",
+    "tomatoes",
+    "rice",
+    "chili flakes",
+    "yogurt",
+    "cilantro",
+    "sesame oil",
+    "paprika",
+];
+
+pub const RECIPE_TAGS: [&str; 7] = [
+    "vegetarian",
+    "spicy",
+    "quick",
+    "weeknight",
+    "gluten-free",
+    "grill",
+    "comfort",
+];
+
+pub const STEPS: [&str; 8] = [
+    "Heat the oil in a large pan over medium heat.",
+    "Add the aromatics and cook until fragrant.",
+    "Stir in the main ingredient and sear on all sides.",
+    "Deglaze with a splash of stock and scrape up the fond.",
+    "Simmer until the sauce thickens slightly.",
+    "Season to taste and adjust the acidity.",
+    "Rest for five minutes off the heat.",
+    "Garnish and serve immediately.",
+];
+
+pub const AUTHORS: [&str; 10] = [
+    "Iris Malloy",
+    "Theo Grant",
+    "Nadia Osei",
+    "Felix Aran",
+    "June Park",
+    "Marco Silva",
+    "Priya Nair",
+    "Owen Blake",
+    "Zara Holt",
+    "Ken Watanabe",
+];
+
+pub const TITLE_ADJ: [&str; 10] = [
+    "Silent", "Burning", "Hidden", "Broken", "Endless", "Glass", "Iron", "Hollow", "Distant",
+    "Golden",
+];
+
+pub const TITLE_NOUN: [&str; 12] = [
+    "Harbor", "Empire", "Garden", "Cipher", "Mountain", "Archive", "Voyage", "Orchard", "Signal",
+    "Kingdom", "Meridian", "Atlas",
+];
+
+pub const GENRES: [&str; 8] = [
+    "sci-fi",
+    "fantasy",
+    "mystery",
+    "history",
+    "biography",
+    "thriller",
+    "essays",
+    "poetry",
+];
+
+pub const SERIES: [&str; 5] = [
+    "The Meridian Cycle",
+    "Archive Wars",
+    "The Glass Chronicles",
+    "Signal and Noise",
+    "Kingdom of Ash",
+];
+
+pub const NOTES: [&str; 6] = [
+    "The pacing drags in the middle but the ending lands.",
+    "Great worldbuilding with a memorable narrator.",
+    "Read this for book club and it split the room.",
+    "The research shows without smothering the story.",
+    "A reread — holds up better than expected.",
+    "Picked up on a recommendation from a colleague.",
+];
