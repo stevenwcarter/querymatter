@@ -426,6 +426,35 @@ fn init_creates_manifest() {
     );
 }
 
+/// `build_vault` already pushes a `path: reason` entry onto `LoadReport.
+/// warnings` for every file it skips (unreadable content, invalid YAML
+/// frontmatter, or — since B6 — a traversal-rejected cached path); before
+/// this fix `run_init` printed only the bare `(N skipped)` count and
+/// discarded `report.warnings`, so the user had no way to learn which file
+/// was skipped or why (silent data loss: that file is then permanently
+/// absent from the cache). `bad.md`'s content is genuinely invalid YAML
+/// (mirrors `frontmatter::tests::invalid_yaml_is_invalid`), so it fails to
+/// parse (`Extract::Invalid` → `ScanResult::Warning`) rather than merely
+/// lacking a fence (`Extract::None`, silently and correctly skipped with no
+/// warning at all).
+#[test]
+fn init_reports_which_files_were_skipped() {
+    let td = TempDir::new().unwrap();
+    fs::write(td.path().join("good.md"), "---\ntitle: ok\n---\n").unwrap();
+    fs::write(
+        td.path().join("bad.md"),
+        "---\nkey: : : broken\n  bad indent\n---\n",
+    )
+    .unwrap();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg("init")
+        .arg(td.path())
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("bad.md"));
+}
+
 #[test]
 fn cache_status_reports_root_and_file_count() {
     let td = tree();
