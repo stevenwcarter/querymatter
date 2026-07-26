@@ -192,8 +192,10 @@ pub enum Predicate {
     /// A comparison of two expressions, e.g. `status = 'draft'`,
     /// `start < end`, or `lower(status) = 'draft'`.
     Compare(Expr, CmpOp, Expr),
-    /// `col [NOT] LIKE '<pattern>'`; the `bool` is `true` when negated.
-    Like(ColRef, String, /* negated */ bool),
+    /// `<expr> [NOT] LIKE '<pattern>'`; the `bool` is `true` when negated. The
+    /// tested side is a general [`Expr`] (e.g. `lower(status) LIKE '%draft%'`),
+    /// matching `Compare`/`Regexp`.
+    Like(Expr, String, /* negated */ bool),
     /// `<expr> [NOT] REGEXP '<pattern>'` (`RLIKE` is sqlparser's alias for
     /// the same node — identical semantics); the `bool` is `true` when
     /// negated. Unlike `Like`, the left side is a general [`Expr`] (e.g.
@@ -203,15 +205,16 @@ pub enum Predicate {
     /// Matching is always case-sensitive — the user opts into
     /// case-insensitivity with an inline `(?i)` flag.
     Regexp(Expr, String, /* negated */ bool),
-    /// `col [NOT] IN (<literals>)`; the `bool` is `true` when negated.
-    In(ColRef, Vec<Literal>, /* negated */ bool),
-    /// `<lit> MEMBER OF(col)` / `NOT <lit> MEMBER OF(col)`; the `bool` is
-    /// `true` when negated. `col` must resolve to a `Value::List` — a `Null`
-    /// or non-list value makes the predicate unknown, mirroring `In`'s
-    /// null-column handling (see `exec::eval_predicate`).
-    MemberOf(Literal, ColRef, /* negated */ bool),
-    /// `col IS [NOT] NULL`; the `bool` is `true` for `IS NOT NULL`.
-    IsNull(ColRef, /* negated */ bool),
+    /// `<expr> [NOT] IN (<literals>)`; the `bool` is `true` when negated.
+    In(Expr, Vec<Literal>, /* negated */ bool),
+    /// `<expr> MEMBER OF(col)` / `NOT <expr> MEMBER OF(col)`; the `bool` is
+    /// `true` when negated. The tested value is a general [`Expr`] (a literal,
+    /// a column, or a scalar call). `col` must resolve to a `Value::List`; a
+    /// `Null`/non-list value makes the predicate unknown (see
+    /// `exec::eval_predicate`).
+    MemberOf(Expr, ColRef, /* negated */ bool),
+    /// `<expr> IS [NOT] NULL`; the `bool` is `true` for `IS NOT NULL`.
+    IsNull(Expr, /* negated */ bool),
     /// Logical conjunction.
     And(Box<Predicate>, Box<Predicate>),
     /// Logical disjunction.
@@ -544,11 +547,14 @@ fn collect_predicate_fields(pred: &Predicate, fields: &mut BTreeSet<String>) {
             collect_expr_fields(l, fields);
             collect_expr_fields(r, fields);
         }
-        Predicate::Like(col, _, _) | Predicate::In(col, _, _) | Predicate::IsNull(col, _) => {
-            collect_col_field(col, fields);
+        Predicate::Like(expr, _, _) | Predicate::In(expr, _, _) | Predicate::IsNull(expr, _) => {
+            collect_expr_fields(expr, fields);
         }
         Predicate::Regexp(expr, _, _) => collect_expr_fields(expr, fields),
-        Predicate::MemberOf(_, col, _) => collect_col_field(col, fields),
+        Predicate::MemberOf(value, col, _) => {
+            collect_expr_fields(value, fields);
+            collect_col_field(col, fields);
+        }
         Predicate::And(a, b) | Predicate::Or(a, b) => {
             collect_predicate_fields(a, fields);
             collect_predicate_fields(b, fields);
@@ -689,9 +695,9 @@ fn predicate_label(pred: &Predicate) -> String {
         Predicate::Compare(l, op, r) => {
             format!("{} {} {}", expr_label(l), cmp_op_symbol(op), expr_label(r))
         }
-        Predicate::Like(col, pattern, negated) => format!(
+        Predicate::Like(expr, pattern, negated) => format!(
             "{} {}like '{pattern}'",
-            col.label(),
+            expr_label(expr),
             if *negated { "not " } else { "" }
         ),
         Predicate::Regexp(expr, pattern, negated) => format!(
@@ -699,24 +705,24 @@ fn predicate_label(pred: &Predicate) -> String {
             expr_label(expr),
             if *negated { "not " } else { "" }
         ),
-        Predicate::In(col, lits, negated) => {
+        Predicate::In(expr, lits, negated) => {
             let rendered: Vec<String> = lits.iter().map(literal_label).collect();
             format!(
                 "{} {}in ({})",
-                col.label(),
+                expr_label(expr),
                 if *negated { "not " } else { "" },
                 rendered.join(", ")
             )
         }
-        Predicate::MemberOf(lit, col, negated) => format!(
+        Predicate::MemberOf(value, col, negated) => format!(
             "{}{} member of({})",
             if *negated { "not " } else { "" },
-            literal_label(lit),
+            expr_label(value),
             col.label()
         ),
-        Predicate::IsNull(col, negated) => format!(
+        Predicate::IsNull(expr, negated) => format!(
             "{} is {}null",
-            col.label(),
+            expr_label(expr),
             if *negated { "not " } else { "" }
         ),
         Predicate::And(a, b) => format!("{} and {}", predicate_label(a), predicate_label(b)),

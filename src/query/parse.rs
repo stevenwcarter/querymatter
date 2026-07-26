@@ -649,7 +649,7 @@ fn lower_predicate(expr: &sql::Expr) -> Result<Predicate, ParseError> {
             pattern,
             ..
         } => Ok(Predicate::Like(
-            lower_col_ref(expr)?,
+            lower_expr(expr)?,
             string_literal(pattern, "LIKE")?,
             *negated,
         )),
@@ -665,10 +665,10 @@ fn lower_predicate(expr: &sql::Expr) -> Result<Predicate, ParseError> {
             negated,
         } => {
             let literals = list.iter().map(lower_literal).collect::<Result<_, _>>()?;
-            Ok(Predicate::In(lower_col_ref(expr)?, literals, *negated))
+            Ok(Predicate::In(lower_expr(expr)?, literals, *negated))
         }
-        sql::Expr::IsNull(inner) => Ok(Predicate::IsNull(lower_col_ref(inner)?, false)),
-        sql::Expr::IsNotNull(inner) => Ok(Predicate::IsNull(lower_col_ref(inner)?, true)),
+        sql::Expr::IsNull(inner) => Ok(Predicate::IsNull(lower_expr(inner)?, false)),
+        sql::Expr::IsNotNull(inner) => Ok(Predicate::IsNull(lower_expr(inner)?, true)),
         sql::Expr::MemberOf(member_of) => lower_member_of(member_of, false),
         sql::Expr::Nested(inner) => lower_predicate(inner),
         sql::Expr::UnaryOp {
@@ -710,19 +710,15 @@ fn lower_not(expr: &sql::Expr) -> Result<Predicate, ParseError> {
     Ok(Predicate::Not(Box::new(lower_predicate(expr)?)))
 }
 
-/// Lowers a `<value> MEMBER OF(<array>)` node: `value` must lower to a
-/// [`Literal`] and `array` to a single column reference, else the whole form
-/// is rejected — sqlparser's `MemberOf` node carries no `negated` field of
-/// its own, so `negated` is threaded in by the caller (see
-/// [`lower_predicate`]).
+/// Lowers a `<value> MEMBER OF(<array>)` node: `value` lowers through the
+/// full [`Expr`] grammar (a literal, a column, or a scalar call — matching
+/// `Compare`/`Regexp`) and `array` must be a single column reference.
+/// sqlparser's `MemberOf` node carries no `negated` field of its own, so
+/// `negated` is threaded in by the caller (see [`lower_predicate`]).
 fn lower_member_of(member_of: &sql::MemberOf, negated: bool) -> Result<Predicate, ParseError> {
-    let (Ok(lit), Ok(col)) = (
-        lower_literal(&member_of.value),
-        lower_col_ref(&member_of.array),
-    ) else {
-        return Err(unsupported("this MEMBER OF form"));
-    };
-    Ok(Predicate::MemberOf(lit, col, negated))
+    let value = lower_expr(&member_of.value)?;
+    let col = lower_col_ref(&member_of.array)?;
+    Ok(Predicate::MemberOf(value, col, negated))
 }
 
 /// Lowers a binary operation: a boolean connective (`AND`/`OR`) or a
@@ -1300,7 +1296,7 @@ mod tests {
             SelectExpr::Expr(Expr::Col(ColRef::File(FileAttr::Body)))
         );
         match q.filter.unwrap() {
-            Predicate::Like(ColRef::File(FileAttr::Body), pattern, false) => {
+            Predicate::Like(Expr::Col(ColRef::File(FileAttr::Body)), pattern, false) => {
                 assert_eq!(pattern, "%TODO%")
             }
             p => panic!("unexpected {p:?}"),
@@ -1314,13 +1310,14 @@ mod tests {
     }
     #[test]
     fn in_like_isnull() {
-        // IN and NOT IN carry the column, the literal list, and the negation flag.
+        // IN and NOT IN carry the tested expression, the literal list, and
+        // the negation flag.
         assert_eq!(
             parse("SELECT jira WHERE status IN ('a','b')")
                 .unwrap()
                 .filter,
             Some(Predicate::In(
-                ColRef::Field(vec!["status".into()]),
+                Expr::Col(ColRef::Field(vec!["status".into()])),
                 vec![Literal::Str("a".into()), Literal::Str("b".into())],
                 false
             ))
@@ -1330,19 +1327,20 @@ mod tests {
                 .unwrap()
                 .filter,
             Some(Predicate::In(
-                ColRef::Field(vec!["status".into()]),
+                Expr::Col(ColRef::Field(vec!["status".into()])),
                 vec![Literal::Str("a".into()), Literal::Str("b".into())],
                 true
             ))
         );
 
-        // LIKE and NOT LIKE carry the pattern and the negation flag.
+        // LIKE and NOT LIKE carry the tested expression, the pattern, and
+        // the negation flag.
         assert_eq!(
             parse("SELECT jira WHERE slice LIKE 'mobile%'")
                 .unwrap()
                 .filter,
             Some(Predicate::Like(
-                ColRef::Field(vec!["slice".into()]),
+                Expr::Col(ColRef::Field(vec!["slice".into()])),
                 "mobile%".into(),
                 false
             ))
@@ -1352,20 +1350,53 @@ mod tests {
                 .unwrap()
                 .filter,
             Some(Predicate::Like(
-                ColRef::Field(vec!["slice".into()]),
+                Expr::Col(ColRef::Field(vec!["slice".into()])),
                 "mobile%".into(),
                 true
             ))
         );
 
-        // IS NULL / IS NOT NULL carry the negation flag.
+        // IS NULL / IS NOT NULL carry the tested expression and the
+        // negation flag.
         assert_eq!(
             parse("SELECT jira WHERE epic IS NULL").unwrap().filter,
-            Some(Predicate::IsNull(ColRef::Field(vec!["epic".into()]), false))
+            Some(Predicate::IsNull(
+                Expr::Col(ColRef::Field(vec!["epic".into()])),
+                false
+            ))
         );
         assert_eq!(
             parse("SELECT jira WHERE epic IS NOT NULL").unwrap().filter,
-            Some(Predicate::IsNull(ColRef::Field(vec!["epic".into()]), true))
+            Some(Predicate::IsNull(
+                Expr::Col(ColRef::Field(vec!["epic".into()])),
+                true
+            ))
+        );
+    }
+    #[test]
+    fn where_scalar_expr_widens_like_in_isnull_member_of() {
+        // W43: the tested side of LIKE/IN/IS NULL/MEMBER OF now lowers
+        // through the full `Expr` grammar, not just a bare column.
+        assert_eq!(
+            parse("SELECT x WHERE lower(status) LIKE '%d%'")
+                .unwrap()
+                .filter,
+            Some(Predicate::Like(
+                Expr::Scalar(
+                    ScalarFn::Lower,
+                    vec![Expr::Col(ColRef::Field(vec!["status".into()]))]
+                ),
+                "%d%".into(),
+                false
+            ))
+        );
+        assert_eq!(
+            parse("SELECT x WHERE lead MEMBER OF(tags)").unwrap().filter,
+            Some(Predicate::MemberOf(
+                Expr::Col(ColRef::Field(vec!["lead".into()])),
+                ColRef::Field(vec!["tags".into()]),
+                false
+            ))
         );
     }
     #[test]
@@ -1428,18 +1459,19 @@ mod tests {
     }
     #[test]
     fn member_of_shape() {
-        // `MEMBER OF` carries the literal, the column, and the negation
-        // flag. Only the prefix `NOT <value> MEMBER OF(...)` form is valid
-        // SQL under sqlparser 0.62 (the postfix `<value> NOT MEMBER OF(...)`
-        // is a syntax error at the sqlparser level — see `lower_not`); the
-        // prefix form still lands as a flat negated flag, not a wrapping
+        // `MEMBER OF` carries the tested value (a general `Expr`, lowered
+        // through `lower_expr`), the column, and the negation flag. Only the
+        // prefix `NOT <value> MEMBER OF(...)` form is valid SQL under
+        // sqlparser 0.62 (the postfix `<value> NOT MEMBER OF(...)` is a
+        // syntax error at the sqlparser level — see `lower_not`); the prefix
+        // form still lands as a flat negated flag, not a wrapping
         // `Predicate::Not`.
         assert_eq!(
             parse("SELECT jira WHERE 'mobile' MEMBER OF(tags)")
                 .unwrap()
                 .filter,
             Some(Predicate::MemberOf(
-                Literal::Str("mobile".into()),
+                Expr::Lit(Literal::Str("mobile".into())),
                 ColRef::Field(vec!["tags".into()]),
                 false
             ))
@@ -1449,7 +1481,7 @@ mod tests {
                 .unwrap()
                 .filter,
             Some(Predicate::MemberOf(
-                Literal::Str("mobile".into()),
+                Expr::Lit(Literal::Str("mobile".into())),
                 ColRef::Field(vec!["tags".into()]),
                 true
             ))
@@ -1457,15 +1489,31 @@ mod tests {
     }
 
     #[test]
-    fn member_of_rejects_non_literal_value_or_non_column_array() {
-        // The value side must lower to a `Literal`; the array side must
-        // lower to a single column reference. Neither holds here (a column
-        // on the value side, a `file.*` compound the array side rejects
-        // only via the column path — this covers the value-side rejection,
-        // which is the common misuse: `col MEMBER OF(tags)`).
+    fn member_of_now_accepts_a_bare_column_value() {
+        // W43: the value side now lowers through the full `Expr` grammar, so
+        // what used to be rejected — a bare column on the value side — is
+        // now the common, intended form (`lead MEMBER OF(tags)`).
+        assert_eq!(
+            parse("SELECT jira WHERE status MEMBER OF(tags)")
+                .unwrap()
+                .filter,
+            Some(Predicate::MemberOf(
+                Expr::Col(ColRef::Field(vec!["status".into()])),
+                ColRef::Field(vec!["tags".into()]),
+                false
+            ))
+        );
+    }
+
+    #[test]
+    fn member_of_rejects_non_column_array() {
+        // The array side must still lower to a single column reference —
+        // widening only loosened the value side (see the test above). The
+        // error now comes straight from `lower_col_ref` rather than the old
+        // generic "this MEMBER OF form".
         assert!(matches!(
-            parse("SELECT jira WHERE status MEMBER OF(tags)"),
-            Err(ParseError::Unsupported(_))
+            parse("SELECT jira WHERE 'mobile' MEMBER OF(1)"),
+            Err(ParseError::BadColumn(_))
         ));
     }
     #[test]
@@ -2120,7 +2168,7 @@ mod tests {
         assert_eq!(
             q.filter,
             Some(Predicate::Like(
-                ColRef::Field(vec!["jira".into()]),
+                Expr::Col(ColRef::Field(vec!["jira".into()])),
                 "-7d".into(),
                 false
             ))

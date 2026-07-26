@@ -481,11 +481,8 @@ pub fn run(mut session: Session) -> anyhow::Result<()> {
 /// SQL), so both paths format results identically.
 fn run_statement(session: &Session, statement: &Statement, sink: &mut OutputSink) {
     let start = Instant::now();
-    match session.render_statement_counted(statement) {
-        Ok((rendered, count)) => {
-            if let Err(err) = sink.write_block(&rendered) {
-                eprintln!("querymatter: failed to write results: {err}");
-            }
+    match session.render_statement_to(statement, sink) {
+        Ok(count) => {
             let elapsed = session.timer().then(|| start.elapsed());
             eprintln!("{}", row_count_line(count, elapsed));
         }
@@ -1879,7 +1876,7 @@ mod tests {
 
         apply_output(&mut sink, Some(path.to_str().unwrap().to_string()));
         assert!(matches!(sink, OutputSink::File(_)));
-        sink.write_block("hello").unwrap();
+        sink.write_result(|w| w.write_all(b"hello\n")).unwrap();
 
         apply_output(&mut sink, None);
         assert!(matches!(sink, OutputSink::Stdout));
@@ -1913,8 +1910,8 @@ mod tests {
 
         apply_output(&mut sink, Some(format!("|cat > {}", path.display())));
         assert!(matches!(sink, OutputSink::Command(_)));
-        sink.write_block("alpha").unwrap();
-        sink.write_block("beta").unwrap();
+        sink.write_result(|w| w.write_all(b"alpha\n")).unwrap();
+        sink.write_result(|w| w.write_all(b"beta\n")).unwrap();
 
         apply_output(&mut sink, None);
         assert!(matches!(sink, OutputSink::Stdout));
@@ -1941,9 +1938,43 @@ mod tests {
 
         // The original pipe is still alive and usable, not a dead sink whose
         // stdin was already closed by a `finish()` on the failed switch.
-        sink.write_block("still alive").unwrap();
+        sink.write_result(|w| w.write_all(b"still alive\n"))
+            .unwrap();
         sink.finish().unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "still alive\n");
+    }
+
+    /// Spec W2: every `.output |cmd` test above pipes raw bytes written
+    /// directly into the sink's writer — never an actual query's *rendered*
+    /// result. This drives `run_statement` (the real production seam a typed
+    /// statement or `.query run` reaches) against a command sink, so the
+    /// streaming render path — `render_statement_to` -> `render::render_to`
+    /// -> `OutputSink::write_result` — is proven end to end over a shell
+    /// pipe, not just stdout/File.
+    #[test]
+    fn run_statement_streams_a_rendered_result_through_a_command_sink() {
+        let td = tempdir().unwrap();
+        fs::write(td.path().join("a.md"), "---\nstatus: draft\n---\n").unwrap();
+        fs::write(td.path().join("b.md"), "---\nstatus: synced\n---\n").unwrap();
+        fs::write(td.path().join("c.md"), "---\nstatus: synced\n---\n").unwrap();
+        let mut session = query_cmd_test_session(td.path());
+        session.set_format(Format::Csv);
+
+        let out_path = td.path().join("piped.csv");
+        let mut sink = OutputSink::open_command(&format!("cat > {}", out_path.display())).unwrap();
+
+        let statement = Statement {
+            sql: "SELECT status".to_string(),
+            terminator: Terminator::Semicolon,
+        };
+        run_statement(&session, &statement, &mut sink);
+        sink.finish().unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&out_path).unwrap(),
+            "status\ndraft\nsynced\nsynced\n",
+            "a real rendered CSV result must reach the file on the other end of the pipe intact"
+        );
     }
 
     #[test]

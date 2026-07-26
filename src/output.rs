@@ -12,8 +12,8 @@ use std::process::{Child, Command, Stdio};
 
 /// Where a statement's rendered result block is written.
 pub enum OutputSink {
-    /// The default: each block prints to stdout via `println!`, exactly as
-    /// before this feature existed.
+    /// The default: each block is written to a locked stdout handle via
+    /// [`write_result`](Self::write_result), then flushed.
     Stdout,
     /// Redirected to an already-open file handle, positioned to append after
     /// whatever has already been written this run/session.
@@ -27,8 +27,8 @@ pub enum OutputSink {
 impl OutputSink {
     /// Opens `path` for writing, creating it if needed and truncating any
     /// existing content — the one point where a redirect target is
-    /// established. Every [`write_block`](Self::write_block) call after this
-    /// appends to the same handle, so callers open once per redirect and
+    /// established. Every [`write_result`](Self::write_result) call after
+    /// this appends to the same handle, so callers open once per redirect and
     /// reuse the returned sink. Callers add path context to a failure via
     /// `anyhow`.
     pub fn open_file(path: &Path) -> io::Result<Self> {
@@ -54,21 +54,32 @@ impl OutputSink {
         Ok(OutputSink::Command(child))
     }
 
-    /// Writes `block` followed by a trailing newline — mirroring the
-    /// `println!` this sink replaces — to stdout, the redirected file, or a
-    /// piped command's stdin.
-    pub fn write_block(&mut self, block: &str) -> io::Result<()> {
+    /// Runs `f` with a writer aimed at this sink's destination — a locked
+    /// stdout handle, the redirected file, or a piped command's stdin — then
+    /// flushes. The caller writes the fully-formatted, newline-terminated
+    /// block itself (see `render::render_to`), so no intermediate `String` is
+    /// built.
+    pub fn write_result(
+        &mut self,
+        f: impl FnOnce(&mut dyn Write) -> io::Result<()>,
+    ) -> io::Result<()> {
         match self {
             OutputSink::Stdout => {
-                println!("{block}");
-                Ok(())
+                let stdout = io::stdout();
+                let mut lock = stdout.lock();
+                f(&mut lock)?;
+                lock.flush()
             }
-            OutputSink::File(file) => writeln!(file, "{block}"),
+            OutputSink::File(file) => {
+                f(file)?;
+                file.flush()
+            }
             OutputSink::Command(child) => {
                 let stdin = child.stdin.as_mut().ok_or_else(|| {
                     io::Error::new(io::ErrorKind::BrokenPipe, "child stdin closed")
                 })?;
-                writeln!(stdin, "{block}")
+                f(stdin)?;
+                stdin.flush()
             }
         }
     }
@@ -93,12 +104,12 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn write_block_appends_within_the_same_sink() {
+    fn write_result_appends_within_the_same_sink() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("out.txt");
         let mut sink = OutputSink::open_file(&path).unwrap();
-        sink.write_block("first").unwrap();
-        sink.write_block("second").unwrap();
+        sink.write_result(|w| writeln!(w, "first")).unwrap();
+        sink.write_result(|w| writeln!(w, "second")).unwrap();
         drop(sink);
         assert_eq!(fs::read_to_string(&path).unwrap(), "first\nsecond\n");
     }
@@ -109,14 +120,29 @@ mod tests {
         let path = dir.path().join("out.txt");
 
         let mut sink = OutputSink::open_file(&path).unwrap();
-        sink.write_block("stale").unwrap();
+        sink.write_result(|w| writeln!(w, "stale")).unwrap();
         drop(sink);
 
         let mut sink = OutputSink::open_file(&path).unwrap();
-        sink.write_block("fresh").unwrap();
+        sink.write_result(|w| writeln!(w, "fresh")).unwrap();
         drop(sink);
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "fresh\n");
+    }
+
+    #[test]
+    fn write_result_streams_into_the_same_sink() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("out.txt");
+        let mut sink = OutputSink::open_file(&path).unwrap();
+        sink.write_result(|w| {
+            w.write_all(b"a,b\n")?;
+            w.write_all(b"1,2\n")
+        })
+        .unwrap();
+        sink.write_result(|w| w.write_all(b"tail\n")).unwrap();
+        drop(sink);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "a,b\n1,2\ntail\n");
     }
 
     #[test]
@@ -132,8 +158,8 @@ mod tests {
         let out = dir.path().join("piped.txt");
         // `cat > file` via sh -c: blocks written to the child's stdin land in the file.
         let mut sink = OutputSink::open_command(&format!("cat > {}", out.display())).unwrap();
-        sink.write_block("alpha").unwrap();
-        sink.write_block("beta").unwrap();
+        sink.write_result(|w| writeln!(w, "alpha")).unwrap();
+        sink.write_result(|w| writeln!(w, "beta")).unwrap();
         sink.finish().unwrap(); // closes stdin, waits for the child
         assert_eq!(fs::read_to_string(&out).unwrap(), "alpha\nbeta\n");
     }

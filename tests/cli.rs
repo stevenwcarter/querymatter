@@ -3078,3 +3078,207 @@ fn date_field_renders_verbatim_across_csv_json_table() {
         .success()
         .stdout(predicates::str::contains("2026-03-15"));
 }
+
+/// W43: a scalar function on the tested side of LIKE (matches `=`'s ability).
+#[test]
+fn where_scalar_expr_like() {
+    let home = TempDir::new().unwrap();
+    let td = tree(); // plans/a.md=draft, plans/b.md=synced, product/c.md=synced
+    qm(home.path())
+        .args([
+            "-e",
+            "SELECT status WHERE lower(status) LIKE '%draf%'",
+            "--format",
+            "csv",
+            td.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout("status\ndraft\n");
+}
+
+/// W43: IN accepts a scalar expression on the tested side.
+#[test]
+fn where_scalar_expr_in() {
+    let home = TempDir::new().unwrap();
+    let td = tree();
+    qm(home.path())
+        .args([
+            "-e",
+            "SELECT status WHERE lower(status) IN ('draft','synced')",
+            "--format",
+            "csv",
+            td.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout("status\ndraft\nsynced\nsynced\n");
+}
+
+/// W43: IS NULL / IS NOT NULL accept a scalar expression on the tested side.
+/// `b.md` omits `status` entirely, so `lower(status)` evaluates to
+/// `Value::Null` for it (a scalar function propagates a NULL argument) —
+/// pinning that `lower(status) IS NULL` genuinely evaluates the expression
+/// rather than falling back to some literal-only check.
+#[test]
+fn where_scalar_expr_isnull() {
+    let home = TempDir::new().unwrap();
+    let td = TempDir::new().unwrap();
+    for (p, s) in [
+        ("a.md", "---\nstatus: DRAFT\n---\n"),
+        ("b.md", "---\ntitle: untagged\n---\n"),
+    ] {
+        let f = td.path().join(p);
+        fs::create_dir_all(f.parent().unwrap()).unwrap();
+        fs::write(f, s).unwrap();
+    }
+
+    qm(home.path())
+        .args([
+            "-e",
+            "SELECT file.name WHERE lower(status) IS NULL",
+            "--format",
+            "csv",
+            td.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout("file.name\nb.md\n");
+
+    qm(home.path())
+        .args([
+            "-e",
+            "SELECT file.name WHERE lower(status) IS NOT NULL",
+            "--format",
+            "csv",
+            td.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout("file.name\na.md\n");
+}
+
+/// W43: MEMBER OF now accepts a bare column (and any expression) on the left —
+/// impossible before (the left had to be a literal).
+#[test]
+fn where_column_member_of_list() {
+    let home = TempDir::new().unwrap();
+    let td = TempDir::new().unwrap();
+    for (p, s) in [
+        (
+            "x.md",
+            "---\nlead: mobile\ntags:\n  - mobile\n  - web\n---\n",
+        ),
+        ("y.md", "---\nlead: infra\ntags:\n  - web\n---\n"),
+    ] {
+        let f = td.path().join(p);
+        fs::create_dir_all(f.parent().unwrap()).unwrap();
+        fs::write(f, s).unwrap();
+    }
+    qm(home.path())
+        .args([
+            "-e",
+            "SELECT lead WHERE lead MEMBER OF(tags)",
+            "--format",
+            "csv",
+            td.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout("lead\nmobile\n"); // x.md: 'mobile' is in tags; y.md: 'infra' is not
+}
+
+/// W43 invariant I1: `file.body` referenced through the WIDENED predicate funnel
+/// must still be detected, so `--force-cache` still fails fast (W56 guard).
+#[test]
+fn force_cache_file_body_like_still_errors_after_widening() {
+    let home = TempDir::new().unwrap();
+    let td = tree();
+    qm(home.path())
+        .args([
+            "-e",
+            "SELECT file.name WHERE file.body LIKE '%draft%'",
+            "--force-cache",
+            td.path().to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("force-cache"));
+}
+
+/// W47 W3: piped csv/tsv/json output is byte-for-byte the expected bytes
+/// (streaming must not perturb them). Rows come back sorted by path:
+/// plans/a.md=draft, plans/b.md=synced, product/c.md=synced.
+#[test]
+fn streaming_formats_are_byte_identical() {
+    let home = TempDir::new().unwrap();
+    let td = tree();
+    let path = td.path().to_str().unwrap();
+
+    qm(home.path())
+        .args(["-e", "SELECT status", "--format", "csv", path])
+        .assert()
+        .success()
+        .stdout("status\ndraft\nsynced\nsynced\n");
+
+    qm(home.path())
+        .args(["-e", "SELECT status", "--format", "tsv", path])
+        .assert()
+        .success()
+        .stdout("status\ndraft\nsynced\nsynced\n");
+
+    qm(home.path())
+        .args(["-e", "SELECT status", "--format", "json", path])
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with("[\n"))
+        .stdout(predicate::str::contains("\"status\": \"draft\""))
+        .stdout(predicate::str::ends_with("]\n"));
+}
+
+/// W47 W2: `--output <file>` writes identical bytes to the file (not stdout).
+#[test]
+fn streaming_output_flag_writes_file_bytes() {
+    let home = TempDir::new().unwrap();
+    let td = tree();
+    let out = td.path().join("result.csv");
+    qm(home.path())
+        .args([
+            "-e",
+            "SELECT status",
+            "--format",
+            "csv",
+            "--output",
+            out.to_str().unwrap(),
+            td.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(""); // nothing on stdout when redirected
+    assert_eq!(
+        fs::read_to_string(&out).unwrap(),
+        "status\ndraft\nsynced\nsynced\n"
+    );
+}
+
+/// Spec W1: a zero-row result renders to the empty JSON array plus one
+/// trailing newline. `streaming_formats_are_byte_identical` above never
+/// exercises zero rows, so this was previously "byte-identical by
+/// construction" rather than actually pinned — this asserts the exact bytes
+/// the streaming JSON path emits, not merely that it produced valid JSON.
+#[test]
+fn empty_result_json_is_bracket_bracket_newline() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .args([
+            "-e",
+            "SELECT status WHERE status = 'nonexistent'",
+            "--format",
+            "json",
+        ])
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout("[]\n");
+}

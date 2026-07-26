@@ -5,7 +5,7 @@
 //! Every format is returned with no trailing newline, so a caller (the REPL
 //! printer) can add exactly one when it prints the result.
 
-use std::io::IsTerminal;
+use std::io::{self, IsTerminal, Write};
 use std::str::FromStr;
 
 use comfy_table::Table;
@@ -135,14 +135,103 @@ const BANNER_ASTERISKS: usize = 27;
 /// right-aligned labels rather than a header row, so both ignore `header`
 /// entirely.
 pub fn render(table: &ResultTable, output: Output, style: TableStyle, header: bool) -> String {
+    let mut buf = Vec::new();
+    render_to(&mut buf, table, output, style, header)
+        .expect("writing to an in-memory Vec is infallible");
+    let s = String::from_utf8_lossy(&buf);
+    s.strip_suffix('\n').unwrap_or(&s).to_string()
+}
+
+/// Renders `table` per `output` directly into `w`, newline-terminated. The
+/// bulk-export formats (json/csv/tsv) stream row-by-row so a large export
+/// starts writing immediately and never materializes a second full copy; the
+/// interactive formats (table/md/vertical) build their string first (they are
+/// interactive-scale). The single trailing newline is owned here (not the
+/// sink), which is what lets csv/tsv stream without buffering the last record.
+pub fn render_to(
+    w: &mut (impl Write + ?Sized),
+    table: &ResultTable,
+    output: Output,
+    style: TableStyle,
+    header: bool,
+) -> io::Result<()> {
     match output {
-        Output::Vertical => render_vertical(table),
-        Output::Format(Format::Table) => render_table(table, style, header),
-        Output::Format(Format::Md) => render_markdown(table, header),
-        Output::Format(Format::Json) => render_json(table),
-        Output::Format(Format::Csv) => render_delimited(table, b',', header),
-        Output::Format(Format::Tsv) => render_delimited(table, b'\t', header),
+        Output::Vertical => writeln_block(w, &render_vertical(table)),
+        Output::Format(Format::Table) => writeln_block(w, &render_table(table, style, header)),
+        Output::Format(Format::Md) => writeln_block(w, &render_markdown(table, header)),
+        Output::Format(Format::Json) => {
+            serde_json::to_writer_pretty(&mut *w, &JsonRows(table)).map_err(io::Error::other)?;
+            w.write_all(b"\n")
+        }
+        Output::Format(Format::Csv) => stream_delimited(w, table, b',', header),
+        Output::Format(Format::Tsv) => stream_delimited(w, table, b'\t', header),
     }
+}
+
+/// Writes a pre-built block followed by exactly one newline.
+fn writeln_block(w: &mut (impl Write + ?Sized), block: &str) -> io::Result<()> {
+    w.write_all(block.as_bytes())?;
+    w.write_all(b"\n")
+}
+
+/// Serializes a [`ResultTable`] as a JSON array of objects keyed by column
+/// header, one object per row, streamed row-by-row. Each row rebuilds the
+/// same `serde_json::Map` construction [`to_json`]'s caller used, so key
+/// ordering is byte-identical to the buffered path regardless of
+/// serde_json's `preserve_order` feature (absent here → sorted keys).
+struct JsonRows<'a>(&'a ResultTable);
+
+impl serde::Serialize for JsonRows<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.0.rows.len()))?;
+        for row in &self.0.rows {
+            let fields: Map<String, JsonValue> = self
+                .0
+                .headers
+                .iter()
+                .zip(row)
+                .map(|(header, value)| (header.clone(), to_json(value)))
+                .collect();
+            seq.serialize_element(&JsonValue::Object(fields))?;
+        }
+        seq.end()
+    }
+}
+
+/// Streams `table` as `delimiter`-separated records directly into `w`. csv's
+/// default record terminator is `\n`, so the final record's terminator is the
+/// block's single trailing newline — matching the buffered path's
+/// strip-then-append. When nothing is written (`!header && no rows`), emit one
+/// bare newline to match the old `println!("")`.
+fn stream_delimited(
+    w: &mut (impl Write + ?Sized),
+    table: &ResultTable,
+    delimiter: u8,
+    header: bool,
+) -> io::Result<()> {
+    {
+        let mut writer = WriterBuilder::new()
+            .delimiter(delimiter)
+            .from_writer(&mut *w);
+        if header {
+            writer
+                .write_record(&table.headers)
+                .map_err(io::Error::other)?;
+        }
+        for row in &table.rows {
+            writer
+                .write_record(row.iter().map(Value::display))
+                .map_err(io::Error::other)?;
+        }
+        writer.flush()?;
+        // `writer` is dropped at the end of this block, releasing its `&mut *w`
+        // borrow so the empty-case newline below can write to `w`.
+    }
+    if !header && table.rows.is_empty() {
+        w.write_all(b"\n")?;
+    }
+    Ok(())
 }
 
 /// Table width-fitting is enabled only when stdout is a real terminal, so
@@ -235,26 +324,6 @@ fn new_table(table: &ResultTable, header: bool) -> Table {
     ct
 }
 
-/// Renders `table` as a JSON array of objects keyed by column header.
-fn render_json(table: &ResultTable) -> String {
-    let rows: Vec<JsonValue> = table
-        .rows
-        .iter()
-        .map(|row| {
-            let fields: Map<String, JsonValue> = table
-                .headers
-                .iter()
-                .zip(row)
-                .map(|(header, value)| (header.clone(), to_json(value)))
-                .collect();
-            JsonValue::Object(fields)
-        })
-        .collect();
-    // A JSON array built entirely from these scalar/array conversions can't
-    // fail to serialize; fall back to an empty string rather than panicking.
-    serde_json::to_string_pretty(&rows).unwrap_or_default()
-}
-
 /// Converts a query [`Value`] to its `serde_json::Value` equivalent.
 fn to_json(value: &Value) -> JsonValue {
     match value {
@@ -271,42 +340,6 @@ fn to_json(value: &Value) -> JsonValue {
             JsonValue::Object(m.iter().map(|(k, v)| (k.clone(), to_json(v))).collect())
         }
     }
-}
-
-/// Renders `table` as `delimiter`-separated text, with a header row unless
-/// `header` is `false`.
-fn render_delimited(table: &ResultTable, delimiter: u8, header: bool) -> String {
-    // A `ResultTable` guarantees each row has exactly one cell per header
-    // (see `query::ResultTable`'s doc comment), so `write_record`'s
-    // field-count check can never fail here; the only realistic failure mode
-    // left is an OOM writing to the in-memory buffer. Fail loudly rather than
-    // silently producing blank output indistinguishable from "zero rows".
-    write_delimited(table, delimiter, header)
-        .expect("ResultTable guarantees one cell per header (query::ResultTable)")
-}
-
-fn write_delimited(table: &ResultTable, delimiter: u8, header: bool) -> csv::Result<String> {
-    let mut writer = WriterBuilder::new()
-        .delimiter(delimiter)
-        .from_writer(Vec::new());
-    if header {
-        writer.write_record(&table.headers)?;
-    }
-    for row in &table.rows {
-        writer.write_record(row.iter().map(Value::display))?;
-    }
-    let bytes = writer
-        .into_inner()
-        .map_err(csv::IntoInnerError::into_error)?;
-    let text = String::from_utf8_lossy(&bytes).into_owned();
-    // Strip only the writer's final record terminator, not `trim_end()`,
-    // which would also eat real trailing whitespace from the last cell's
-    // `Value::display()` content (data loss).
-    let trimmed = text
-        .strip_suffix("\r\n")
-        .or_else(|| text.strip_suffix('\n'))
-        .unwrap_or(&text);
-    Ok(trimmed.to_string())
 }
 
 #[cfg(test)]
@@ -338,6 +371,28 @@ mod tests {
         assert_eq!(v[0]["status"], "synced");
         assert_eq!(v[0]["Count"], 2);
     }
+    /// Spec W1: a zero-row table renders to the bare empty JSON array — the
+    /// pretty-printer's empty-array form, not `"[\n]"` or `"[\n\n]"`. Pins
+    /// the value `render_to`'s empty case is built on, complementing the
+    /// end-to-end `empty_result_json_is_bracket_bracket_newline` CLI test in
+    /// `tests/cli.rs`.
+    #[test]
+    fn json_empty_table_is_bracket_bracket() {
+        let empty = ResultTable {
+            headers: vec!["status".into()],
+            rows: vec![],
+        };
+        assert_eq!(
+            render(
+                &empty,
+                Output::Format(Format::Json),
+                TableStyle::Ascii,
+                true
+            ),
+            "[]"
+        );
+    }
+
     #[test]
     fn csv_has_header_and_rows() {
         let s = render(
@@ -802,5 +857,54 @@ mod tests {
             a.contains("status"),
             "md keeps its header/content, got:\n{a}"
         );
+    }
+
+    /// W47 W1: render_to writes exactly what render() returns plus one newline,
+    /// for every format — the byte-identity contract the streaming path rests on.
+    #[test]
+    fn render_to_equals_render_plus_newline_all_formats() {
+        let t = table();
+        for output in [
+            Output::Format(Format::Table),
+            Output::Format(Format::Md),
+            Output::Format(Format::Json),
+            Output::Format(Format::Csv),
+            Output::Format(Format::Tsv),
+            Output::Vertical,
+        ] {
+            let buffered = render(&t, output, TableStyle::Ascii, true);
+            let mut streamed = Vec::new();
+            render_to(&mut streamed, &t, output, TableStyle::Ascii, true).unwrap();
+            assert_eq!(
+                String::from_utf8(streamed).unwrap(),
+                format!("{buffered}\n"),
+                "{output:?} render_to must equal render() + newline"
+            );
+        }
+    }
+
+    /// W47 W1 edge: an empty result with the header suppressed still emits one
+    /// bare newline for csv/tsv, matching the old `println!("")`.
+    #[test]
+    fn render_to_empty_no_header_csv_emits_one_newline() {
+        let empty = ResultTable {
+            headers: vec!["status".into()],
+            rows: vec![],
+        };
+        for fmt in [Format::Csv, Format::Tsv] {
+            let mut streamed = Vec::new();
+            render_to(
+                &mut streamed,
+                &empty,
+                Output::Format(fmt),
+                TableStyle::Ascii,
+                false,
+            )
+            .unwrap();
+            assert_eq!(String::from_utf8(streamed).unwrap(), "\n", "{fmt:?}");
+            // and it still equals render() + "\n"
+            let buffered = render(&empty, Output::Format(fmt), TableStyle::Ascii, false);
+            assert_eq!(buffered, "");
+        }
     }
 }
