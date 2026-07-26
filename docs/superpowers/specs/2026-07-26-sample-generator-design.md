@@ -138,7 +138,9 @@ absent), `finished` (ISO date, only when finished), `purchased` (US-format
 - **No nondeterministic iteration:** const arrays and explicit sorts only;
   never iterate a `HashMap`/`HashSet`.
 - **Dates:** fixed absolute dates, deterministically picked inside a fixed
-  window (2025-01-01 .. 2026-07-01). Never derived from the clock.
+  window (2025-01-01 .. 2026-07-01) for `work/` and `recipes/`; `reading/`
+  files pick dates inside their own folder year (2019–2026) so the
+  by-year layout stays coherent. Never derived from the clock.
 - **mtimes:** after writing each file, set its modification time with
   `std::fs::File::set_modified` (std, stable) to a deterministic per-file
   `SystemTime` (`UNIX_EPOCH + secs`). Themed files derive it from their own
