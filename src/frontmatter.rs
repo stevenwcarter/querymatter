@@ -110,15 +110,24 @@ pub fn body(content: &str) -> Option<String> {
 const MAX_NESTING_DEPTH: usize = 128;
 
 /// Rejects `content` before it's ever handed to gray_matter's YAML parser,
-/// when [`max_nesting_depth`]'s conservative estimate says parsing it could
-/// recurse past [`MAX_NESTING_DEPTH`].
+/// when [`max_nesting_depth`]'s conservative estimate — computed over ONLY
+/// the fenced frontmatter block ([`frontmatter_fence`]), never the Markdown
+/// body that follows it — says parsing it could recurse past
+/// [`MAX_NESTING_DEPTH`].
 ///
 /// This has to run *before* `Matter::parse`, not after: past a certain
 /// depth, gray_matter's YAML engine (yaml-rust2) overflows its own parser
 /// stack while parsing — see [`MAX_NESTING_DEPTH`]'s doc — which aborts the
 /// whole process before it would ever return an `Err` we could handle.
+///
+/// Scoping to just the fence matters (correctness fix, B9 review): a body
+/// containing unrelated bracket-heavy or dash-heavy text (interval notation
+/// `[0,1) [1,2) …`, a flattened outline `- - - - …`) is never YAML gray_matter
+/// parses at all, so it must never be able to trip this cap and reject an
+/// otherwise-valid file.
 fn check_nesting_depth(content: &str) -> Result<(), String> {
-    if max_nesting_depth(content) > MAX_NESTING_DEPTH {
+    let fence = frontmatter_fence(content).unwrap_or_default();
+    if max_nesting_depth(fence) > MAX_NESTING_DEPTH {
         return Err(format!(
             "frontmatter nesting exceeds {MAX_NESTING_DEPTH} levels — skipped"
         ));
@@ -126,9 +135,53 @@ fn check_nesting_depth(content: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Delimits the leading YAML frontmatter block exactly the way
+/// `gray_matter`'s `Matter::parse` does (default delimiter `"---"`, used for
+/// both the opening and — absent an explicit `close_delimiter`, which this
+/// crate never sets — closing fence): the first line, trailing whitespace
+/// aside, must read `---`; the block then runs up to the next line that,
+/// trailing whitespace aside, also reads `---`. Returns the raw text
+/// strictly between those two fence lines — the only text gray_matter's YAML
+/// engine ever sees.
+///
+/// Returns `None` when there's no opening fence, or the opening fence is
+/// never closed — in both cases gray_matter parses no frontmatter at all
+/// (the whole input becomes body content, matching [`Extract::None`]), so
+/// there is no YAML for a depth scan to reject.
+fn frontmatter_fence(content: &str) -> Option<&str> {
+    let (first_line, mut tail) = content.split_once('\n')?;
+    if first_line.trim_end() != "---" {
+        return None;
+    }
+    let body_start = content.len() - tail.len();
+    loop {
+        let line_start = content.len() - tail.len();
+        match tail.split_once('\n') {
+            Some((line, rest)) => {
+                if line.trim_end() == "---" {
+                    return Some(&content[body_start..line_start]);
+                }
+                tail = rest;
+            }
+            // `tail` itself is the final line (no trailing `\n` left),
+            // matching what `str::lines()` would yield last.
+            None if tail.trim_end() == "---" => {
+                return Some(&content[body_start..line_start]);
+            }
+            None => return None,
+        }
+    }
+}
+
 /// A cheap, conservative pre-parse estimate of how deeply gray_matter's YAML
 /// parser would need to recurse to parse `text`, computed without invoking
 /// the parser at all.
+///
+/// `text` must already be just the fenced frontmatter block —
+/// [`frontmatter_fence`]'s output, never a whole file or its Markdown body.
+/// Scanning body text here would false-positive: bracket- or dash-heavy
+/// prose the YAML engine never even sees (interval notation, a flattened
+/// outline) would wrongly compute a rejection-worthy depth.
 ///
 /// Only two constructs can nest a `Value` at all: `[`/`{` flow collections,
 /// and block sequences (`- ` entries). Over-counting only rejects more
@@ -450,6 +503,71 @@ mod tests {
         let depth = MAX_NESTING_DEPTH + 1;
         let c = format!("---\nx:\n  {}v\n---\nsome body text\n", "- ".repeat(depth));
         assert_eq!(body(&c), None);
+    }
+
+    // B9 review fix: `frontmatter_fence` must delimit exactly the slice
+    // gray_matter's YAML engine sees, never more (the body) or less.
+    #[test]
+    fn frontmatter_fence_extracts_only_the_fenced_slice() {
+        let c = "---\ntitle: ok\nn: 1\n---\nbody text here\n";
+        assert_eq!(frontmatter_fence(c), Some("title: ok\nn: 1\n"));
+    }
+
+    #[test]
+    fn frontmatter_fence_is_none_without_an_opening_fence() {
+        assert_eq!(frontmatter_fence("# just a heading\nbody\n"), None);
+    }
+
+    #[test]
+    fn frontmatter_fence_is_none_when_never_closed() {
+        assert_eq!(frontmatter_fence("---\ntitle: ok\nstill going\n"), None);
+    }
+
+    #[test]
+    fn frontmatter_fence_handles_a_final_line_with_no_trailing_newline() {
+        assert_eq!(
+            frontmatter_fence("---\ntitle: ok\n---"),
+            Some("title: ok\n")
+        );
+    }
+
+    // B9 review fix (Critical false-positive): the depth scan must be scoped
+    // to ONLY the fenced YAML gray_matter actually parses. Before this fix,
+    // `check_nesting_depth` scanned the WHOLE FILE, so legitimate shallow
+    // frontmatter followed by an unrelated bracket-heavy or dash-heavy body
+    // (interval notation, a flattened outline) was wrongly rejected as
+    // over-nested even though gray_matter never parses the body as YAML at
+    // all. This reproduces the exact false positive: confirmed FAILING
+    // (returned `Extract::Invalid`) before the fix that scopes the scan to
+    // `frontmatter_fence`'s output, and PASSING after.
+    #[test]
+    fn body_with_many_unclosed_brackets_does_not_reject_shallow_frontmatter() {
+        let intervals: String = (0..200).map(|i| format!("[{i},{}) ", i + 1)).collect();
+        let c = format!("---\nstatus: draft\n---\n{intervals}\n");
+        match extract(&c) {
+            Extract::Fields { fields, .. } => {
+                assert_eq!(fields.get("status"), Some(&Value::Str("draft".into())));
+            }
+            other => {
+                panic!("expected Fields, body brackets must not reject frontmatter, got {other:?}")
+            }
+        }
+        assert!(body(&c).is_some(), "body() must also accept this file");
+    }
+
+    #[test]
+    fn body_with_a_flattened_outline_does_not_reject_shallow_frontmatter() {
+        let outline = "- ".repeat(200) + "v";
+        let c = format!("---\nstatus: draft\n---\n{outline}\n");
+        match extract(&c) {
+            Extract::Fields { fields, .. } => {
+                assert_eq!(fields.get("status"), Some(&Value::Str("draft".into())));
+            }
+            other => {
+                panic!("expected Fields, body dashes must not reject frontmatter, got {other:?}")
+            }
+        }
+        assert!(body(&c).is_some(), "body() must also accept this file");
     }
 
     // Direct unit test of `pod_to_value`'s own cap, built from a `Pod` tree

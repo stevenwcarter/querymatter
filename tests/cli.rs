@@ -3762,3 +3762,48 @@ fn deeply_nested_frontmatter_is_skipped_not_crashed() {
         .stdout(predicates::str::contains("ok"))
         .stderr(predicates::str::contains("deep.md"));
 }
+
+/// B9 review fix (Critical false-positive): a file with LEGITIMATE, shallow
+/// frontmatter but a body containing unrelated bracket-heavy or dash-heavy
+/// text must load normally — the pre-parse depth cap that stops the crash in
+/// `deeply_nested_frontmatter_is_skipped_not_crashed` above must only ever
+/// fire on the fenced frontmatter YAML gray_matter actually parses, never on
+/// Markdown body content. `intervals.md`'s body is interval notation (`[0,1)
+/// [1,2) …`, 200 unclosed `[`); `outline.md`'s is a flattened pasted outline
+/// (`- - - - … v`, 200 levels) — both comfortably past the 128 cap. Before
+/// the fix that scopes `check_nesting_depth` to just the fenced block, BOTH
+/// were wrongly rejected as `Extract::Invalid("frontmatter nesting exceeds
+/// 128 levels — skipped")` even though their frontmatter (`status: draft`)
+/// is trivially shallow.
+#[test]
+fn body_bracket_or_dash_heavy_text_does_not_reject_legitimate_frontmatter() {
+    let td = TempDir::new().unwrap();
+    let intervals: String = (0..200).map(|i| format!("[{i},{}) ", i + 1)).collect();
+    fs::write(
+        td.path().join("intervals.md"),
+        format!("---\nstatus: draft\n---\n{intervals}\n"),
+    )
+    .unwrap();
+    let outline = "- ".repeat(200) + "v";
+    fs::write(
+        td.path().join("outline.md"),
+        format!("---\nstatus: draft\n---\n{outline}\n"),
+    )
+    .unwrap();
+    let home = TempDir::new().unwrap();
+    let out = qm(home.path())
+        .args(["-e", "SELECT status", "--format", "json"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("nesting").not())
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        v.as_array().unwrap().len(),
+        2,
+        "both files must load, neither skipped as over-nested: {v}"
+    );
+}
