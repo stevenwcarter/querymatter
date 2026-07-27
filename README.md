@@ -559,10 +559,11 @@ is refused unless you pass `--force` (which deletes and regenerates it).
 [`docs/sample-queries.md`](docs/sample-queries.md) walks through queries
 exercising most of the DSL against this tree, with expected output;
 [`docs/sample-queries.sql`](docs/sample-queries.sql) is the runnable version
-(`querymatter samples < docs/sample-queries.sql`), pinned by an integration
+(`querymatter --echo samples < docs/sample-queries.sql`), pinned by an integration
 test so the examples can never silently rot. The 100k scale plus
 `querymatter init samples` is a quick way to feel the cache speedup on a
-large vault.
+large vault. Passing `--echo` causes the comments and queries to be printed
+from the batch file, making it easier to determine what each query is doing.
 
 ## Caching large vaults (`.querymatter`)
 
