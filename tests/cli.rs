@@ -2798,6 +2798,143 @@ fn output_flag_errors_cleanly_on_an_unwritable_path() {
         .stderr(predicates::str::contains("querymatter:"));
 }
 
+// --- `--echo` ---
+
+/// A three-statement batch script — two `;`-terminated blocks each with a
+/// leading `--` comment, plus one `\G`-terminated block — for the `--echo`
+/// tests below. `split_statements` folds each block's comment lines into the
+/// FOLLOWING statement's `sql` (the property `--echo` relies on), so each
+/// echoed headline is expected to be the comment(s) plus the statement, with
+/// its terminator restored.
+const ECHO_BATCH_SQL: &str = "-- first block\n\
+-- count everything\n\
+SELECT count(*) AS n;\n\
+\n\
+-- second block\n\
+SELECT status WHERE prd = '010';\n\
+\n\
+-- third block, vertical\n\
+SELECT status WHERE prd = '011'\\G\n";
+
+/// `--echo` on batch (piped stdin): stdout has every statement's original
+/// text — including its leading comments — echoed with its terminator
+/// restored, immediately before that statement's result, with exactly one
+/// blank line separating each echoed block from the next (requirement 2).
+#[test]
+fn echo_batch_stdin_echoes_comments_statement_and_restored_terminator() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    let out = qm(home.path())
+        .arg("--echo")
+        .arg(td.path())
+        .write_stdin(ECHO_BATCH_SQL)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(out).unwrap();
+
+    assert!(
+        text.contains("-- first block\n-- count everything\nSELECT count(*) AS n;\n"),
+        "first block's comments + statement + restored ';' missing:\n{text}"
+    );
+    assert!(
+        text.contains("-- second block\nSELECT status WHERE prd = '010';\n"),
+        "second block's comment + statement + restored ';' missing:\n{text}"
+    );
+    assert!(
+        text.contains("-- third block, vertical\nSELECT status WHERE prd = '011'\\G\n"),
+        "third block's comment + statement + restored '\\G' missing:\n{text}"
+    );
+    assert!(
+        text.contains("\n\n-- second block"),
+        "exactly one blank line must separate the first result from the \
+         second echoed block:\n{text}"
+    );
+    assert!(
+        text.contains("\n\n-- third block, vertical"),
+        "exactly one blank line must separate the second result from the \
+         third echoed block:\n{text}"
+    );
+}
+
+/// Same batch script, WITHOUT `--echo`: stdout must contain no statement
+/// text at all — the guard proving `--echo`'s absence changes nothing about
+/// today's output (requirement 2's "default output must stay
+/// byte-identical").
+#[test]
+fn echo_off_batch_stdin_emits_no_statement_text() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    let out = qm(home.path())
+        .arg(td.path())
+        .write_stdin(ECHO_BATCH_SQL)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(out).unwrap();
+
+    assert!(
+        !text.contains("-- first block"),
+        "no echoed comment must appear without --echo:\n{text}"
+    );
+    assert!(
+        !text.contains("SELECT status WHERE prd = '010';"),
+        "no echoed statement (with its restored terminator) must appear \
+         without --echo:\n{text}"
+    );
+}
+
+/// `--echo` combined with `--output FILE`: the echoed headlines and results
+/// interleave in the file (the SAME sink), and stdout stays completely
+/// empty, exactly like `--output` alone.
+#[test]
+fn echo_with_output_flag_interleaves_in_the_file_stdout_stays_empty() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    let out_path = td.path().join("res.txt");
+    qm(home.path())
+        .arg("--echo")
+        .args(["--output", out_path.to_str().unwrap()])
+        .arg(td.path())
+        .write_stdin(ECHO_BATCH_SQL)
+        .assert()
+        .success()
+        .stdout(predicates::str::is_empty());
+
+    let body = fs::read_to_string(&out_path).unwrap();
+    assert!(
+        body.contains("-- first block\n-- count everything\nSELECT count(*) AS n;\n"),
+        "the echoed headline must land in the --output file:\n{body}"
+    );
+    assert!(
+        body.contains("\n\n-- second block"),
+        "the blank-line separator must land in the --output file too:\n{body}"
+    );
+}
+
+/// `-e` one-shot with `--echo` echoes exactly like batch mode — both share
+/// `Session::render_statement_to`. (`-e`'s value can't itself start with
+/// `--` — clap reads that as an option, not this flag's value — so this
+/// exercises a plain one-line statement rather than a leading comment; the
+/// comment-preservation behavior is already pinned by the batch-mode tests
+/// above, which share the exact same rendering path.)
+#[test]
+fn echo_oneshot_dash_e_echoes_statement() {
+    let td = tree();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg("--echo")
+        .args(["-e", "SELECT count(*) AS n"])
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("SELECT count(*) AS n;\n"));
+}
+
 // --- `querymatter query` (saved named queries) ---
 
 #[test]

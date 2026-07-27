@@ -1017,6 +1017,10 @@ fn build_session(
     // it here from the same `cli.freshness()` that decided how `store` was
     // loaded.
     session.set_disk_reads_allowed(cli.freshness() != Freshness::ForceCache);
+    // Seeds `--echo`'s initial state; the REPL's `.echo` dot-command can
+    // still flip it live for the rest of the session (see `Session::echo`'s
+    // doc comment).
+    session.set_echo(cli.echo);
     Ok(session)
 }
 

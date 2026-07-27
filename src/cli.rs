@@ -122,6 +122,11 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub output: Option<PathBuf>,
 
+    /// Echo each statement — including its leading comments — before its
+    /// result (one-shot/batch; sets the REPL's initial echo state).
+    #[arg(long)]
+    pub echo: bool,
+
     /// Disable unknown-column validation, treating an unknown
     /// SELECT/WHERE/GROUP BY/ORDER BY/HAVING column as NULL instead of
     /// failing the query with a suggestion.
