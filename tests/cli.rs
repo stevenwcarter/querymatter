@@ -3967,6 +3967,29 @@ fn table_output_neutralizes_ansi_escapes_from_frontmatter() {
     assert!(!out.contains(&0x1b), "raw ESC leaked into table output");
 }
 
+/// The multiline-render fix end-to-end: a value containing `\n` renders its
+/// lines in the default table format — no U+FFFD blobs. Exercises the same
+/// sanitize-then-render path `file.body` uses.
+#[test]
+fn table_output_renders_multiline_values() {
+    let td = TempDir::new().unwrap();
+    fs::write(
+        td.path().join("multi.md"),
+        "---\ntitle: \"line one\\nline two\"\n---\n",
+    )
+    .unwrap();
+    let home = TempDir::new().unwrap();
+    qm(home.path())
+        .arg("-e")
+        .arg("SELECT title")
+        .arg(td.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("line one"))
+        .stdout(predicate::str::contains("line two"))
+        .stdout(predicate::str::contains("\u{FFFD}").not());
+}
+
 /// Task 3 (B3) INV-1 pin: the table/vertical sanitizer must not touch the
 /// json interchange path. The same ESC-bearing value must still come through
 /// as serde's own `` escape, byte-identical to before this fix.

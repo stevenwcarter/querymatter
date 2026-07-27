@@ -1,0 +1,12 @@
+---
+source: src/render.rs
+expression: "render(&t, Output::Format(Format::Table), TableStyle::Ascii, true)"
+---
++------+------------------+
+| path | body             |
++=========================+
+| a.md | # Title          |
+|      |                  |
+|      | First paragraph. |
+|      | Second line.     |
++------+------------------+

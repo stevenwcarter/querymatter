@@ -317,11 +317,16 @@ fn render_markdown(table: &ResultTable, header: bool) -> String {
     ct.trim_fmt()
 }
 
-/// Neutralizes C0/C1 control characters — ESC, `\r`, and their kin — so a
-/// frontmatter value can't forge terminal escape sequences (screen clears,
+/// Neutralizes C0/C1 control characters — ESC, lone `\r`, and their kin — so
+/// a frontmatter value can't forge terminal escape sequences (screen clears,
 /// cursor moves, forged rows) when rendered into a table cell or vertical
-/// (`\G`) line. `\t` is left untouched; everything else `char::is_control`
-/// reports (including `\n`) becomes U+FFFD.
+/// (`\G`) line. `\t` and `\n` are exempt: tabs are harmless, and newlines
+/// are real content in multiline values like `file.body` — comfy-table
+/// renders them as lines *inside* a cell's borders (they can't forge rows),
+/// and vertical output prints them raw exactly as `mysql`'s `\G` does.
+/// `\r\n` collapses to `\n` first, so a CRLF-authored file doesn't render a
+/// U+FFFD at every line end; a lone `\r` (a line-overwrite vector) still
+/// becomes U+FFFD.
 ///
 /// Used by the interactive [`Format::Table`] path (via [`new_table`]'s
 /// `sanitize: true` call from [`render_table`]) and the vertical
@@ -332,13 +337,16 @@ fn render_markdown(table: &ResultTable, header: bool) -> String {
 /// byte-identity interchange contract (see the module doc) and must keep
 /// receiving raw [`Value::display`] output untouched.
 fn sanitize_for_terminal(s: &str) -> Cow<'_, str> {
-    if !s.chars().any(|c| c.is_control() && c != '\t') {
+    if !s.chars().any(|c| c.is_control() && c != '\t' && c != '\n') {
         return Cow::Borrowed(s);
     }
+    // `\r` fails the fast path whether lone or part of a CRLF, so the
+    // collapse below runs on every string that could need it.
     Cow::Owned(
-        s.chars()
+        s.replace("\r\n", "\n")
+            .chars()
             .map(|c| {
-                if c.is_control() && c != '\t' {
+                if c.is_control() && c != '\t' && c != '\n' {
                     '\u{FFFD}'
                 } else {
                     c
@@ -454,21 +462,79 @@ mod tests {
         );
     }
 
-    /// FIX 4 (B3 review): pins that `\n` falls under the "all control chars
-    /// except `\t`" rule and is deliberately neutralized too, not exempted —
-    /// a separate assertion from the ESC/CR/tab characterization above so a
-    /// future "let newlines through" change can't slip past unnoticed.
+    /// Inverts the old FIX 4 pin on purpose: `\n` is real content in
+    /// multiline values like `file.body` (comfy-table renders it as lines
+    /// inside a cell; `\G` prints it raw like mysql), so it is exempt from
+    /// sanitization alongside `\t`. See the 2026-07-27 multiline-render spec.
     #[test]
-    fn sanitize_for_terminal_neutralizes_newline() {
+    fn sanitize_for_terminal_preserves_newline() {
         let sanitized = sanitize_for_terminal("before\nafter");
+        assert_eq!(sanitized, "before\nafter");
         assert!(
-            !sanitized.contains('\n'),
-            "newline must be neutralized, got {sanitized:?}"
+            matches!(sanitized, Cow::Borrowed(_)),
+            "newline-only input must take the no-alloc fast path"
         );
-        assert!(
-            sanitized.contains('\u{FFFD}'),
-            "newline must become U+FFFD, got {sanitized:?}"
-        );
+    }
+
+    /// `\r\n` collapses to `\n` so CRLF-authored files don't render a U+FFFD
+    /// blob at the end of every line — the very bug the newline exemption
+    /// fixes, in Windows trim.
+    #[test]
+    fn sanitize_for_terminal_collapses_crlf() {
+        assert_eq!(sanitize_for_terminal("a\r\nb\r\nc"), "a\nb\nc");
+    }
+
+    /// A lone `\r` is a real cursor-abuse vector (line overwrite forgery) and
+    /// stays neutralized — only the two-char `\r\n` sequence is normalized.
+    #[test]
+    fn sanitize_for_terminal_still_neutralizes_lone_cr() {
+        assert_eq!(sanitize_for_terminal("a\rb"), "a\u{FFFD}b");
+    }
+
+    /// A multiline value (the `file.body` case) renders as multiple lines
+    /// inside its table cell — borders intact, no U+FFFD blobs.
+    #[test]
+    fn table_multiline_cell() {
+        let t = ResultTable {
+            headers: vec!["path".into(), "body".into()],
+            rows: vec![vec![
+                Value::Str("a.md".into()),
+                Value::Str("# Title\n\nFirst paragraph.\nSecond line.".into()),
+            ]],
+        };
+        insta::assert_snapshot!(render(
+            &t,
+            Output::Format(Format::Table),
+            TableStyle::Ascii,
+            true
+        ));
+    }
+
+    /// `\G` prints multiline values raw, mysql-style: continuation lines
+    /// start at column 0.
+    #[test]
+    fn vertical_multiline_value() {
+        let t = ResultTable {
+            headers: vec!["path".into(), "body".into()],
+            rows: vec![vec![
+                Value::Str("a.md".into()),
+                Value::Str("# Title\n\nFirst paragraph.".into()),
+            ]],
+        };
+        insta::assert_snapshot!(render(&t, Output::Vertical, TableStyle::Ascii, true));
+    }
+
+    /// The newline exemption must not weaken the B3 security fix: an ESC
+    /// riding inside a multiline value still becomes U+FFFD in table output.
+    #[test]
+    fn table_multiline_still_neutralizes_esc() {
+        let t = ResultTable {
+            headers: vec!["body".into()],
+            rows: vec![vec![Value::Str("line one\n\u{1b}[2Jline two".into())]],
+        };
+        let s = render(&t, Output::Format(Format::Table), TableStyle::Ascii, true);
+        assert!(!s.contains('\u{1b}'), "raw ESC leaked, got:\n{s}");
+        assert!(s.contains('\u{FFFD}'), "ESC must become U+FFFD, got:\n{s}");
     }
 
     #[test]
