@@ -251,7 +251,7 @@ fn want_dynamic_width(is_tty: bool) -> bool {
 /// [`want_dynamic_width`]), not in [`new_table`]/[`render_markdown`]: Markdown
 /// is a fixed interchange format and must stay terminal-independent.
 fn render_table(table: &ResultTable, style: TableStyle, header: bool) -> String {
-    let mut ct = new_table(table, header, true);
+    let mut ct = new_table(table, header, CellEscape::Terminal);
     if want_dynamic_width(std::io::stdout().is_terminal()) {
         ct.set_content_arrangement(comfy_table::ContentArrangement::Dynamic);
     }
@@ -308,11 +308,13 @@ fn render_vertical(table: &ResultTable) -> String {
 
 /// Renders `table` as a Markdown table, independent of any [`TableStyle`].
 ///
-/// Passes `sanitize: false` to [`new_table`]: Markdown is a fixed interchange
-/// format (see [`render_table`]'s doc), so — unlike [`Format::Table`] — its
-/// cells must NOT go through [`sanitize_for_terminal`]/[`sanitized_display`].
+/// Passes [`CellEscape::Markdown`] to [`new_table`]: line breaks become
+/// `<br>` (a md-table row must be one physical line), but cells are
+/// otherwise raw — Markdown is a fixed interchange format (see
+/// [`render_table`]'s doc), so its cells must NOT go through
+/// [`sanitize_for_terminal`].
 fn render_markdown(table: &ResultTable, header: bool) -> String {
-    let mut ct = new_table(table, header, false);
+    let mut ct = new_table(table, header, CellEscape::Markdown);
     ct.load_preset(ASCII_MARKDOWN);
     ct.trim_fmt()
 }
@@ -329,13 +331,13 @@ fn render_markdown(table: &ResultTable, header: bool) -> String {
 /// becomes U+FFFD.
 ///
 /// Used by the interactive [`Format::Table`] path (via [`new_table`]'s
-/// `sanitize: true` call from [`render_table`]) and the vertical
+/// [`CellEscape::Terminal`] call from [`render_table`]) and the vertical
 /// ([`render_vertical`]) path. [`Format::Md`] shares [`new_table`] but calls
-/// it with `sanitize: false` from [`render_markdown`], since Markdown is a
-/// fixed interchange format and must stay terminal-independent. Never call
-/// this from the csv/tsv/json paths either — those are the other stable,
-/// byte-identity interchange contract (see the module doc) and must keep
-/// receiving raw [`Value::display`] output untouched.
+/// it with [`CellEscape::Markdown`] from [`render_markdown`], since Markdown
+/// is a fixed interchange format and must stay terminal-independent. Never
+/// call this from the csv/tsv/json paths either — those are the other
+/// stable, byte-identity interchange contract (see the module doc) and must
+/// keep receiving raw [`Value::display`] output untouched.
 fn sanitize_for_terminal(s: &str) -> Cow<'_, str> {
     if !s.chars().any(|c| c.is_control() && c != '\t' && c != '\n') {
         return Cow::Borrowed(s);
@@ -357,8 +359,8 @@ fn sanitize_for_terminal(s: &str) -> Cow<'_, str> {
 }
 
 /// [`Value::display`], sanitized for terminal display via
-/// [`sanitize_for_terminal`]. Used by the [`Format::Table`] and vertical
-/// (`\G`) paths only — see that function's doc for why.
+/// [`sanitize_for_terminal`]. Used by the [`render_vertical`] (`\G`) path;
+/// the table path does the same dance inline in [`new_table`].
 ///
 /// Avoids a redundant clone on the common no-control-char path: `s` is
 /// already owned, so when [`sanitize_for_terminal`] hands back a borrow of it
@@ -372,28 +374,55 @@ fn sanitized_display(value: &Value) -> String {
     }
 }
 
+/// How [`new_table`] transforms cell and header text before it enters the
+/// table: terminal sanitization for [`Format::Table`], line-break escaping
+/// for [`Format::Md`].
+#[derive(Clone, Copy)]
+enum CellEscape {
+    /// Neutralize terminal-escape vectors via [`sanitize_for_terminal`].
+    Terminal,
+    /// Replace `\r\n`/`\n`/`\r` with `<br>` so each Markdown row stays one
+    /// physical line. Everything else — including ESC — passes through raw:
+    /// md is a fixed interchange format, not a terminal display, and `<br>`
+    /// is dialect syntax, not sanitization.
+    Markdown,
+}
+
+/// Applies `escape`'s transform, borrowing when the string needs no change.
+fn escape_cell(s: &str, escape: CellEscape) -> Cow<'_, str> {
+    match escape {
+        CellEscape::Terminal => sanitize_for_terminal(s),
+        CellEscape::Markdown => escape_md_linebreaks(s),
+    }
+}
+
+/// Replaces line breaks with `<br>` for Markdown table cells and headers.
+/// `\r\n` is replaced first so a CRLF becomes one `<br>`, not two.
+fn escape_md_linebreaks(s: &str) -> Cow<'_, str> {
+    if !s.contains(['\n', '\r']) {
+        return Cow::Borrowed(s);
+    }
+    Cow::Owned(s.replace("\r\n", "<br>").replace(['\n', '\r'], "<br>"))
+}
+
 /// A `comfy-table` [`Table`] carrying `table`'s headers (unless `header` is
-/// `false`) and rows, with no preset loaded yet. `sanitize` selects whether
-/// cells go through [`sanitize_for_terminal`]/[`sanitized_display`]:
-/// [`render_table`] (`Format::Table`) passes `true`, [`render_markdown`]
-/// (`Format::Md`, a fixed interchange format) passes `false`.
-fn new_table(table: &ResultTable, header: bool, sanitize: bool) -> Table {
+/// `false`) and rows, with no preset loaded yet, cells and headers
+/// transformed per `escape`: [`render_table`] (`Format::Table`) passes
+/// [`CellEscape::Terminal`], [`render_markdown`] (`Format::Md`) passes
+/// [`CellEscape::Markdown`].
+fn new_table(table: &ResultTable, header: bool, escape: CellEscape) -> Table {
     let mut ct = Table::new();
     if header {
-        ct.set_header(table.headers.iter().map(|h| {
-            if sanitize {
-                sanitize_for_terminal(h)
-            } else {
-                Cow::Borrowed(h.as_str())
-            }
-        }));
+        ct.set_header(table.headers.iter().map(|h| escape_cell(h, escape)));
     }
     for row in &table.rows {
         ct.add_row(row.iter().map(|value| {
-            if sanitize {
-                sanitized_display(value)
-            } else {
-                value.display()
+            // Like `sanitized_display`: reuse the owned display string when
+            // the escape hands back a borrow of it unchanged.
+            let s = value.display();
+            match escape_cell(&s, escape) {
+                Cow::Borrowed(_) => s,
+                Cow::Owned(escaped) => escaped,
             }
         }));
     }
@@ -748,6 +777,46 @@ mod tests {
             TableStyle::Ascii,
             true
         ));
+    }
+
+    /// md cells turn every line-break form into `<br>` — the Markdown-table
+    /// way to hold multiline content — so each row stays one physical line.
+    #[test]
+    fn md_multiline_cell_becomes_br() {
+        let t = ResultTable {
+            headers: vec!["body".into()],
+            rows: vec![vec![Value::Str("a\r\nb\nc\rd".into())]],
+        };
+        let s = render(&t, Output::Format(Format::Md), TableStyle::Ascii, true);
+        assert!(s.contains("a<br>b<br>c<br>d"), "got:\n{s}");
+        for line in s.lines() {
+            assert!(
+                line.starts_with('|') && line.ends_with('|'),
+                "a row split across physical lines, got:\n{s}"
+            );
+        }
+    }
+
+    /// Headers take the same escaping — a newline-bearing alias can't split
+    /// the md header row either.
+    #[test]
+    fn md_multiline_header_becomes_br() {
+        let t = ResultTable {
+            headers: vec!["two\nlines".into()],
+            rows: vec![vec![Value::Int(1)]],
+        };
+        let s = render(&t, Output::Format(Format::Md), TableStyle::Ascii, true);
+        assert!(s.contains("two<br>lines"), "got:\n{s}");
+    }
+
+    /// `\r\n` becomes ONE `<br>`, and the escape only fires on line breaks —
+    /// clean strings ride the borrowed fast path.
+    #[test]
+    fn escape_md_linebreaks_handles_all_break_forms() {
+        assert_eq!(escape_md_linebreaks("a\r\nb"), "a<br>b");
+        assert_eq!(escape_md_linebreaks("a\nb"), "a<br>b");
+        assert_eq!(escape_md_linebreaks("a\rb"), "a<br>b");
+        assert!(matches!(escape_md_linebreaks("plain"), Cow::Borrowed(_)));
     }
 
     /// Regression for a data-loss bug: the delimited-render path used to
