@@ -903,6 +903,14 @@ as in `SELECT * LIMIT 1\G`. `\g` is accepted as a synonym for `;`. `\G`
 overrides whatever `.format` is set to, and works in `-e` and piped batch mode
 as well as the REPL.
 
+Multiline values (a multiline frontmatter string, or `file.body`) render
+their line breaks for real: as extra lines inside the cell in `--format
+table`, raw MySQL-style continuation lines under `\G`, and `<br>` in
+`--format md` (whose rows must each stay one physical line). Other control
+characters in frontmatter (ESC, lone `\r`, …) are still neutralized to
+`U+FFFD` in table/`\G` output so a hostile file can't forge terminal escape
+sequences; json/csv/tsv always carry the raw value with their own escaping.
+
 On a real terminal, `--format table` (and `.format table`) also fits the
 table to the terminal's width automatically instead of overflowing off the
 screen; piped or redirected output (a script, `--output`, `.output <path>`)
