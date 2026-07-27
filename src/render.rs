@@ -251,7 +251,7 @@ fn want_dynamic_width(is_tty: bool) -> bool {
 /// [`want_dynamic_width`]), not in [`new_table`]/[`render_markdown`]: Markdown
 /// is a fixed interchange format and must stay terminal-independent.
 fn render_table(table: &ResultTable, style: TableStyle, header: bool) -> String {
-    let mut ct = new_table(table, header, true);
+    let mut ct = new_table(table, header, CellEscape::Terminal);
     if want_dynamic_width(std::io::stdout().is_terminal()) {
         ct.set_content_arrangement(comfy_table::ContentArrangement::Dynamic);
     }
@@ -278,6 +278,15 @@ fn render_table(table: &ResultTable, style: TableStyle, header: bool) -> String 
 ///
 /// Zero rows renders the empty string — there are no headers worth showing
 /// without a row, and an empty result must stay distinguishable when piped.
+///
+/// `\n` being sanitizer-exempt (see [`sanitize_for_terminal`]) applies to
+/// header text too: `SELECT *` derives headers from frontmatter keys, and a
+/// YAML double-quoted key like `"x\nfake: value"` is legal, so a hostile key
+/// — not just a value — can print a spoofed `label: value` line at column 0
+/// here, and a multiline header also skews `width` (computed over the raw
+/// header string below) since it's measured, not rendered, as one line. This
+/// is the same risk class the design deliberately accepts for values, for
+/// `mysql`'s `\G` parity.
 fn render_vertical(table: &ResultTable) -> String {
     let stars = "*".repeat(BANNER_ASTERISKS);
     // Frontmatter keys are overwhelmingly ASCII, so `chars().count()` stands
@@ -308,37 +317,47 @@ fn render_vertical(table: &ResultTable) -> String {
 
 /// Renders `table` as a Markdown table, independent of any [`TableStyle`].
 ///
-/// Passes `sanitize: false` to [`new_table`]: Markdown is a fixed interchange
-/// format (see [`render_table`]'s doc), so — unlike [`Format::Table`] — its
-/// cells must NOT go through [`sanitize_for_terminal`]/[`sanitized_display`].
+/// Passes [`CellEscape::Markdown`] to [`new_table`]: line breaks become
+/// `<br>` (a md-table row must be one physical line), but cells are
+/// otherwise raw — Markdown is a fixed interchange format (see
+/// [`render_table`]'s doc), so its cells must NOT go through
+/// [`sanitize_for_terminal`].
 fn render_markdown(table: &ResultTable, header: bool) -> String {
-    let mut ct = new_table(table, header, false);
+    let mut ct = new_table(table, header, CellEscape::Markdown);
     ct.load_preset(ASCII_MARKDOWN);
     ct.trim_fmt()
 }
 
-/// Neutralizes C0/C1 control characters — ESC, `\r`, and their kin — so a
-/// frontmatter value can't forge terminal escape sequences (screen clears,
+/// Neutralizes C0/C1 control characters — ESC, lone `\r`, and their kin — so
+/// a frontmatter value can't forge terminal escape sequences (screen clears,
 /// cursor moves, forged rows) when rendered into a table cell or vertical
-/// (`\G`) line. `\t` is left untouched; everything else `char::is_control`
-/// reports (including `\n`) becomes U+FFFD.
+/// (`\G`) line. `\t` and `\n` are exempt: tabs are harmless, and newlines
+/// are real content in multiline values like `file.body` — comfy-table
+/// renders them as lines *inside* a cell's borders (they can't forge rows),
+/// and vertical output prints them raw exactly as `mysql`'s `\G` does.
+/// `\r\n` collapses to `\n` first, so a CRLF-authored file doesn't render a
+/// U+FFFD at every line end; a lone `\r` (a line-overwrite vector) still
+/// becomes U+FFFD.
 ///
 /// Used by the interactive [`Format::Table`] path (via [`new_table`]'s
-/// `sanitize: true` call from [`render_table`]) and the vertical
+/// [`CellEscape::Terminal`] call from [`render_table`]) and the vertical
 /// ([`render_vertical`]) path. [`Format::Md`] shares [`new_table`] but calls
-/// it with `sanitize: false` from [`render_markdown`], since Markdown is a
-/// fixed interchange format and must stay terminal-independent. Never call
-/// this from the csv/tsv/json paths either — those are the other stable,
-/// byte-identity interchange contract (see the module doc) and must keep
-/// receiving raw [`Value::display`] output untouched.
+/// it with [`CellEscape::Markdown`] from [`render_markdown`], since Markdown
+/// is a fixed interchange format and must stay terminal-independent. Never
+/// call this from the csv/tsv/json paths either — those are the other
+/// stable, byte-identity interchange contract (see the module doc) and must
+/// keep receiving raw [`Value::display`] output untouched.
 fn sanitize_for_terminal(s: &str) -> Cow<'_, str> {
-    if !s.chars().any(|c| c.is_control() && c != '\t') {
+    if !s.chars().any(|c| c.is_control() && c != '\t' && c != '\n') {
         return Cow::Borrowed(s);
     }
+    // `\r` fails the fast path whether lone or part of a CRLF, so the
+    // collapse below runs on every string that could need it.
     Cow::Owned(
-        s.chars()
+        s.replace("\r\n", "\n")
+            .chars()
             .map(|c| {
-                if c.is_control() && c != '\t' {
+                if c.is_control() && c != '\t' && c != '\n' {
                     '\u{FFFD}'
                 } else {
                     c
@@ -349,8 +368,8 @@ fn sanitize_for_terminal(s: &str) -> Cow<'_, str> {
 }
 
 /// [`Value::display`], sanitized for terminal display via
-/// [`sanitize_for_terminal`]. Used by the [`Format::Table`] and vertical
-/// (`\G`) paths only — see that function's doc for why.
+/// [`sanitize_for_terminal`]. Used by the [`render_vertical`] (`\G`) path;
+/// the table path does the same dance inline in [`new_table`].
 ///
 /// Avoids a redundant clone on the common no-control-char path: `s` is
 /// already owned, so when [`sanitize_for_terminal`] hands back a borrow of it
@@ -364,28 +383,55 @@ fn sanitized_display(value: &Value) -> String {
     }
 }
 
+/// How [`new_table`] transforms cell and header text before it enters the
+/// table: terminal sanitization for [`Format::Table`], line-break escaping
+/// for [`Format::Md`].
+#[derive(Clone, Copy)]
+enum CellEscape {
+    /// Neutralize terminal-escape vectors via [`sanitize_for_terminal`].
+    Terminal,
+    /// Replace `\r\n`/`\n`/`\r` with `<br>` so each Markdown row stays one
+    /// physical line. Everything else — including ESC — passes through raw:
+    /// md is a fixed interchange format, not a terminal display, and `<br>`
+    /// is dialect syntax, not sanitization.
+    Markdown,
+}
+
+/// Applies `escape`'s transform, borrowing when the string needs no change.
+fn escape_cell(s: &str, escape: CellEscape) -> Cow<'_, str> {
+    match escape {
+        CellEscape::Terminal => sanitize_for_terminal(s),
+        CellEscape::Markdown => escape_md_linebreaks(s),
+    }
+}
+
+/// Replaces line breaks with `<br>` for Markdown table cells and headers.
+/// `\r\n` is replaced first so a CRLF becomes one `<br>`, not two.
+fn escape_md_linebreaks(s: &str) -> Cow<'_, str> {
+    if !s.contains(['\n', '\r']) {
+        return Cow::Borrowed(s);
+    }
+    Cow::Owned(s.replace("\r\n", "<br>").replace(['\n', '\r'], "<br>"))
+}
+
 /// A `comfy-table` [`Table`] carrying `table`'s headers (unless `header` is
-/// `false`) and rows, with no preset loaded yet. `sanitize` selects whether
-/// cells go through [`sanitize_for_terminal`]/[`sanitized_display`]:
-/// [`render_table`] (`Format::Table`) passes `true`, [`render_markdown`]
-/// (`Format::Md`, a fixed interchange format) passes `false`.
-fn new_table(table: &ResultTable, header: bool, sanitize: bool) -> Table {
+/// `false`) and rows, with no preset loaded yet, cells and headers
+/// transformed per `escape`: [`render_table`] (`Format::Table`) passes
+/// [`CellEscape::Terminal`], [`render_markdown`] (`Format::Md`) passes
+/// [`CellEscape::Markdown`].
+fn new_table(table: &ResultTable, header: bool, escape: CellEscape) -> Table {
     let mut ct = Table::new();
     if header {
-        ct.set_header(table.headers.iter().map(|h| {
-            if sanitize {
-                sanitize_for_terminal(h)
-            } else {
-                Cow::Borrowed(h.as_str())
-            }
-        }));
+        ct.set_header(table.headers.iter().map(|h| escape_cell(h, escape)));
     }
     for row in &table.rows {
         ct.add_row(row.iter().map(|value| {
-            if sanitize {
-                sanitized_display(value)
-            } else {
-                value.display()
+            // Like `sanitized_display`: reuse the owned display string when
+            // the escape hands back a borrow of it unchanged.
+            let s = value.display();
+            match escape_cell(&s, escape) {
+                Cow::Borrowed(_) => s,
+                Cow::Owned(escaped) => escaped,
             }
         }));
     }
@@ -454,21 +500,83 @@ mod tests {
         );
     }
 
-    /// FIX 4 (B3 review): pins that `\n` falls under the "all control chars
-    /// except `\t`" rule and is deliberately neutralized too, not exempted —
-    /// a separate assertion from the ESC/CR/tab characterization above so a
-    /// future "let newlines through" change can't slip past unnoticed.
+    /// Inverts the old FIX 4 pin on purpose: `\n` is real content in
+    /// multiline values like `file.body` (comfy-table renders it as lines
+    /// inside a cell; `\G` prints it raw like mysql), so it is exempt from
+    /// sanitization alongside `\t`. See the 2026-07-27 multiline-render spec.
     #[test]
-    fn sanitize_for_terminal_neutralizes_newline() {
+    fn sanitize_for_terminal_preserves_newline() {
         let sanitized = sanitize_for_terminal("before\nafter");
+        assert_eq!(sanitized, "before\nafter");
         assert!(
-            !sanitized.contains('\n'),
-            "newline must be neutralized, got {sanitized:?}"
+            matches!(sanitized, Cow::Borrowed(_)),
+            "newline-only input must take the no-alloc fast path"
         );
-        assert!(
-            sanitized.contains('\u{FFFD}'),
-            "newline must become U+FFFD, got {sanitized:?}"
-        );
+    }
+
+    /// `\r\n` collapses to `\n` so CRLF-authored files don't render a U+FFFD
+    /// blob at the end of every line — the very bug the newline exemption
+    /// fixes, in Windows trim.
+    #[test]
+    fn sanitize_for_terminal_collapses_crlf() {
+        assert_eq!(sanitize_for_terminal("a\r\nb\r\nc"), "a\nb\nc");
+    }
+
+    /// A lone `\r` is a real cursor-abuse vector (line overwrite forgery) and
+    /// stays neutralized — only the two-char `\r\n` sequence is normalized.
+    #[test]
+    fn sanitize_for_terminal_still_neutralizes_lone_cr() {
+        assert_eq!(sanitize_for_terminal("a\rb"), "a\u{FFFD}b");
+        // Adjacent CRs: `str::replace`'s left-to-right, non-overlapping scan
+        // consumes the trailing `\r\n` as one match, leaving the leading `\r`
+        // lone. Pins that behavior against a future single-pass rewrite.
+        assert_eq!(sanitize_for_terminal("\r\r\nx"), "\u{FFFD}\nx");
+    }
+
+    /// A multiline value (the `file.body` case) renders as multiple lines
+    /// inside its table cell — borders intact, no U+FFFD blobs.
+    #[test]
+    fn table_multiline_cell() {
+        let t = ResultTable {
+            headers: vec!["path".into(), "body".into()],
+            rows: vec![vec![
+                Value::Str("a.md".into()),
+                Value::Str("# Title\n\nFirst paragraph.\nSecond line.".into()),
+            ]],
+        };
+        insta::assert_snapshot!(render(
+            &t,
+            Output::Format(Format::Table),
+            TableStyle::Ascii,
+            true
+        ));
+    }
+
+    /// `\G` prints multiline values raw, mysql-style: continuation lines
+    /// start at column 0.
+    #[test]
+    fn vertical_multiline_value() {
+        let t = ResultTable {
+            headers: vec!["path".into(), "body".into()],
+            rows: vec![vec![
+                Value::Str("a.md".into()),
+                Value::Str("# Title\n\nFirst paragraph.".into()),
+            ]],
+        };
+        insta::assert_snapshot!(render(&t, Output::Vertical, TableStyle::Ascii, true));
+    }
+
+    /// The newline exemption must not weaken the B3 security fix: an ESC
+    /// riding inside a multiline value still becomes U+FFFD in table output.
+    #[test]
+    fn table_multiline_still_neutralizes_esc() {
+        let t = ResultTable {
+            headers: vec!["body".into()],
+            rows: vec![vec![Value::Str("line one\n\u{1b}[2Jline two".into())]],
+        };
+        let s = render(&t, Output::Format(Format::Table), TableStyle::Ascii, true);
+        assert!(!s.contains('\u{1b}'), "raw ESC leaked, got:\n{s}");
+        assert!(s.contains('\u{FFFD}'), "ESC must become U+FFFD, got:\n{s}");
     }
 
     #[test]
@@ -682,6 +790,46 @@ mod tests {
             TableStyle::Ascii,
             true
         ));
+    }
+
+    /// md cells turn every line-break form into `<br>` — the Markdown-table
+    /// way to hold multiline content — so each row stays one physical line.
+    #[test]
+    fn md_multiline_cell_becomes_br() {
+        let t = ResultTable {
+            headers: vec!["body".into()],
+            rows: vec![vec![Value::Str("a\r\nb\nc\rd".into())]],
+        };
+        let s = render(&t, Output::Format(Format::Md), TableStyle::Ascii, true);
+        assert!(s.contains("a<br>b<br>c<br>d"), "got:\n{s}");
+        for line in s.lines() {
+            assert!(
+                line.starts_with('|') && line.ends_with('|'),
+                "a row split across physical lines, got:\n{s}"
+            );
+        }
+    }
+
+    /// Headers take the same escaping — a newline-bearing alias can't split
+    /// the md header row either.
+    #[test]
+    fn md_multiline_header_becomes_br() {
+        let t = ResultTable {
+            headers: vec!["two\nlines".into()],
+            rows: vec![vec![Value::Int(1)]],
+        };
+        let s = render(&t, Output::Format(Format::Md), TableStyle::Ascii, true);
+        assert!(s.contains("two<br>lines"), "got:\n{s}");
+    }
+
+    /// `\r\n` becomes ONE `<br>`, and the escape only fires on line breaks —
+    /// clean strings ride the borrowed fast path.
+    #[test]
+    fn escape_md_linebreaks_handles_all_break_forms() {
+        assert_eq!(escape_md_linebreaks("a\r\nb"), "a<br>b");
+        assert_eq!(escape_md_linebreaks("a\nb"), "a<br>b");
+        assert_eq!(escape_md_linebreaks("a\rb"), "a<br>b");
+        assert!(matches!(escape_md_linebreaks("plain"), Cow::Borrowed(_)));
     }
 
     /// Regression for a data-loss bug: the delimited-render path used to

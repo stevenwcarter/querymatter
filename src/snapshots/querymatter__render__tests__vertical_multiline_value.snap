@@ -1,0 +1,9 @@
+---
+source: src/render.rs
+expression: "render(&t, Output::Vertical, TableStyle::Ascii, true)"
+---
+*************************** 1. row ***************************
+path: a.md
+body: # Title
+
+First paragraph.
