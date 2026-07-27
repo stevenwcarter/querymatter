@@ -278,6 +278,15 @@ fn render_table(table: &ResultTable, style: TableStyle, header: bool) -> String 
 ///
 /// Zero rows renders the empty string — there are no headers worth showing
 /// without a row, and an empty result must stay distinguishable when piped.
+///
+/// `\n` being sanitizer-exempt (see [`sanitize_for_terminal`]) applies to
+/// header text too: `SELECT *` derives headers from frontmatter keys, and a
+/// YAML double-quoted key like `"x\nfake: value"` is legal, so a hostile key
+/// — not just a value — can print a spoofed `label: value` line at column 0
+/// here, and a multiline header also skews `width` (computed over the raw
+/// header string below) since it's measured, not rendered, as one line. This
+/// is the same risk class the design deliberately accepts for values, for
+/// `mysql`'s `\G` parity.
 fn render_vertical(table: &ResultTable) -> String {
     let stars = "*".repeat(BANNER_ASTERISKS);
     // Frontmatter keys are overwhelmingly ASCII, so `chars().count()` stands
@@ -518,6 +527,10 @@ mod tests {
     #[test]
     fn sanitize_for_terminal_still_neutralizes_lone_cr() {
         assert_eq!(sanitize_for_terminal("a\rb"), "a\u{FFFD}b");
+        // Adjacent CRs: `str::replace`'s left-to-right, non-overlapping scan
+        // consumes the trailing `\r\n` as one match, leaving the leading `\r`
+        // lone. Pins that behavior against a future single-pass rewrite.
+        assert_eq!(sanitize_for_terminal("\r\r\nx"), "\u{FFFD}\nx");
     }
 
     /// A multiline value (the `file.body` case) renders as multiple lines
