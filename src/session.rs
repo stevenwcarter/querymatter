@@ -3,6 +3,7 @@
 //! batch, and interactive modes.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -40,6 +41,17 @@ pub struct Session {
     /// (unrestricted) so every existing [`Session::new`] call site — none of
     /// which cares about `--force-cache` — keeps its pre-W56 behavior.
     disk_reads_allowed: bool,
+    /// Whether [`Self::render_statement_to`] echoes a statement's original
+    /// text (comments included) and terminator before its result, plus a
+    /// blank line after — the `--echo` flag / REPL `.echo` dot-command.
+    /// Session-only (not a [`Settings`]-resolved, config-file-persistable
+    /// value like `format`/`header`/`timer`: nothing asked for `--echo` to be
+    /// configurable via `.querymatter.toml`/`config.toml`, so it stays a
+    /// plain flag seeded once by [`Self::set_echo`], mirroring
+    /// `disk_reads_allowed` above). Defaults to `false`, so a session that
+    /// never calls `set_echo` — every pre-`--echo` [`Session::new`] call site
+    /// — renders byte-identically to before.
+    echo: bool,
 }
 
 impl Session {
@@ -60,6 +72,7 @@ impl Session {
             fallback,
             vault,
             disk_reads_allowed: true,
+            echo: false,
         }
     }
 
@@ -70,6 +83,19 @@ impl Session {
     /// mid-session.
     pub fn set_disk_reads_allowed(&mut self, allowed: bool) {
         self.disk_reads_allowed = allowed;
+    }
+
+    /// Whether [`Self::render_statement_to`] echoes each statement before its
+    /// result — see the `echo` field's doc comment above.
+    pub fn echo(&self) -> bool {
+        self.echo
+    }
+
+    /// Turns statement echoing on or off for the rest of this session.
+    /// Called once by `main::build_session` to seed `--echo`'s initial value,
+    /// and again by the REPL's `.echo on|off` dot-command to change it live.
+    pub fn set_echo(&mut self, on: bool) {
+        self.echo = on;
     }
 
     /// The format rendered results are produced in.
@@ -244,15 +270,34 @@ impl Session {
     /// build-a-`String`-then-`write_block` two-step (design W47). The REPL
     /// prints the count as a `-- N rows` line; one-shot/batch callers sum it
     /// for `--exit-code`.
+    ///
+    /// When [`Self::echo`] is on, `statement`'s original text (including any
+    /// leading `--` comments — [`split_statements`] folds them into the
+    /// following statement's `sql`, by design) plus its restored terminator
+    /// go to `sink` first, and a blank line follows the result — both through
+    /// the SAME sink as the result, so `--output`/`.output` redirects and
+    /// stdout ordering interleave correctly. Echoed only once the query has
+    /// actually run: a failing statement writes nothing here (its error
+    /// propagates instead), matching every statement before it having already
+    /// been fully written. Off (the default), nothing changes — byte-for-byte
+    /// identical to before `--echo` existed.
     pub fn render_statement_to(
         &self,
         statement: &Statement,
         sink: &mut OutputSink,
     ) -> anyhow::Result<usize> {
         let table = self.run(&statement.sql)?;
+        if self.echo {
+            sink.write_result(|w| write_echo(w, statement))
+                .context("failed to write echoed statement")?;
+        }
         let output = statement.terminator.output(self.format());
         sink.write_result(|w| render::render_to(w, &table, output, self.style(), self.header()))
             .context("failed to write query results")?;
+        if self.echo {
+            sink.write_result(|w| writeln!(w))
+                .context("failed to write echo separator")?;
+        }
         Ok(table.rows.len())
     }
 
@@ -503,6 +548,20 @@ pub fn split_statements(input: &str) -> Vec<Statement> {
     statements
 }
 
+/// Writes `statement`'s `--echo` headline to `w`: its `sql` text verbatim
+/// (comments included) followed by its terminator restored — `;` for
+/// [`Terminator::Semicolon`] (whether the source actually used `;` or `\g`;
+/// both parse to the same terminator and re-emitting as `;` is harmless, the
+/// same choice `repl::history_entry` makes) or `\G` for
+/// [`Terminator::VerticalG`] — and a trailing newline.
+fn write_echo(w: &mut dyn Write, statement: &Statement) -> io::Result<()> {
+    let terminator = match statement.terminator {
+        Terminator::Semicolon => ";",
+        Terminator::VerticalG => "\\G",
+    };
+    writeln!(w, "{}{terminator}", statement.sql)
+}
+
 /// Trims `stmt` and pushes it onto `out` with `terminator` when not empty.
 fn push_statement(out: &mut Vec<Statement>, stmt: &str, terminator: Terminator) {
     let trimmed = stmt.trim();
@@ -671,6 +730,130 @@ mod tests {
                 .render_statement_to(&semi("SELECT status WHERE status = 'missing'"), &mut sink)
                 .unwrap(),
             0
+        );
+    }
+
+    /// A session over `dir` with a single `status` field, for the `--echo`
+    /// tests below.
+    fn echo_test_session(dir: &Path, echo: bool) -> Session {
+        let (store, _report) =
+            InMemoryStore::load(vec![dir.to_path_buf()], WalkOpts::default(), None);
+        let mut session = Session::new(
+            Box::new(store),
+            Settings::default(),
+            Settings::default(),
+            None,
+        );
+        session.set_echo(echo);
+        session
+    }
+
+    /// With echo off (the default), `render_statement_to`'s output is
+    /// byte-for-byte identical to before `--echo` existed: no echoed text, no
+    /// blank-line separator — pins requirement 2's "default output must stay
+    /// byte-identical".
+    #[test]
+    fn render_statement_to_echo_off_matches_pre_echo_output() {
+        let td = TempDir::new().unwrap();
+        fs::write(td.path().join("a.md"), "---\nstatus: draft\n---\n").unwrap();
+        let session = echo_test_session(td.path(), false);
+
+        let out = TempDir::new().unwrap();
+        let path = out.path().join("o.txt");
+        let mut sink = OutputSink::open_file(&path).unwrap();
+        session
+            .render_statement_to(&semi("SELECT status"), &mut sink)
+            .unwrap();
+        drop(sink);
+
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(
+            !body.contains("SELECT status"),
+            "echo off must never write the statement text: {body:?}"
+        );
+        assert!(
+            !body.ends_with("\n\n"),
+            "echo off must never add a trailing blank-line separator: {body:?}"
+        );
+    }
+
+    /// With echo on, `render_statement_to` writes the statement's original
+    /// text — comments included, per `split_statements`' documented property
+    /// — with its terminator restored, THEN the result, THEN one blank line,
+    /// all through the same sink (requirement 2).
+    #[test]
+    fn render_statement_to_echo_on_writes_headline_result_then_blank_line() {
+        let td = TempDir::new().unwrap();
+        fs::write(td.path().join("a.md"), "---\nstatus: draft\n---\n").unwrap();
+        let session = echo_test_session(td.path(), true);
+
+        let out = TempDir::new().unwrap();
+        let path = out.path().join("o.txt");
+        let mut sink = OutputSink::open_file(&path).unwrap();
+        let statement = Statement {
+            sql: "-- pick a status\nSELECT status".to_string(),
+            terminator: Terminator::Semicolon,
+        };
+        session.render_statement_to(&statement, &mut sink).unwrap();
+        drop(sink);
+
+        let body = fs::read_to_string(&path).unwrap();
+        let headline_end = body
+            .find("-- pick a status\nSELECT status;\n")
+            .expect("echoed headline (comment + statement + restored ';') missing");
+        assert_eq!(headline_end, 0, "the headline must come first: {body:?}");
+        assert!(
+            body.ends_with("\n\n"),
+            "exactly one blank line must separate this block from the next: {body:?}"
+        );
+    }
+
+    /// `\G` restores as `\G`, not `;` — the vertical terminator survives the
+    /// echo round-trip distinctly from a semicolon-terminated statement.
+    #[test]
+    fn render_statement_to_echo_on_restores_vertical_g_terminator() {
+        let td = TempDir::new().unwrap();
+        fs::write(td.path().join("a.md"), "---\nstatus: draft\n---\n").unwrap();
+        let session = echo_test_session(td.path(), true);
+
+        let out = TempDir::new().unwrap();
+        let path = out.path().join("o.txt");
+        let mut sink = OutputSink::open_file(&path).unwrap();
+        let statement = Statement {
+            sql: "SELECT status".to_string(),
+            terminator: Terminator::VerticalG,
+        };
+        session.render_statement_to(&statement, &mut sink).unwrap();
+        drop(sink);
+
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(
+            body.starts_with("SELECT status\\G\n"),
+            "expected the \\G terminator restored verbatim: {body:?}"
+        );
+    }
+
+    /// Echo text reaches the sink even for a zero-row result — requirement 2
+    /// ("Echo text goes through the sink even when the result is
+    /// empty/zero rows").
+    #[test]
+    fn render_statement_to_echo_on_writes_headline_for_empty_result() {
+        let td = TempDir::new().unwrap();
+        fs::write(td.path().join("a.md"), "---\nstatus: draft\n---\n").unwrap();
+        let session = echo_test_session(td.path(), true);
+
+        let out = TempDir::new().unwrap();
+        let path = out.path().join("o.txt");
+        let mut sink = OutputSink::open_file(&path).unwrap();
+        let statement = semi("SELECT status WHERE status = 'missing'");
+        let rows = session.render_statement_to(&statement, &mut sink).unwrap();
+        drop(sink);
+
+        assert_eq!(rows, 0);
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(
+            body.starts_with("SELECT status WHERE status = 'missing';\n"),
+            "echo must still write the headline for a zero-row result: {body:?}"
         );
     }
 

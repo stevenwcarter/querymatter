@@ -37,6 +37,11 @@ piped stdin.
 `-e`/`--query` always wins if given; otherwise piped (non-TTY) stdin means
 batch mode; otherwise you get the REPL.
 
+Batch mode prints results back to back with nothing identifying which
+statement produced which — pass `--echo` to have each statement (comments
+included) printed as a headline before its result, sqlite3 `.echo on`-style;
+see [Flags](#flags) and `docs/sample-queries.md`.
+
 **stdout carries data** — query results, `config list`/`get`/`path` output,
 and completion scripts. Every diagnostic, warning, confirmation, and prompt
 goes to stderr, so `querymatter -e '…' --format json | jq` always sees pure
@@ -308,6 +313,7 @@ forces strict validation for one invocation, overriding a configured `lenient
 | `--format <FMT>` | `table` (default), `json`, `csv`, `tsv`, or `md`. In the REPL this is just the *initial* format — `.format` changes it live. |
 | `--table-style <STYLE>` | Border style for `--format table`: `ascii` (default), `unicode`, `compact`, or `plain`. Also settable per-shell with `QUERYMATTER_TABLE_STYLE`; the flag wins. Ignored by `json`/`csv`/`tsv`/`md`. In the REPL this is just the *initial* style — `.style` changes it live. |
 | `--output <PATH>` | Write query results to `PATH` instead of stdout (one-shot/batch mode only). See [Redirecting output](#redirecting-output---output). |
+| `--echo` | Echo each statement — including its leading `--` comments — before its result, with a blank line after (one-shot/batch/`query run`). In the REPL this is just the *initial* echo state — `.echo` changes it live. |
 | `--lenient` | Disable unknown-column validation — an unknown column reads as `NULL` instead of failing the query. Off by default — see [Unknown-column validation](#unknown-column-validation). |
 | `--no-lenient` | Force strict unknown-column validation, overriding a config `lenient = true`. |
 | `--header` | Force the header row on in table/csv/tsv/md output, overriding a config `header = false`. On by default. |
@@ -876,6 +882,7 @@ rather than SQL:
 | `.style [style]` | Show, or set, the table border style (`ascii`, `unicode`, `compact`, `plain`) for subsequent queries. |
 | `.header [on\|off]` | Show, or toggle, whether results include a header row (this session only). |
 | `.timer [on\|off]` | Show, or toggle, whether the `-- N rows` line also reports elapsed query time (this session only). |
+| `.echo [on\|off]` | Show, or toggle, whether each statement (comments included) is echoed before its result (this session only). |
 | `.output [path\|stdout]` | Redirect subsequent results to `path` (truncating it first), pipe them through a shell command with `.output \|cmd`, or back to stdout with `.output`/`.output stdout`. See [Redirecting output](#redirecting-output---output). |
 | `.settings` | List every setting, its resolved value, and which layer supplied it. |
 | `.set <key> <value>` | Save a setting to the config file. Rendering settings (`format`, `table_style`) also apply immediately; scan settings take effect on the next run. |
@@ -910,7 +917,10 @@ way, but their `.set`/`config set` counterparts are **deferred**, like any
 scan setting: `.set header false`/`.set timer true`/`.set quiet true` persist
 the default for future runs without changing what's already resolved for
 *this* session — use `.header`/`.timer` directly to change this session's
-behavior right now.
+behavior right now. `.echo` is session-only too, seeded from `--echo`'s
+initial value, but has no `.set echo`/`config set echo` config-file
+counterpart at all — turn it on for the run/session you want it in, via
+`--echo` or `.echo on`.
 
 After each REPL statement's result, a `-- N rows` line (singular for exactly
 one row) is printed to stderr — a quick sanity check that distinguishes a

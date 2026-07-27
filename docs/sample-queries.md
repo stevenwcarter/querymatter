@@ -16,6 +16,15 @@ The whole file is also runnable in one shot via batch mode:
 querymatter samples < docs/sample-queries.sql
 ```
 
+Batch mode prints every result back to back with nothing saying which
+statement produced it — add `--echo` to have each statement (its leading `--`
+comment included) printed as a headline right before its result, for a much
+more readable run:
+
+```sh
+querymatter --echo samples < docs/sample-queries.sql
+```
+
 Every result shown below assumes `--scale 1k`. `starwars/` output is
 identical at every scale (that folder is fixed); the scaled folders
 (`work/`, `recipes/`, `reading/`) change with `--scale`.

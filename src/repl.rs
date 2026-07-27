@@ -66,6 +66,7 @@ const DOT_COMMAND_NAMES: &[&str] = &[
     ".style",
     ".header",
     ".timer",
+    ".echo",
     ".output",
     ".settings",
     ".set",
@@ -115,6 +116,10 @@ pub enum DotCommand {
     /// `.timer [on|off]` — set (`Some`) or report (`None`) whether the
     /// `-- N rows` line includes the query's elapsed time.
     Timer(Option<bool>),
+    /// `.echo [on|off]` — set (`Some`) or report (`None`) whether each
+    /// statement is echoed (original text, comments included, plus its
+    /// terminator) before its result.
+    Echo(Option<bool>),
     /// `.output [path]` or `.output |cmd` — redirect subsequent statement
     /// results to `path`, or pipe them through a shell command when the
     /// argument starts with `|` (the sqlite3 convention, e.g.
@@ -297,6 +302,10 @@ pub fn parse_dot(line: &str) -> DotCommand {
             Some(value) => DotCommand::Timer(value),
             None => DotCommand::Unknown(line.to_string()),
         },
+        "echo" => match parse_on_off(words.next()) {
+            Some(value) => DotCommand::Echo(value),
+            None => DotCommand::Unknown(line.to_string()),
+        },
         // Verbatim (not `words.next()`) so `.output |column -t -s,` or
         // `.output |grep x | wc -l` survive with their internal spaces intact
         // — a whitespace split would truncate the piped command at its first
@@ -347,8 +356,8 @@ pub fn parse_dot(line: &str) -> DotCommand {
 }
 
 /// Parses an optional `on`/`off` argument (case-insensitive), shared by every
-/// dot-command that toggles a boolean setting — `.header` and `.timer`. The
-/// outer `Option` is `None` for an unrecognized argument
+/// dot-command that toggles a boolean setting — `.header`, `.timer`, and
+/// `.echo`. The outer `Option` is `None` for an unrecognized argument
 /// (any word but `on`/`off`), which the caller maps to an error; the inner
 /// `Option` is `None` for a bare command with no argument at all, meaning
 /// "report the current state" rather than change it.
@@ -566,14 +575,15 @@ enum DotOutcome {
 ///
 /// stdout/stderr policy: reference/inspection output (`.help`, `.schema`,
 /// `.settings`, `.query list`, and `.format`'s/`.style`'s/`.header`'s/
-/// `.timer`'s reports of the current format/style/header/timer setting) goes
-/// to stdout; the `.reload`/`.refresh`/`.refresh-all` reports, `.set`/`.unset`
-/// confirmations, `.output`'s confirmation, `.query save`'s confirmation, and
-/// all error messages (unknown command, bad format, bad style, bad key,
-/// missing argument, unknown saved-query name) go to stderr, keeping stdout
-/// clean for piping. `.query run <name>`'s query results follow a typed
-/// statement's own policy instead — the rendered result goes wherever `sink`
-/// points, and the `-- N rows` line stays on stderr (see [`run_statement`]).
+/// `.timer`'s/`.echo`'s reports of the current format/style/header/timer/echo
+/// setting) goes to stdout; the `.reload`/`.refresh`/`.refresh-all` reports,
+/// `.set`/`.unset` confirmations, `.output`'s confirmation, `.query save`'s
+/// confirmation, and all error messages (unknown command, bad format, bad
+/// style, bad key, missing argument, unknown saved-query name) go to stderr,
+/// keeping stdout clean for piping. `.query run <name>`'s query results
+/// follow a typed statement's own policy instead — the rendered result goes
+/// wherever `sink` points, and the `-- N rows` line stays on stderr (see
+/// [`run_statement`]).
 ///
 /// `last_sql` is the last successfully-run statement's SQL this session (see
 /// [`run`]'s `last_sql` local), threaded through purely so `.query save` with
@@ -599,6 +609,10 @@ fn dispatch_dot(
         DotCommand::Timer(Some(on)) => session.set_timer(on),
         DotCommand::Timer(None) => {
             println!("timer: {}", if session.timer() { "on" } else { "off" });
+        }
+        DotCommand::Echo(Some(on)) => session.set_echo(on),
+        DotCommand::Echo(None) => {
+            println!("echo: {}", if session.echo() { "on" } else { "off" });
         }
         DotCommand::Output(target) => apply_output(sink, target),
         DotCommand::Reload => {
@@ -940,6 +954,10 @@ fn help_text() -> String {
     let _ = writeln!(
         text,
         "  .timer [on|off]    show, or set, whether the row-count line shows elapsed query time"
+    );
+    let _ = writeln!(
+        text,
+        "  .echo [on|off]     show, or set, whether each statement is echoed before its result"
     );
     let _ = writeln!(
         text,
@@ -1494,6 +1512,25 @@ mod tests {
         );
     }
 
+    /// `.echo` parses exactly like `.header`/`.timer` — `parse_on_off`'s
+    /// shared boolean-toggle handling.
+    #[test]
+    fn parses_echo_on_off_and_report() {
+        assert_eq!(parse_dot(".echo on"), DotCommand::Echo(Some(true)));
+        assert_eq!(parse_dot(".echo off"), DotCommand::Echo(Some(false)));
+        assert_eq!(parse_dot(".echo"), DotCommand::Echo(None));
+    }
+
+    /// An unrecognized `.echo` argument is `Unknown`, matching `.header`'s
+    /// bad-argument handling (see `header_bad_arg_is_unknown_command` above).
+    #[test]
+    fn echo_bad_arg_is_unknown_command() {
+        assert_eq!(
+            parse_dot(".echo maybe"),
+            DotCommand::Unknown(".echo maybe".to_string())
+        );
+    }
+
     #[test]
     fn dot_commands_parse() {
         assert!(matches!(parse_dot(".help"), DotCommand::Help));
@@ -1695,6 +1732,25 @@ mod tests {
             DotOutcome::Continue
         );
         assert!(!session.header());
+    }
+
+    /// `dispatch_dot` wires `.echo on` through to `Session::set_echo` — echo
+    /// defaults to off, so this also proves the dispatch actually flips it
+    /// rather than a coincidence (mirrors `dispatch_header_off_sets_session`
+    /// above).
+    #[test]
+    fn dispatch_echo_on_sets_session() {
+        let td = tempdir().unwrap();
+        fs::write(td.path().join("a.md"), "---\nstatus: draft\n---\n").unwrap();
+        let mut session = query_cmd_test_session(td.path());
+        assert!(!session.echo(), "echo must default to off");
+        let mut sink = OutputSink::Stdout;
+
+        assert_eq!(
+            dispatch_dot(DotCommand::Echo(Some(true)), &mut session, &mut sink, None),
+            DotOutcome::Continue
+        );
+        assert!(session.echo());
     }
 
     /// An unrecognized `.query` action word is `BadQueryAction` (reported as
