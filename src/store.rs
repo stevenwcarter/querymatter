@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use crate::cache::{self, CachedDir, CachedFile, Freshness, ScanResult};
+use crate::cache::{self, CachedDir, CachedFile, Freshness, RelPath, ScanResult};
 use crate::discover::{self, WalkOpts};
 use crate::model::{FileAttr, Record};
 use crate::parallel;
@@ -280,7 +280,7 @@ impl InMemoryStore {
                     .map(|name| (name.to_string(), record.field(&[name.into()])))
                     .collect();
                 by_dir.entry(dir).or_default().push(CachedFile {
-                    rel_path,
+                    rel_path: RelPath::from_scan(rel_path),
                     mtime: SystemTime::UNIX_EPOCH,
                     size: 0,
                     fields,
@@ -802,7 +802,7 @@ mod tests {
         let persisted_status = loaded
             .iter()
             .flat_map(|dir| &dir.files)
-            .find(|file| file.rel_path == "a.md")
+            .find(|file| file.rel_path.as_str() == "a.md")
             .and_then(|file| file.fields.get("status").cloned())
             .expect("a.md not found in persisted cache");
         assert_eq!(
@@ -890,7 +890,7 @@ mod tests {
         let persisted_status = loaded
             .iter()
             .flat_map(|dir| &dir.files)
-            .find(|file| file.rel_path == "a.md")
+            .find(|file| file.rel_path.as_str() == "a.md")
             .and_then(|file| file.fields.get("status").cloned())
             .expect("a.md not found in persisted cache");
         assert_eq!(

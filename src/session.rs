@@ -1065,7 +1065,7 @@ mod tests {
         let persisted = loaded
             .iter()
             .flat_map(|dir| &dir.files)
-            .find(|file| file.rel_path == "a.md")
+            .find(|file| file.rel_path.as_str() == "a.md")
             .and_then(|file| file.fields.get("status").cloned())
             .expect("a.md not found in persisted cache");
         assert_eq!(

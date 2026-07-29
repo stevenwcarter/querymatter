@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
-use std::{fs, io};
+use std::{fmt, fs, io};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -46,12 +46,97 @@ pub const MAGIC: [u8; 4] = *b"QMDB";
 /// into a shifted `CachedFile`.
 pub const SCHEMA_VERSION: u32 = 3;
 
+/// A [`CachedFile::rel_path`], relative to its [`CachedDir::dir`] — the
+/// vault-traversal guard as a type rather than a check scattered across
+/// every join site (Task 7/T6). Constructing one already rejects an escape
+/// attempt (`..`, an absolute path, a Windows drive prefix), so a
+/// `CachedFile` can never hold an unsafe `rel_path` in the first place, and
+/// [`RelPath::resolve`] is the only place a `rel_path` is ever joined onto a
+/// directory — no other call site re-derives that join.
+///
+/// Wire-compatible with the plain `String` it replaces: [`Serialize`]
+/// delegates straight to the inner string, and [`Deserialize`] parses it the
+/// same way [`RelPath::parse`] would, so an old cache blob still decodes and
+/// a poisoned one (a crafted string that would escape its directory) fails
+/// to decode instead of being silently trusted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelPath(String);
+
+impl RelPath {
+    /// Parses `s` as a `rel_path`: rejects any component that could escape
+    /// the directory it will be joined onto (`Component::ParentDir`,
+    /// `RootDir`, or `Prefix`), silently drops a harmless `Component::CurDir`
+    /// (`./`), and stores the normalized result — the same component scan
+    /// the old `contained_path` helper ran at every join, now run once here.
+    pub fn parse(s: &str) -> Option<RelPath> {
+        let mut normalized = PathBuf::new();
+        for component in Path::new(s).components() {
+            match component {
+                Component::Normal(part) => normalized.push(part),
+                Component::CurDir => {}
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+            }
+        }
+        Some(RelPath(normalized.to_string_lossy().into_owned()))
+    }
+
+    /// Infallible construction for [`scan_file`]'s `strip_prefix`-derived
+    /// `rel_path`: its input is always a suffix of a real, already-scanned
+    /// filesystem path relative to `dir`, never untrusted data, so it can't
+    /// hold an escaping component to reject.
+    pub(crate) fn from_scan(rel: String) -> RelPath {
+        RelPath(rel)
+    }
+
+    /// Joins `self` onto `dir` — the only place a [`CachedFile::rel_path`]
+    /// becomes a filesystem path. Infallible: `self` was already validated
+    /// by [`RelPath::parse`]/[`RelPath::from_scan`], so the result can never
+    /// escape `dir`; the `starts_with` check is belt-and-suspenders kept as
+    /// a `debug_assert!` rather than a runtime `Option`, since it can't fail
+    /// on an already-parsed value.
+    pub fn resolve(&self, dir: &DirPath) -> PathBuf {
+        let joined = dir.join(&self.0);
+        debug_assert!(
+            joined.starts_with(dir),
+            "RelPath {:?} resolved outside {}",
+            self.0,
+            dir.display()
+        );
+        joined
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for RelPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Serialize for RelPath {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for RelPath {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        RelPath::parse(&s).ok_or_else(|| {
+            serde::de::Error::custom(format!("rel_path escapes its directory: {s:?}"))
+        })
+    }
+}
+
 /// One cached Markdown file: its frontmatter fields plus enough metadata
 /// (`mtime`, `size`, `word_count`) to detect that it has changed on disk and
 /// to answer `file.*` pseudo-columns without re-reading the file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CachedFile {
-    pub rel_path: String,
+    pub rel_path: RelPath,
     pub mtime: SystemTime,
     pub size: u64,
     pub fields: IndexMap<String, Value>,
@@ -521,11 +606,12 @@ pub fn scan_file(dir: &DirPath, path: &FilePath, max_file_bytes: u64) -> ScanRes
     };
     match frontmatter::extract(&content) {
         Extract::Fields { fields, word_count } => ScanResult::Cached(CachedFile {
-            rel_path: path
-                .strip_prefix(dir)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .into_owned(),
+            rel_path: RelPath::from_scan(
+                path.strip_prefix(dir)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
             mtime,
             size,
             fields,
@@ -616,7 +702,7 @@ fn refresh_per_file(
             cached_dir
                 .files
                 .iter()
-                .map(move |file| (cached_dir.dir.join(&file.rel_path), file))
+                .map(move |file| (file.rel_path.resolve(&cached_dir.dir), file))
         })
         .collect();
 
@@ -759,7 +845,7 @@ fn refresh_fast(
             cached_dir
                 .files
                 .iter()
-                .map(move |file| (cached_dir.dir.join(&file.rel_path), file))
+                .map(move |file| (file.rel_path.resolve(&cached_dir.dir), file))
         })
         .collect();
 
@@ -836,35 +922,6 @@ fn content_equal(a: &[CachedDir], b: &[CachedDir]) -> bool {
     normalize(a) == normalize(b)
 }
 
-/// Lexically resolves `dir.join(rel_path)`, rejecting any `rel_path` that
-/// could escape `dir` — the guard between a poisoned on-disk cache blob (a
-/// crafted-but-well-formed [`CachedFile::rel_path`] such as
-/// `../../../../etc/passwd`) and [`records_from`] handing back a `Record`
-/// whose `abs_path` reads outside the vault (B6). `load_cache_under` only
-/// rejects a bad `MAGIC`/version header, not a malicious-but-validly-shaped
-/// blob, so this check has to happen here, at the point a `Record`'s
-/// filesystem path is actually built.
-///
-/// Rejects an absolute path and any `..`/root/prefix [`Component`]; a
-/// leading/embedded `.` component is harmless and stripped. Deliberately
-/// lexical only — it never canonicalizes or otherwise touches the
-/// filesystem, since canonicalizing could itself follow a symlink, and the
-/// goal is to reject traversal in the *stored* data, not resolve it.
-/// `starts_with` is a belt-and-suspenders check on top of the component
-/// scan, not the primary defense.
-fn contained_path(dir: &DirPath, rel_path: &str) -> Option<PathBuf> {
-    let mut normalized = PathBuf::new();
-    for component in Path::new(rel_path).components() {
-        match component {
-            Component::Normal(part) => normalized.push(part),
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
-        }
-    }
-    let joined = dir.join(&normalized);
-    joined.starts_with(dir).then_some(joined)
-}
-
 /// [`records_from`]'s per-directory result: the directory's own path, the
 /// `Record`s reconstructed under it, and the full frontmatter field-name
 /// union read from it (see [`records_from`]'s doc comment for what that
@@ -873,8 +930,8 @@ fn contained_path(dir: &DirPath, rel_path: &str) -> Option<PathBuf> {
 type RecordsByDir = Vec<(PathBuf, Vec<Record>, BTreeSet<String>)>;
 
 /// Reconstructs [`Record`]s from cached directories for querying, grouped
-/// by directory, alongside a [`LoadReport`] of any [`CachedFile`] rejected
-/// as unsafe (see [`contained_path`]).
+/// by directory, alongside a [`LoadReport`] for interface parity with the
+/// live-scan path — see below for why it's always empty in practice.
 ///
 /// `root` is the overall scan root — passing it (rather than each
 /// [`CachedDir::dir`]) is what keeps the cache-equals-live invariant intact,
@@ -894,20 +951,20 @@ type RecordsByDir = Vec<(PathBuf, Vec<Record>, BTreeSet<String>)>;
 /// which write it, run over every field), so a later query for a different
 /// field still finds it here.
 ///
-/// Every `CachedFile::rel_path` is checked via [`contained_path`] before it
-/// becomes a `Record`: an entry whose `rel_path` would escape `cached_dir.dir`
-/// (B6 — a poisoned cache blob planted by a malicious vault) is skipped
-/// entirely, with a warning pushed onto the returned [`LoadReport`] naming
-/// it, rather than silently dropped — consistent with how every other skip
-/// (unreadable file, invalid frontmatter) is surfaced. A skipped file's
-/// fields never contribute to the returned field-name union either, since it
-/// is treated as untrusted, not merely stale.
+/// Every `CachedFile::rel_path` is a [`RelPath`], already validated at parse
+/// time (B6): [`RelPath::resolve`] can't produce a path outside
+/// `cached_dir.dir`, so unlike the pre-[`RelPath`] version of this function,
+/// there is nothing left to reject here. A poisoned on-disk blob (a crafted
+/// `rel_path` that would have escaped its directory) instead fails to decode
+/// at all — [`load_cache_under`]'s existing "a blob that fails to decode is
+/// skipped, its directory simply absent" handling is what now guards against
+/// it, one directory at a time rather than one file at a time.
 pub fn records_from(
     root: &VaultRoot,
     dirs: &[CachedDir],
     wanted: Option<&BTreeSet<String>>,
 ) -> (RecordsByDir, LoadReport) {
-    let mut report = LoadReport::default();
+    let report = LoadReport::default();
     let entries = dirs
         .iter()
         .map(|cached_dir| {
@@ -915,16 +972,8 @@ pub fn records_from(
             let records = cached_dir
                 .files
                 .iter()
-                .filter_map(|file| {
-                    let Some(path) = contained_path(&cached_dir.dir, &file.rel_path) else {
-                        report.skipped += 1;
-                        report.warnings.push(format!(
-                            "{}: rejected cached rel_path {:?} escaping the vault",
-                            cached_dir.dir.display(),
-                            file.rel_path
-                        ));
-                        return None;
-                    };
+                .map(|file| {
+                    let path = file.rel_path.resolve(&cached_dir.dir);
                     field_names.extend(file.fields.keys().cloned());
                     let fields = match wanted {
                         None => file.fields.clone(),
@@ -935,14 +984,14 @@ pub fn records_from(
                             .map(|(name, value)| (name.clone(), value.clone()))
                             .collect(),
                     };
-                    Some(Record::new(
+                    Record::new(
                         root,
                         &FilePath::new(path),
                         fields,
                         file.mtime,
                         file.size,
                         file.word_count,
-                    ))
+                    )
                 })
                 .collect();
             (cached_dir.dir.to_path_buf(), records, field_names)
@@ -1104,7 +1153,7 @@ mod tests {
             scanned_at: UNIX_EPOCH + Duration::from_secs(1000),
             dir_mtime: UNIX_EPOCH + Duration::from_secs(900),
             files: vec![CachedFile {
-                rel_path: "a.md".into(),
+                rel_path: RelPath::parse("a.md").unwrap(),
                 mtime: UNIX_EPOCH + Duration::from_secs(800),
                 size: 42,
                 fields: f,
@@ -1154,6 +1203,28 @@ mod tests {
         };
         assert_eq!(encode(&new), encode(&old));
     }
+    /// Pin: `RelPath` must encode exactly as the `String` it wraps (a
+    /// `serde(transparent)`-style encoding), so cache blobs written before
+    /// `RelPath` existed still decode and `SCHEMA_VERSION` stays untouched.
+    #[test]
+    fn relpath_bincode_layout_matches_plain_string() {
+        assert_eq!(
+            encode(&RelPath::parse("notes/a.md").unwrap()),
+            encode(&"notes/a.md".to_string()),
+        );
+    }
+
+    /// Pin: a `rel_path` that escapes its directory (`..`) is rejected both
+    /// by `RelPath::parse` directly and by `RelPath`'s custom `Deserialize`
+    /// when decoding a raw `String` blob that was never validated — the
+    /// traversal check is the constructor now, not a separate join-time scan.
+    #[test]
+    fn relpath_with_parent_traversal_fails_to_decode() {
+        let poisoned = encode(&"../escape.md".to_string());
+        assert!(decode::<RelPath>(&poisoned).is_none());
+        assert!(RelPath::parse("../escape.md").is_none());
+    }
+
     #[test]
     fn manifest_header_roundtrips() {
         let body = ManifestBody {
@@ -1530,7 +1601,7 @@ mod tests {
     fn cached_status(dirs: &[CachedDir], file_name: &str) -> Value {
         dirs.iter()
             .flat_map(|d| &d.files)
-            .find(|f| f.rel_path == file_name)
+            .find(|f| f.rel_path.as_str() == file_name)
             .and_then(|f| f.fields.get("status").cloned())
             .expect("file not found in cache")
     }
@@ -1539,7 +1610,7 @@ mod tests {
     fn all_rel_paths(dirs: &[CachedDir]) -> Vec<String> {
         let mut names: Vec<String> = dirs
             .iter()
-            .flat_map(|d| d.files.iter().map(|f| f.rel_path.clone()))
+            .flat_map(|d| d.files.iter().map(|f| f.rel_path.to_string()))
             .collect();
         names.sort();
         names
@@ -1848,78 +1919,76 @@ mod tests {
         assert_eq!(&cached_records[0], live_records[0]);
     }
 
-    /// B6 (security, high risk): a poisoned on-disk cache blob can carry a
-    /// `CachedFile::rel_path` that escapes the vault — `load_cache_under`
-    /// only guards against corruption (a bad MAGIC/version header), not
-    /// malice, so a crafted-but-well-formed blob decodes fine. Crafting a
-    /// real bincode blob is impractical, so this constructs the `CachedDir`
-    /// directly (matching the real field names) with a traversal `rel_path`
-    /// alongside a legitimate nested one, and characterizes `records_from`'s
-    /// behavior: the traversal entry must NOT become a `Record` (today it
-    /// does, pointing outside the vault via `Record::abs_path`), while the
-    /// legitimate nested entry must still load (INV-4 cache round-trip).
+    /// B6 (security, high risk), relocated: the traversal check used to run
+    /// inside `records_from` (via the old `contained_path` helper), so a
+    /// malicious `CachedFile` could be built directly in memory to
+    /// characterize its rejection. `RelPath` makes that state
+    /// unrepresentable — `CachedFile { rel_path: RelPath, .. }` can't hold an
+    /// escaping path at all — so the only way left to observe rejection is
+    /// through the real wire format: this crafts a `CachedDir`-shaped blob
+    /// (same field layout, `rel_path` still a plain `String`) the way a
+    /// malicious/corrupted file on disk would be, and confirms it fails to
+    /// decode as a whole — including the legitimate sibling file alongside
+    /// it. `load_cache_under`'s existing "a blob that fails to decode is
+    /// skipped, its directory simply absent" handling (see its doc comment)
+    /// is what now guards against this on the real load path: the poisoned
+    /// directory is silently dropped and re-scanned live, which can only
+    /// ever produce a legitimate `rel_path` (`scan_file`'s
+    /// `strip_prefix`-derived construction never nests a `..`).
     #[test]
-    fn records_from_rejects_path_traversal_rel_path() {
-        let td = TempDir::new().unwrap();
-        let vault = td.path();
+    fn poisoned_rel_path_fails_whole_directory_blob_decode() {
+        #[derive(serde::Serialize)]
+        struct PoisonedFile<'a> {
+            rel_path: &'a str,
+            mtime: SystemTime,
+            size: u64,
+            fields: &'a IndexMap<String, Value>,
+            word_count: usize,
+        }
+        #[derive(serde::Serialize)]
+        struct PoisonedDir<'a> {
+            dir: &'a Path,
+            scanned_at: SystemTime,
+            dir_mtime: SystemTime,
+            files: Vec<PoisonedFile<'a>>,
+        }
 
-        let malicious = CachedFile {
-            rel_path: "../../../../etc/passwd".into(),
-            mtime: UNIX_EPOCH,
-            size: 0,
-            fields: IndexMap::new(),
-            word_count: 0,
-        };
-        let legitimate = CachedFile {
-            rel_path: "a/b.md".into(),
-            mtime: UNIX_EPOCH,
-            size: 0,
-            fields: IndexMap::new(),
-            word_count: 0,
-        };
-        let cached_dir = CachedDir {
-            dir: DirPath::new(vault.to_path_buf()),
+        let empty_fields = IndexMap::new();
+        let poisoned = PoisonedDir {
+            dir: Path::new("/v/plans"),
             scanned_at: UNIX_EPOCH,
             dir_mtime: UNIX_EPOCH,
-            files: vec![malicious, legitimate],
+            files: vec![
+                PoisonedFile {
+                    rel_path: "../../../../etc/passwd",
+                    mtime: UNIX_EPOCH,
+                    size: 0,
+                    fields: &empty_fields,
+                    word_count: 0,
+                },
+                PoisonedFile {
+                    rel_path: "a/b.md",
+                    mtime: UNIX_EPOCH,
+                    size: 0,
+                    fields: &empty_fields,
+                    word_count: 0,
+                },
+            ],
         };
 
-        let (entries, report) =
-            records_from(&VaultRoot::new(vault.to_path_buf()), &[cached_dir], None);
-        let records: Vec<Record> = entries
-            .into_iter()
-            .flat_map(|(_, records, _field_names)| records)
-            .collect();
-
+        let bytes = encode(&poisoned);
         assert!(
-            !records.iter().any(|r| r.abs_path().ends_with("etc/passwd")),
-            "a traversal rel_path must never become a Record pointing outside the vault, got {records:?}"
-        );
-        assert_eq!(
-            records.len(),
-            1,
-            "only the legitimate nested rel_path should survive, got {records:?}"
-        );
-        assert_eq!(records[0].abs_path(), vault.join("a/b.md").as_path());
-
-        assert_eq!(
-            report.skipped, 1,
-            "the rejected traversal entry must be counted as a skip"
-        );
-        assert!(
-            report
-                .warnings
-                .iter()
-                .any(|w| w.contains("../../../../etc/passwd")),
-            "the skip must be observable via a LoadReport warning naming the rel_path, got {:?}",
-            report.warnings
+            decode::<CachedDir>(&bytes).is_none(),
+            "a poisoned rel_path anywhere in the blob must fail the whole CachedDir decode, \
+             even alongside an otherwise-legitimate sibling file"
         );
     }
 
     /// B6 positive case: a `rel_path` nested several levels deep (`a/b/c.md`)
     /// is exactly the shape a legitimate scan produces for a subdirectory
-    /// file (INV-4, cache round-trip) and must still load — the containment
-    /// check must not reject ordinary nesting, only actual escapes.
+    /// file (INV-4, cache round-trip) and must still load — `RelPath::parse`
+    /// must not reject ordinary nesting, only actual escapes, and
+    /// `records_from` must resolve it to the right `Record`.
     #[test]
     fn records_from_still_loads_legitimate_nested_rel_path() {
         let td = TempDir::new().unwrap();
@@ -1930,7 +1999,7 @@ mod tests {
             scanned_at: UNIX_EPOCH,
             dir_mtime: UNIX_EPOCH,
             files: vec![CachedFile {
-                rel_path: "a/b/c.md".into(),
+                rel_path: RelPath::parse("a/b/c.md").unwrap(),
                 mtime: UNIX_EPOCH,
                 size: 0,
                 fields: IndexMap::new(),
@@ -1938,7 +2007,7 @@ mod tests {
             }],
         };
 
-        let (entries, report) =
+        let (entries, _report) =
             records_from(&VaultRoot::new(vault.to_path_buf()), &[cached_dir], None);
         let records: Vec<Record> = entries
             .into_iter()
@@ -1947,41 +2016,17 @@ mod tests {
 
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].abs_path(), vault.join("a/b/c.md").as_path());
-        assert_eq!(report.skipped, 0);
-        assert!(report.warnings.is_empty());
     }
 
     /// B6: an absolute `rel_path` (no `..` needed at all) must be rejected
-    /// the same way a `..`-relative traversal is — [`contained_path`] checks
+    /// the same way a `..`-relative traversal is — `RelPath::parse` checks
     /// via [`Component`] matching, not string-matching for `..`, so this
-    /// pins that an absolute path is caught too.
+    /// pins that an absolute path is caught too. Relocated from
+    /// `records_from` (see [`poisoned_rel_path_fails_whole_directory_blob_decode`]):
+    /// the check is now `RelPath::parse`'s alone.
     #[test]
-    fn records_from_rejects_absolute_rel_path() {
-        let td = TempDir::new().unwrap();
-        let vault = td.path();
-
-        let cached_dir = CachedDir {
-            dir: DirPath::new(vault.to_path_buf()),
-            scanned_at: UNIX_EPOCH,
-            dir_mtime: UNIX_EPOCH,
-            files: vec![CachedFile {
-                rel_path: "/etc/passwd".into(),
-                mtime: UNIX_EPOCH,
-                size: 0,
-                fields: IndexMap::new(),
-                word_count: 0,
-            }],
-        };
-
-        let (entries, report) =
-            records_from(&VaultRoot::new(vault.to_path_buf()), &[cached_dir], None);
-        let records: Vec<Record> = entries
-            .into_iter()
-            .flat_map(|(_, records, _field_names)| records)
-            .collect();
-
-        assert!(records.is_empty(), "got {records:?}");
-        assert_eq!(report.skipped, 1);
+    fn relpath_rejects_absolute_path() {
+        assert!(RelPath::parse("/etc/passwd").is_none());
     }
 
     /// Every directory's `rel_path`s, in the order they appear in `dirs` and
@@ -1993,7 +2038,7 @@ mod tests {
             .map(|d| {
                 (
                     d.dir.to_path_buf(),
-                    d.files.iter().map(|f| f.rel_path.clone()).collect(),
+                    d.files.iter().map(|f| f.rel_path.to_string()).collect(),
                 )
             })
             .collect()
@@ -2037,7 +2082,7 @@ mod tests {
                     by_dir
                         .entry(parent.to_path_buf())
                         .or_default()
-                        .push(file.rel_path);
+                        .push(file.rel_path.to_string());
                 }
                 ScanResult::NoFrontmatter => {}
                 ScanResult::Warning(msg) => warnings.push(msg),
