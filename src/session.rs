@@ -1061,7 +1061,7 @@ mod tests {
             "the in-memory view must reflect the edit"
         );
 
-        let (_body, loaded) = cache::load_cache(td.path()).unwrap();
+        let (_body, loaded, _warnings) = cache::load_cache(td.path()).unwrap();
         let persisted = loaded
             .iter()
             .flat_map(|dir| &dir.files)

@@ -179,15 +179,34 @@ impl InMemoryStore {
         wanted: Option<&BTreeSet<String>>,
         scope: Option<&[PathBuf]>,
     ) -> (Self, LoadReport) {
-        let (cached, ttl_secs, incompatible) = match cache::load_cache_under(vault, scope) {
-            Some((body, dirs)) => (dirs, body.ttl_secs, false),
-            // A `None` with a manifest present means it's unreadable; without
-            // one it's simply a fresh/absent cache (stay silent).
-            None => (Vec::new(), DEFAULT_TTL_SECS, cache::manifest_exists(vault)),
-        };
+        let (cached, ttl_secs, incompatible, blob_warnings) =
+            match cache::load_cache_under(vault, scope) {
+                Some((body, dirs, warnings)) => (dirs, body.ttl_secs, false, warnings),
+                // A `None` with a manifest present means it's unreadable; without
+                // one it's simply a fresh/absent cache (stay silent).
+                None => (
+                    Vec::new(),
+                    DEFAULT_TTL_SECS,
+                    cache::manifest_exists(vault),
+                    Vec::new(),
+                ),
+            };
 
-        let (fresh, mut report, changed) =
+        let (fresh, refresh_report, changed) =
             cache::refresh_against_cache_scoped(vault, &cached, &opts, mode, ttl_secs, scope);
+
+        // Task 7/T6: a per-directory blob that failed to decode (e.g. a
+        // poisoned `rel_path`, B6) is silently absent from `cached` above —
+        // `blob_warnings` is what turns that into a skip + warning, seeded
+        // BEFORE `refresh_report` is merged in so it survives every
+        // `Freshness` mode, including `ForceCache` (whose own `LoadReport`
+        // is always empty — it does no filesystem work of its own).
+        let mut report = LoadReport {
+            skipped: blob_warnings.len(),
+            warnings: blob_warnings,
+            ..LoadReport::default()
+        };
+        report.merge(refresh_report);
 
         if incompatible {
             report.warnings.insert(
@@ -207,8 +226,7 @@ impl InMemoryStore {
             report.warnings.push(format!("saving cache: {err}"));
         }
 
-        let (slices, slices_report) = slices_from_cached(vault, &fresh, wanted);
-        report.merge(slices_report);
+        let slices = slices_from_cached(vault, &fresh, wanted);
         (InMemoryStore { slices, opts }, report)
     }
 
@@ -302,11 +320,10 @@ impl InMemoryStore {
 }
 
 /// Builds one [`DirSlice`] per cached directory in `dirs` via
-/// [`cache::records_from`], stamping each with the current time, alongside
-/// the [`LoadReport`] [`cache::records_from`] returns (e.g. any `CachedFile`
-/// rejected as an unsafe cached `rel_path` — B6). Shared by
-/// [`InMemoryStore::from_cache`] and [`RecordStore::refresh`], both of
-/// which rebuild the store's slices from a freshly refreshed `Vec<CachedDir>`.
+/// [`cache::records_from`] (infallible — see its doc comment), stamping each
+/// with the current time. Shared by [`InMemoryStore::from_cache`] and
+/// [`RecordStore::refresh`], both of which rebuild the store's slices from a
+/// freshly refreshed `Vec<CachedDir>`.
 ///
 /// `wanted` is forwarded straight to [`cache::records_from`] — see its doc
 /// comment for what it prunes and why `schema()` stays complete regardless.
@@ -314,10 +331,9 @@ fn slices_from_cached(
     vault: &VaultRoot,
     dirs: &[CachedDir],
     wanted: Option<&BTreeSet<String>>,
-) -> (Vec<DirSlice>, LoadReport) {
+) -> Vec<DirSlice> {
     let now = SystemTime::now();
-    let (entries, report) = cache::records_from(vault, dirs, wanted);
-    let slices = entries
+    cache::records_from(vault, dirs, wanted)
         .into_iter()
         .map(|(root, records, field_names)| DirSlice {
             root,
@@ -325,8 +341,7 @@ fn slices_from_cached(
             scanned_at: now,
             field_names,
         })
-        .collect();
-    (slices, report)
+        .collect()
 }
 
 impl RecordStore for InMemoryStore {
@@ -399,24 +414,37 @@ impl RecordStore for InMemoryStore {
     /// [`cached_dirs_from_slices`](InMemoryStore::cached_dirs_from_slices)'s
     /// doc comment for why that invariant matters here.
     fn refresh(&mut self, vault: &VaultRoot, subtree: Option<&Path>) -> LoadReport {
-        let (mut cached, ttl_secs) = match cache::load_cache(vault) {
-            Some((body, dirs)) => (dirs, body.ttl_secs),
-            None => (self.cached_dirs_from_slices(), DEFAULT_TTL_SECS),
+        let (mut cached, ttl_secs, blob_warnings) = match cache::load_cache(vault) {
+            Some((body, dirs, warnings)) => (dirs, body.ttl_secs, warnings),
+            None => (self.cached_dirs_from_slices(), DEFAULT_TTL_SECS, Vec::new()),
         };
 
         // `None` (whole-vault) re-scans every directory under `vault` by using
         // `vault` itself as the subtree, matching the forced re-parse a
         // `Some(subtree)` already performs.
         let subtree = subtree.unwrap_or(vault);
-        let mut report = cache::refresh_subtree(vault, &mut cached, subtree, &self.opts);
+        // Task 7/T6: a directory whose blob failed to decode is silently
+        // absent from `cached` above; if it lies outside `subtree`,
+        // `refresh_subtree` never re-derives it (directories outside the
+        // requested subtree are left untouched), so this seeds the report
+        // with that loss before merging in the forced re-parse's own report.
+        let mut report = LoadReport {
+            skipped: blob_warnings.len(),
+            warnings: blob_warnings,
+            ..LoadReport::default()
+        };
+        report.merge(cache::refresh_subtree(
+            vault,
+            &mut cached,
+            subtree,
+            &self.opts,
+        ));
 
         if let Err(err) = cache::save_cache(vault, &cached, ttl_secs) {
             report.warnings.push(format!("saving cache: {err}"));
         }
 
-        let (slices, slices_report) = slices_from_cached(vault, &cached, None);
-        self.slices = slices;
-        report.merge(slices_report);
+        self.slices = slices_from_cached(vault, &cached, None);
         report
     }
 }
@@ -798,7 +826,7 @@ mod tests {
             "in-memory records must reflect the edit"
         );
 
-        let (_body, loaded) = cache::load_cache(td.path()).unwrap();
+        let (_body, loaded, _warnings) = cache::load_cache(td.path()).unwrap();
         let persisted_status = loaded
             .iter()
             .flat_map(|dir| &dir.files)
@@ -886,7 +914,7 @@ mod tests {
             "ForceCache must never re-read the changed file"
         );
 
-        let (_body, loaded) = cache::load_cache(td.path()).unwrap();
+        let (_body, loaded, _warnings) = cache::load_cache(td.path()).unwrap();
         let persisted_status = loaded
             .iter()
             .flat_map(|dir| &dir.files)
@@ -897,6 +925,101 @@ mod tests {
             persisted_status,
             Value::Str("draft".into()),
             "ForceCache must never persist — the on-disk cache stays at the stale value"
+        );
+    }
+
+    /// Task 7/T6, end-to-end: a poisoned `rel_path` on disk (a real bincode
+    /// blob crafted the way a corrupted/malicious cache file would be, NOT
+    /// built in memory — `RelPath` makes that illegal state unrepresentable
+    /// in-process) must surface as exactly one warning naming both the
+    /// directory and the offending `rel_path`, while a legitimate SIBLING
+    /// directory's blob still loads normally. Critically, this must hold
+    /// under `Freshness::ForceCache`: its freshness pass never touches the
+    /// filesystem (`refresh_against_cache_scoped`'s `ForceCache` arm returns
+    /// an always-empty `LoadReport`), so `InMemoryStore::from_cache` has no
+    /// OTHER chance to notice or report the loss — before this fix the
+    /// poisoned directory's legitimate content vanished from every
+    /// `ForceCache` query with zero warning, permanently (nothing ever
+    /// re-scans it under `ForceCache`).
+    #[test]
+    fn poisoned_blob_warns_and_survives_under_force_cache() {
+        let td = TempDir::new().unwrap();
+        write(td.path(), "plans/a.md", "---\nstatus: draft\n---\n");
+        write(td.path(), "notes/b.md", "---\nstatus: final\n---\n");
+        let vault = VaultRoot::new(td.path().to_path_buf());
+        cache::build_vault(&vault, &WalkOpts::default(), 300).unwrap();
+
+        // Clobber notes/'s blob with a real bincode encoding of the same
+        // field layout, but a `rel_path` that escapes the directory — i.e.
+        // exactly what a poisoned/malicious cache blob looks like on the
+        // wire (the technique `cache::tests` already uses for its own
+        // whole-blob-decode-failure pin).
+        let (body, _, _) = cache::load_cache(td.path()).unwrap();
+        let notes_dir = td.path().join("notes");
+        let notes_entry = body.dirs.iter().find(|e| e.dir == notes_dir).unwrap();
+
+        #[derive(serde::Serialize)]
+        struct PoisonedFile<'a> {
+            rel_path: &'a str,
+            mtime: SystemTime,
+            size: u64,
+            fields: indexmap::IndexMap<String, Value>,
+            word_count: usize,
+        }
+        #[derive(serde::Serialize)]
+        struct PoisonedDir<'a> {
+            dir: &'a Path,
+            scanned_at: SystemTime,
+            dir_mtime: SystemTime,
+            files: Vec<PoisonedFile<'a>>,
+        }
+        let poisoned = PoisonedDir {
+            dir: &notes_dir,
+            scanned_at: SystemTime::now(),
+            dir_mtime: SystemTime::now(),
+            files: vec![PoisonedFile {
+                rel_path: "../../../../etc/passwd",
+                mtime: SystemTime::now(),
+                size: 0,
+                fields: indexmap::IndexMap::new(),
+                word_count: 0,
+            }],
+        };
+        let bytes = bincode::serde::encode_to_vec(&poisoned, bincode::config::standard()).unwrap();
+        fs::write(
+            td.path().join(".querymatter").join(&notes_entry.blob),
+            bytes,
+        )
+        .unwrap();
+
+        let (store, report) = InMemoryStore::from_cache(
+            &vault,
+            WalkOpts::default(),
+            Freshness::ForceCache,
+            None,
+            None,
+        );
+
+        let statuses: Vec<Value> = store
+            .records()
+            .map(|r| r.field(&["status".into()]))
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![Value::Str("draft".into())],
+            "plans/a.md must still load even though notes/'s blob is poisoned"
+        );
+
+        assert_eq!(report.skipped, 1, "got {:?}", report.warnings);
+        assert_eq!(report.warnings.len(), 1, "got {:?}", report.warnings);
+        let warning = &report.warnings[0];
+        assert!(
+            warning.contains(&notes_dir.display().to_string()),
+            "the warning must name the dropped directory, got {warning:?}"
+        );
+        assert!(
+            warning.contains("../../../../etc/passwd"),
+            "the warning must name the offending rel_path, got {warning:?}"
         );
     }
 
@@ -925,7 +1048,7 @@ mod tests {
             "from_cache with no prior cache must build correct records via a live scan"
         );
 
-        let (_body, loaded) = cache::load_cache(td.path())
+        let (_body, loaded, _warnings) = cache::load_cache(td.path())
             .expect("from_cache must persist a new cache when none existed");
         assert_eq!(loaded.len(), 2, "one CachedDir per matched directory");
     }

@@ -205,6 +205,18 @@ pub fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Option<T> {
         .ok()
 }
 
+/// The human-readable core of a bincode decode error: for a custom
+/// `Deserialize` rejection (e.g. [`RelPath::deserialize`]'s traversal check)
+/// this is exactly that message, not bincode's `OtherString("...")` debug
+/// wrapper around it; any other decode error falls back to bincode's own
+/// `Display`.
+fn decode_error_message(err: &bincode::error::DecodeError) -> String {
+    match err {
+        bincode::error::DecodeError::OtherString(msg) => msg.clone(),
+        other => other.to_string(),
+    }
+}
+
 /// Writes a `manifest.bin` payload: `MAGIC ++ SCHEMA_VERSION (LE u32) ++
 /// bincode(body)`.
 pub fn write_manifest_bytes(body: &ManifestBody) -> Vec<u8> {
@@ -401,15 +413,36 @@ fn in_scope(path: &Path, scope: Option<&[PathBuf]>) -> bool {
     scope.is_none_or(|dirs| dirs.iter().any(|dir| path.starts_with(dir)))
 }
 
+/// Reads and decodes one manifest entry's blob, or an `Err` naming the
+/// directory and a human-readable reason when the file is unreadable or its
+/// bytes fail to decode — including a poisoned `rel_path` (B6), whose
+/// [`RelPath::deserialize`] rejection message names the offending path.
+/// Either failure is what [`load_cache_under`] turns into one skipped
+/// directory plus one warning, instead of silently dropping it.
+fn read_blob(cache_dir: &Path, entry: &ManifestEntry) -> Result<CachedDir, String> {
+    let blob_path = cache_dir.join(&entry.blob);
+    let bytes = fs::read(&blob_path).map_err(|err| format!("{}: {err}", entry.dir.display()))?;
+    bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+        .map(|(dir, _)| dir)
+        .map_err(|err| {
+            format!(
+                "{}: rejected cached blob — {}",
+                entry.dir.display(),
+                decode_error_message(&err)
+            )
+        })
+}
+
 /// Loads the cache saved by [`save_cache`], or `None` if `vault_dir` has no
 /// usable one: no `manifest.bin`, or one whose header doesn't match
 /// [`MAGIC`]/[`SCHEMA_VERSION`] (see [`read_manifest_bytes`]).
 ///
-/// Each manifest entry's blob is loaded independently; a blob that's
-/// missing or fails to decode is skipped — its directory is simply absent
-/// from the returned `Vec`, and the caller re-scans it — rather than
+/// Each manifest entry's blob is loaded independently via [`read_blob`]; a
+/// blob that's missing or fails to decode is skipped AND warned about (the
+/// returned `Vec<String>`) — its directory is simply absent from the
+/// returned `Vec<CachedDir>`, and the caller re-scans it — rather than
 /// discarding the whole cache over one corrupt file.
-pub fn load_cache(vault_dir: &Path) -> Option<(ManifestBody, Vec<CachedDir>)> {
+pub fn load_cache(vault_dir: &Path) -> Option<(ManifestBody, Vec<CachedDir>, Vec<String>)> {
     load_cache_under(vault_dir, None)
 }
 
@@ -422,25 +455,32 @@ pub fn load_cache(vault_dir: &Path) -> Option<(ManifestBody, Vec<CachedDir>)> {
 ///
 /// `scope` of `None` reads every blob, i.e. exactly [`load_cache`]; the two
 /// share this one implementation. Blob-level fault tolerance is unchanged: a
-/// missing or corrupt in-scope blob is skipped, not fatal.
+/// missing or corrupt in-scope blob is skipped, not fatal — but (Task 7/T6
+/// fix) no longer silent: the returned `Vec<String>` carries one warning per
+/// skipped blob, in manifest order, for the caller to surface (every
+/// production caller folds it into a [`LoadReport`]).
 pub fn load_cache_under(
     vault_dir: &Path,
     scope: Option<&[PathBuf]>,
-) -> Option<(ManifestBody, Vec<CachedDir>)> {
+) -> Option<(ManifestBody, Vec<CachedDir>, Vec<String>)> {
     let cache_dir = vault_dir.join(CACHE_DIR_NAME);
     let manifest_bytes = fs::read(cache_dir.join(MANIFEST_FILE_NAME)).ok()?;
     let body = read_manifest_bytes(&manifest_bytes)?;
 
+    let mut warnings = Vec::new();
     let loaded = body
         .dirs
         .iter()
         .filter(|entry| in_scope(&entry.dir, scope))
-        .filter_map(|entry| {
-            let bytes = fs::read(cache_dir.join(&entry.blob)).ok()?;
-            decode::<CachedDir>(&bytes)
+        .filter_map(|entry| match read_blob(&cache_dir, entry) {
+            Ok(dir) => Some(dir),
+            Err(msg) => {
+                warnings.push(msg);
+                None
+            }
         })
         .collect();
-    Some((body, loaded))
+    Some((body, loaded, warnings))
 }
 
 /// The `.querymatter` cache directory under `vault_dir` (whether or not it
@@ -930,8 +970,8 @@ fn content_equal(a: &[CachedDir], b: &[CachedDir]) -> bool {
 type RecordsByDir = Vec<(PathBuf, Vec<Record>, BTreeSet<String>)>;
 
 /// Reconstructs [`Record`]s from cached directories for querying, grouped
-/// by directory, alongside a [`LoadReport`] for interface parity with the
-/// live-scan path — see below for why it's always empty in practice.
+/// by directory. Infallible — see below for why there's no [`LoadReport`] to
+/// return alongside the records.
 ///
 /// `root` is the overall scan root — passing it (rather than each
 /// [`CachedDir::dir`]) is what keeps the cache-equals-live invariant intact,
@@ -954,19 +994,20 @@ type RecordsByDir = Vec<(PathBuf, Vec<Record>, BTreeSet<String>)>;
 /// Every `CachedFile::rel_path` is a [`RelPath`], already validated at parse
 /// time (B6): [`RelPath::resolve`] can't produce a path outside
 /// `cached_dir.dir`, so unlike the pre-[`RelPath`] version of this function,
-/// there is nothing left to reject here. A poisoned on-disk blob (a crafted
+/// there is nothing left to reject — hence no `LoadReport` in the return
+/// type; a signature that always returned an empty one would lie about what
+/// this function can still fail at. A poisoned on-disk blob (a crafted
 /// `rel_path` that would have escaped its directory) instead fails to decode
-/// at all — [`load_cache_under`]'s existing "a blob that fails to decode is
-/// skipped, its directory simply absent" handling is what now guards against
-/// it, one directory at a time rather than one file at a time.
+/// at all, one whole directory at a time — [`load_cache_under`]'s `Vec<String>`
+/// of per-blob warnings, surfaced by its callers (e.g.
+/// [`crate::store::InMemoryStore::from_cache`]), is where that's reported
+/// now, not here.
 pub fn records_from(
     root: &VaultRoot,
     dirs: &[CachedDir],
     wanted: Option<&BTreeSet<String>>,
-) -> (RecordsByDir, LoadReport) {
-    let report = LoadReport::default();
-    let entries = dirs
-        .iter()
+) -> RecordsByDir {
+    dirs.iter()
         .map(|cached_dir| {
             let mut field_names = BTreeSet::new();
             let records = cached_dir
@@ -996,8 +1037,7 @@ pub fn records_from(
                 .collect();
             (cached_dir.dir.to_path_buf(), records, field_names)
         })
-        .collect();
-    (entries, report)
+        .collect()
 }
 
 /// The `querymatter init` core: a full scan of `base` (there is no previous
@@ -1037,7 +1077,12 @@ pub struct CacheSummary {
 /// call with the context that does, since that's also where the
 /// no-vault-at-all case is worded.
 pub fn cache_summary(vault_dir: &Path) -> anyhow::Result<CacheSummary> {
-    let (body, dirs) = load_cache(vault_dir).context("no readable .querymatter cache found")?;
+    // `_warnings`: `cache status` reports counts/sizes only, not a
+    // `LoadReport` — a per-blob decode-failure warning (Task 7/T6) has
+    // nowhere to surface here today; the query-loading path
+    // (`InMemoryStore::from_cache`) is what carries it to the user.
+    let (body, dirs, _warnings) =
+        load_cache(vault_dir).context("no readable .querymatter cache found")?;
     let file_count = dirs.iter().map(|d| d.files.len()).sum();
 
     let cache = cache_dir(vault_dir);
@@ -1225,6 +1270,23 @@ mod tests {
         assert!(RelPath::parse("../escape.md").is_none());
     }
 
+    /// Fix report MINOR finding #3: pins the exact text
+    /// `RelPath::deserialize`'s rejection produces, and that
+    /// `decode_error_message` (what `load_cache_under`'s per-blob warning is
+    /// built from) extracts it cleanly — not wrapped in bincode's own
+    /// `OtherString("...")` debug formatting.
+    #[test]
+    fn relpath_deserialize_error_message_is_exact() {
+        let poisoned = encode(&"../escape.md".to_string());
+        let err =
+            bincode::serde::decode_from_slice::<RelPath, _>(&poisoned, bincode::config::standard())
+                .unwrap_err();
+        assert_eq!(
+            decode_error_message(&err),
+            r#"rel_path escapes its directory: "../escape.md""#
+        );
+    }
+
     #[test]
     fn manifest_header_roundtrips() {
         let body = ManifestBody {
@@ -1310,9 +1372,10 @@ mod tests {
         let dirs = vec![sample_dir_at(td.path().join("plans"))];
         save_cache(td.path(), &dirs, 300).unwrap();
         assert!(td.path().join(".querymatter/manifest.bin").is_file());
-        let (body, loaded) = load_cache(td.path()).unwrap();
+        let (body, loaded, warnings) = load_cache(td.path()).unwrap();
         assert_eq!(body.ttl_secs, 300);
         assert_eq!(loaded, dirs);
+        assert!(warnings.is_empty());
     }
 
     /// W26 (spec §7): a scoped load reads and decodes ONLY the blobs whose
@@ -1336,16 +1399,17 @@ mod tests {
         save_cache(td.path(), &dirs, 300).unwrap();
 
         let scope = [plans.clone()];
-        let (_body, loaded) = load_cache_under(td.path(), Some(&scope)).unwrap();
+        let (_body, loaded, warnings) = load_cache_under(td.path(), Some(&scope)).unwrap();
         assert_eq!(
             loaded,
             vec![sample_dir_at(plans.clone())],
             "a plans-scoped load must decode only the plans/ blob"
         );
+        assert!(warnings.is_empty());
 
         // Corrupt the product/ blob: a correctly scoped load never reads it,
         // so this is a no-op for a plans-scoped load.
-        let (body, _) = load_cache(td.path()).unwrap();
+        let (body, _, _) = load_cache(td.path()).unwrap();
         let product_entry = body.dirs.iter().find(|e| e.dir == product).unwrap();
         fs::write(
             td.path().join(".querymatter").join(&product_entry.blob),
@@ -1353,11 +1417,15 @@ mod tests {
         )
         .unwrap();
 
-        let (_body, loaded) = load_cache_under(td.path(), Some(&scope)).unwrap();
+        let (_body, loaded, warnings) = load_cache_under(td.path(), Some(&scope)).unwrap();
         assert_eq!(
             loaded,
             vec![sample_dir_at(plans)],
             "a plans-scoped load must succeed and stay plans-only even with a corrupt product/ blob"
+        );
+        assert!(
+            warnings.is_empty(),
+            "the corrupt out-of-scope product/ blob was never read, so it can't warn either"
         );
     }
 
@@ -1372,9 +1440,10 @@ mod tests {
         ];
         save_cache(td.path(), &dirs, 300).unwrap();
 
-        let (_body, loaded) = load_cache_under(td.path(), None).unwrap();
+        let (_body, loaded, warnings) = load_cache_under(td.path(), None).unwrap();
         assert_eq!(loaded.len(), 2, "an unscoped load must decode every blob");
         assert_eq!(load_cache(td.path()).unwrap().1, loaded);
+        assert!(warnings.is_empty());
     }
 
     #[test]
@@ -1395,6 +1464,10 @@ mod tests {
         assert!(load_cache(td.path()).is_none());
     }
 
+    /// Task 7/T6: a blob that fails to decode is skipped (its directory
+    /// simply absent from `loaded`, exactly as before) AND now warned about
+    /// — the drop is loud, not silent, even for ordinary corruption that has
+    /// nothing to do with `RelPath`.
     #[test]
     fn corrupt_blob_skips_only_that_dir() {
         // Save two dirs, then clobber one blob with garbage; load returns
@@ -1404,7 +1477,7 @@ mod tests {
         let bad = sample_dir_at(td.path().join("notes"));
         save_cache(td.path(), &[good.clone(), bad.clone()], 300).unwrap();
 
-        let (body, _) = load_cache(td.path()).unwrap();
+        let (body, _, _) = load_cache(td.path()).unwrap();
         let bad_entry = body
             .dirs
             .iter()
@@ -1416,8 +1489,14 @@ mod tests {
         )
         .unwrap();
 
-        let (_, loaded) = load_cache(td.path()).unwrap();
+        let (_, loaded, warnings) = load_cache(td.path()).unwrap();
         assert_eq!(loaded, vec![good]);
+        assert_eq!(warnings.len(), 1, "got {warnings:?}");
+        assert!(
+            warnings[0].contains(&bad.dir.display().to_string()),
+            "the warning must name the dropped directory, got {:?}",
+            warnings[0]
+        );
     }
 
     #[test]
@@ -1432,8 +1511,13 @@ mod tests {
 
         save_cache(td.path(), &[good.clone(), ancient], 300).unwrap();
 
-        let (_, loaded) = load_cache(td.path()).unwrap();
+        let (_, loaded, warnings) = load_cache(td.path()).unwrap();
         assert_eq!(loaded, vec![good]);
+        assert!(
+            warnings.is_empty(),
+            "the ancient dir was never written to the manifest at all (save_cache's own \
+             skip), so there's no blob for load_cache to warn about"
+        );
     }
 
     /// B14: a save's orphan GC deletes an unreferenced blob (regression test
@@ -1818,8 +1902,9 @@ mod tests {
         assert_eq!(report.loaded, 2);
         assert_eq!(report.skipped, 0);
 
-        let (body, loaded) = load_cache(td.path()).unwrap();
+        let (body, loaded, warnings) = load_cache(td.path()).unwrap();
         assert_eq!(body.ttl_secs, 300);
+        assert!(warnings.is_empty());
         assert_eq!(
             all_rel_paths(&loaded),
             vec!["a.md".to_string(), "b.md".to_string()]
@@ -1903,8 +1988,7 @@ mod tests {
         write_file(td.path(), "plans/a.md", "---\nstatus: draft\n---\n");
 
         let cached = build_initial_cache(td.path());
-        let (entries, _report) =
-            records_from(&VaultRoot::new(td.path().to_path_buf()), &cached, None);
+        let entries = records_from(&VaultRoot::new(td.path().to_path_buf()), &cached, None);
         let cached_records: Vec<Record> = entries
             .into_iter()
             .flat_map(|(_, records, _field_names)| records)
@@ -2007,8 +2091,7 @@ mod tests {
             }],
         };
 
-        let (entries, _report) =
-            records_from(&VaultRoot::new(vault.to_path_buf()), &[cached_dir], None);
+        let entries = records_from(&VaultRoot::new(vault.to_path_buf()), &[cached_dir], None);
         let records: Vec<Record> = entries
             .into_iter()
             .flat_map(|(_, records, _field_names)| records)
