@@ -21,7 +21,7 @@ use rustyline::history::FileHistory;
 use rustyline::{Context as RlContext, Editor, Helper, Highlighter, Hinter, Validator};
 
 use crate::config::ConfigKey;
-use crate::model::Value;
+use crate::model::{FileAttr, Value};
 use crate::output::OutputSink;
 use crate::queries::{self, Queries};
 use crate::render::{Format, TableStyle};
@@ -33,18 +33,6 @@ const PROMPT: &str = "querymatter> ";
 /// Prompt shown while a statement is still accumulating (no `;`, `\g`, or
 /// `\G` yet).
 const CONTINUATION_PROMPT: &str = "   ...> ";
-/// The `file.*` pseudo-columns every record exposes, independent of
-/// frontmatter (kept in sync with [`crate::model::FileAttr`]'s labels).
-const FILE_COLUMNS: [&str; 8] = [
-    "file.name",
-    "file.path",
-    "file.folder",
-    "file.ext",
-    "file.mtime",
-    "file.size",
-    "file.word_count",
-    "file.body",
-];
 /// The history file's name under the REPL's state/data directory.
 const HISTORY_FILE: &str = "history.txt";
 /// The dot-command names, each including its leading `.` — the single source
@@ -1020,7 +1008,7 @@ fn print_schema(session: &Session) {
         println!("  {field}");
     }
     println!("File pseudo-columns:");
-    for column in FILE_COLUMNS {
+    for column in FileAttr::ALL.map(FileAttr::label) {
         println!("  {column}");
     }
     println!("{} record(s) loaded", record_count(session));
@@ -1040,10 +1028,13 @@ fn print_schema(session: &Session) {
 /// neither a frontmatter field nor a `file.*` column is an error, printed to
 /// stderr.
 fn print_describe(session: &Session, field: Option<&str>) {
-    match field {
-        Some(name) if FILE_COLUMNS.contains(&name) => print_describe_file_column(name),
-        Some(name) => print_describe_field(session, name),
-        None => print_describe_all(session),
+    let file_attr = field
+        .and_then(|name| name.strip_prefix("file."))
+        .and_then(FileAttr::from_attr_name);
+    match (file_attr, field) {
+        (Some(attr), _) => print_describe_file_column(attr),
+        (None, Some(name)) => print_describe_field(session, name),
+        (None, None) => print_describe_all(session),
     }
 }
 
@@ -1085,19 +1076,18 @@ fn print_describe_field(session: &Session, name: &str) {
 /// `Int`, every other `file.*` column is `Str` — so there's no coverage or
 /// value tally worth computing — least of all for `file.path`, whose
 /// distinct values are effectively unbounded.
-fn print_describe_file_column(name: &str) {
-    println!("{}", describe_file_column_line(name));
+fn print_describe_file_column(attr: FileAttr) {
+    println!("{}", describe_file_column_line(attr));
 }
 
 /// Builds [`print_describe_file_column`]'s one-line text; split out so the
 /// per-column type note is unit-testable without capturing stdout.
-fn describe_file_column_line(name: &str) -> String {
-    let ty = if matches!(name, "file.size" | "file.word_count") {
-        "Int"
-    } else {
-        "Str"
-    };
-    format!("{name}: (file.*) always present, type {ty}, 100% coverage")
+fn describe_file_column_line(attr: FileAttr) -> String {
+    format!(
+        "{}: (file.*) always present, type {}, 100% coverage",
+        attr.label(),
+        attr.value_kind()
+    )
 }
 
 /// `.describe`'s no-argument summary: one aligned line per frontmatter
@@ -1108,7 +1098,7 @@ fn print_describe_all(session: &Session) {
     let width = report
         .keys()
         .map(String::len)
-        .chain(FILE_COLUMNS.iter().map(|c| c.len()))
+        .chain(FileAttr::ALL.map(|attr| attr.label().len()))
         .max()
         .unwrap_or(0);
 
@@ -1121,7 +1111,7 @@ fn print_describe_all(session: &Session) {
             coverage_pct(stat),
         );
     }
-    for column in FILE_COLUMNS {
+    for column in FileAttr::ALL.map(FileAttr::label) {
         println!("  {column:width$}  (file.*)");
     }
 }
@@ -1319,11 +1309,12 @@ fn filter_prefix_ci<'a>(candidates: impl Iterator<Item = &'a str>, prefix: &str)
 /// the key word of `.set`/`.unset` completes against [`ConfigKey::ALL`]; the
 /// `<name>` argument of `.query run` completes against `query_names`;
 /// anything else — a bare word in SQL position — completes against `schema`
-/// plus [`FILE_COLUMNS`], and never against SQL keywords. This last case is
-/// intentionally approximate (it doesn't parse SQL to know whether a column
-/// name even belongs where the cursor is) but harmless either way: rustyline
-/// only replaces the word when the user actually accepts a candidate, so an
-/// empty or wrong-context result just means nothing is offered.
+/// plus [`FileAttr::ALL`]'s labels, and never against SQL keywords. This last
+/// case is intentionally approximate (it doesn't parse SQL to know whether a
+/// column name even belongs where the cursor is) but harmless either way:
+/// rustyline only replaces the word when the user actually accepts a
+/// candidate, so an empty or wrong-context result just means nothing is
+/// offered.
 fn complete_candidates(
     line: &str,
     pos: usize,
@@ -1342,7 +1333,13 @@ fn complete_candidates(
     if is_query_run_name_position(line, start) {
         return filter_prefix(query_names.iter().map(String::as_str), word);
     }
-    filter_prefix(schema.iter().map(String::as_str).chain(FILE_COLUMNS), word)
+    filter_prefix(
+        schema
+            .iter()
+            .map(String::as_str)
+            .chain(FileAttr::ALL.map(FileAttr::label)),
+        word,
+    )
 }
 
 /// rustyline `Helper`: wires [`complete_candidates`] into the editor as
@@ -2223,11 +2220,11 @@ mod tests {
     }
 
     /// SQL-position completion must draw only from `schema` plus
-    /// [`FILE_COLUMNS`], never a SQL-keyword list — proven with a prefix
-    /// (`"sel"`) that actually contains `select` as a candidate, unlike the
-    /// `"sta"` prefix in `completion_candidates_by_position` above (which
-    /// can't match `select` regardless of the implementation and so proves
-    /// nothing). The schema here deliberately excludes `select`.
+    /// [`FileAttr::ALL`]'s labels, never a SQL-keyword list — proven with a
+    /// prefix (`"sel"`) that actually contains `select` as a candidate,
+    /// unlike the `"sta"` prefix in `completion_candidates_by_position` above
+    /// (which can't match `select` regardless of the implementation and so
+    /// proves nothing). The schema here deliberately excludes `select`.
     #[test]
     fn sql_position_completion_never_offers_a_sql_keyword() {
         let schema = vec!["status".to_string(), "prd".to_string()];
@@ -2276,10 +2273,10 @@ mod tests {
     }
 
     /// `.schema`'s "File pseudo-columns:" section (`print_schema`) does
-    /// nothing but iterate `FILE_COLUMNS` verbatim, so pinning the const
-    /// itself is a faithful proxy for that printed output — and, since
-    /// `print_describe`'s `Some(name) if FILE_COLUMNS.contains(&name) => ...`
-    /// guard reads the same const, this also pins that `.describe
+    /// nothing but iterate `FileAttr::ALL`'s labels verbatim, so pinning
+    /// those labels is a faithful proxy for that printed output — and, since
+    /// `print_describe`'s file-column guard resolves the same
+    /// `FileAttr::from_attr_name`, this also pins that `.describe
     /// file.mtime`/`.describe file.size`/`.describe file.word_count`/
     /// `.describe file.body` route to the pseudo-column path rather than
     /// falling through to "unknown field" (Task 4 follow-up; `file.word_count`
@@ -2287,7 +2284,7 @@ mod tests {
     #[test]
     fn file_columns_include_mtime_size_word_count_and_body() {
         assert_eq!(
-            FILE_COLUMNS,
+            FileAttr::ALL.map(FileAttr::label),
             [
                 "file.name",
                 "file.path",
@@ -2308,11 +2305,11 @@ mod tests {
     /// (Task 7/W56) — stays `Str`.
     #[test]
     fn describe_file_column_reports_accurate_types() {
-        assert!(describe_file_column_line("file.size").contains("type Int"));
-        assert!(describe_file_column_line("file.word_count").contains("type Int"));
-        assert!(describe_file_column_line("file.mtime").contains("type Str"));
-        assert!(describe_file_column_line("file.name").contains("type Str"));
-        assert!(describe_file_column_line("file.body").contains("type Str"));
+        assert!(describe_file_column_line(FileAttr::Size).contains("type Int"));
+        assert!(describe_file_column_line(FileAttr::WordCount).contains("type Int"));
+        assert!(describe_file_column_line(FileAttr::Mtime).contains("type Str"));
+        assert!(describe_file_column_line(FileAttr::Name).contains("type Str"));
+        assert!(describe_file_column_line(FileAttr::Body).contains("type Str"));
     }
 
     #[test]

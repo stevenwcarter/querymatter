@@ -614,28 +614,16 @@ fn lower_compound(parts: &[sql::Ident]) -> Result<ColRef, ParseError> {
                 "`file.*` has no nesting: `{joined}`"
             )));
         };
-        return Ok(ColRef::File(file_attr_from_str(&attr.value)?));
+        let lowered = attr.value.to_ascii_lowercase();
+        return FileAttr::from_attr_name(&lowered)
+            .map(ColRef::File)
+            .ok_or_else(|| {
+                ParseError::BadColumn(format!("unknown file attribute `file.{lowered}`"))
+            });
     }
     Ok(ColRef::Field(
         parts.iter().map(|p| p.value.clone()).collect(),
     ))
-}
-
-/// Parses a `file.*` attribute name into a [`FileAttr`].
-fn file_attr_from_str(name: &str) -> Result<FileAttr, ParseError> {
-    match name.to_ascii_lowercase().as_str() {
-        "name" => Ok(FileAttr::Name),
-        "path" => Ok(FileAttr::Path),
-        "folder" => Ok(FileAttr::Folder),
-        "ext" => Ok(FileAttr::Ext),
-        "mtime" => Ok(FileAttr::Mtime),
-        "size" => Ok(FileAttr::Size),
-        "word_count" => Ok(FileAttr::WordCount),
-        "body" => Ok(FileAttr::Body),
-        other => Err(ParseError::BadColumn(format!(
-            "unknown file attribute `file.{other}`"
-        ))),
-    }
 }
 
 /// Lowers a `WHERE` expression into a [`Predicate`] tree.

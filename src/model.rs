@@ -218,6 +218,66 @@ pub enum FileAttr {
     Body,
 }
 
+impl FileAttr {
+    /// Every pseudo-column, in the display order `.schema`/`.describe` use.
+    pub const ALL: [FileAttr; 8] = [
+        FileAttr::Name,
+        FileAttr::Path,
+        FileAttr::Folder,
+        FileAttr::Ext,
+        FileAttr::Mtime,
+        FileAttr::Size,
+        FileAttr::WordCount,
+        FileAttr::Body,
+    ];
+
+    /// The dotted, user-facing SQL spelling (`file.name`, …). These strings
+    /// are pinned by the sample_queries snapshot — do not change them.
+    pub fn label(self) -> &'static str {
+        match self {
+            FileAttr::Name => "file.name",
+            FileAttr::Path => "file.path",
+            FileAttr::Folder => "file.folder",
+            FileAttr::Ext => "file.ext",
+            FileAttr::Mtime => "file.mtime",
+            FileAttr::Size => "file.size",
+            FileAttr::WordCount => "file.word_count",
+            FileAttr::Body => "file.body",
+        }
+    }
+
+    /// Parses the bare, already-lowercased attribute half (`name`,
+    /// `word_count`, …) that `parse::lower_compound` splits off — the
+    /// counterpart spelling to [`Self::label`]'s dotted form. Two explicit
+    /// fns rather than one `FromStr`, because the two spellings differ.
+    pub fn from_attr_name(name: &str) -> Option<FileAttr> {
+        match name {
+            "name" => Some(FileAttr::Name),
+            "path" => Some(FileAttr::Path),
+            "folder" => Some(FileAttr::Folder),
+            "ext" => Some(FileAttr::Ext),
+            "mtime" => Some(FileAttr::Mtime),
+            "size" => Some(FileAttr::Size),
+            "word_count" => Some(FileAttr::WordCount),
+            "body" => Some(FileAttr::Body),
+            _ => None,
+        }
+    }
+
+    /// The `.describe` type column for this pseudo-column.
+    pub fn value_kind(self) -> &'static str {
+        match self {
+            FileAttr::Size | FileAttr::WordCount => "Int",
+            FileAttr::Name
+            | FileAttr::Path
+            | FileAttr::Folder
+            | FileAttr::Ext
+            | FileAttr::Mtime
+            | FileAttr::Body => "Str",
+        }
+    }
+}
+
 /// One queryable row: a Markdown file's YAML frontmatter fields, plus its
 /// `file.*` pseudo-columns resolved relative to the scan root.
 #[derive(Debug, Clone, PartialEq)]

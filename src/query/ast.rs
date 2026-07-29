@@ -702,7 +702,7 @@ impl ColRef {
     pub(crate) fn label(&self) -> String {
         match self {
             ColRef::Field(path) => path.join("."),
-            ColRef::File(attr) => file_attr_label(*attr).to_string(),
+            ColRef::File(attr) => attr.label().to_string(),
         }
     }
 }
@@ -894,20 +894,6 @@ fn bin_op_symbol(op: &BinOp) -> &'static str {
         BinOp::Div => "/",
         BinOp::Mod => "%",
         BinOp::Concat => "||",
-    }
-}
-
-/// The `file.<attr>` label for a [`FileAttr`].
-fn file_attr_label(attr: FileAttr) -> &'static str {
-    match attr {
-        FileAttr::Name => "file.name",
-        FileAttr::Path => "file.path",
-        FileAttr::Folder => "file.folder",
-        FileAttr::Ext => "file.ext",
-        FileAttr::Mtime => "file.mtime",
-        FileAttr::Size => "file.size",
-        FileAttr::WordCount => "file.word_count",
-        FileAttr::Body => "file.body",
     }
 }
 
