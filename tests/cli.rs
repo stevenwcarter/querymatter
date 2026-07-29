@@ -2264,8 +2264,8 @@ fn config_set_rejects_an_invalid_exclude_glob_and_leaves_the_file_alone() {
 /// but a hand-edited `config.toml` bypasses `config set` entirely — the
 /// runtime check must also fire, against the RESOLVED exclude list, so a
 /// hand-written bad glob still fails loudly instead of silently matching
-/// nothing (`discover::build_exclude_set` has no error channel and drops
-/// what doesn't compile).
+/// nothing (`Settings::resolve_walk` parses the resolved list into an
+/// `ExcludeSet` and propagates the parse error).
 #[test]
 fn hand_written_config_with_invalid_exclude_glob_fails_a_query_naming_the_pattern() {
     let td = tree();

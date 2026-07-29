@@ -19,7 +19,7 @@ use clap::parser::ValueSource;
 
 use crate::cli::{Cli, WalkFlags};
 use crate::config::{Config, ConfigKey};
-use crate::discover::{DEFAULT_MAX_FILE_BYTES, WalkOpts};
+use crate::discover::{DEFAULT_MAX_FILE_BYTES, ExcludeSet, WalkOpts};
 use crate::render::{Format, TableStyle};
 
 /// Which precedence layer supplied a resolved value.
@@ -74,7 +74,7 @@ pub struct Settings {
     pub ext: Resolved<Vec<String>>,
     pub respect_gitignore: Resolved<bool>,
     pub hidden: Resolved<bool>,
-    pub exclude: Resolved<Vec<String>>,
+    pub exclude: Resolved<ExcludeSet>,
     pub lenient: Resolved<bool>,
     pub timer: Resolved<bool>,
     pub header: Resolved<bool>,
@@ -94,7 +94,7 @@ impl Default for Settings {
             ),
             respect_gitignore: Resolved::new(false, Source::Default),
             hidden: Resolved::new(false, Source::Default),
-            exclude: Resolved::new(Vec::new(), Source::Default),
+            exclude: Resolved::new(ExcludeSet::empty(), Source::Default),
             lenient: Resolved::new(false, Source::Default),
             timer: Resolved::new(false, Source::Default),
             header: Resolved::new(true, Source::Default),
@@ -110,9 +110,18 @@ impl Settings {
     /// `vault` is the vault-level `.querymatter.toml` (see the module doc
     /// comment): a key it sets wins over `config` (the per-user config file)
     /// but loses to a flag or environment variable.
-    pub fn resolve(cli: &Cli, vault: &Config, config: &Config, matches: &ArgMatches) -> Self {
+    ///
+    /// Returns an error when the resolved `exclude` list contains a glob that
+    /// fails to parse — see [`Settings::resolve_walk`], which does the actual
+    /// parsing.
+    pub fn resolve(
+        cli: &Cli,
+        vault: &Config,
+        config: &Config,
+        matches: &ArgMatches,
+    ) -> anyhow::Result<Self> {
         let defaults = Settings::default();
-        Settings {
+        Ok(Settings {
             format: resolve_value(
                 cli.format,
                 vault.format,
@@ -156,8 +165,8 @@ impl Settings {
                 (None, Some(v)) => Resolved::new(v, Source::Config),
                 (None, None) => Resolved::new(defaults.timer.value, Source::Default),
             },
-            ..Settings::resolve_walk(&cli.walk, vault, config, matches)
-        }
+            ..Settings::resolve_walk(&cli.walk, vault, config, matches)?
+        })
     }
 
     /// Resolves the scan settings only — everything `querymatter init` needs.
@@ -165,14 +174,27 @@ impl Settings {
     /// renders nothing.
     ///
     /// `vault` is the vault-level `.querymatter.toml`; see [`Settings::resolve`].
+    ///
+    /// The `exclude` wire form (`Vec<String>`, precedence-resolved like every
+    /// other setting) is parsed into an [`ExcludeSet`] exactly once, right
+    /// here — an invalid pattern from a flag, the vault config, the per-user
+    /// config, or a hand-edited file all fail this call the same way, naming
+    /// the offending pattern.
     pub fn resolve_walk(
         walk: &WalkFlags,
         vault: &Config,
         config: &Config,
         matches: &ArgMatches,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let defaults = Settings::default();
-        Settings {
+        let resolved_exclude = resolve_value(
+            non_empty(walk.exclude.clone()),
+            vault.exclude.clone(),
+            config.exclude.clone(),
+            Vec::new(),
+            source_of(matches, "exclude"),
+        );
+        Ok(Settings {
             ext: resolve_value(
                 walk.ext.clone(),
                 vault.ext.clone(),
@@ -199,12 +221,9 @@ impl Settings {
                 config.hidden,
                 defaults.hidden.value,
             ),
-            exclude: resolve_value(
-                non_empty(walk.exclude.clone()),
-                vault.exclude.clone(),
-                config.exclude.clone(),
-                defaults.exclude.value.clone(),
-                source_of(matches, "exclude"),
+            exclude: Resolved::new(
+                ExcludeSet::try_from(resolved_exclude.value.as_slice())?,
+                resolved_exclude.source,
             ),
             // No CLI flag/env var: a config/default is sufficient for a
             // security cap nobody needs to override per-invocation (see the
@@ -218,7 +237,7 @@ impl Settings {
                 None,
             ),
             ..defaults
-        }
+        })
     }
 
     /// The [`WalkOpts`] these settings describe, with an empty `ignore_files`
@@ -279,7 +298,13 @@ impl Settings {
                 ConfigKey::TableStyle,
                 (enum_name(&self.table_style.value), self.table_style.source),
             ),
-            (ConfigKey::Ext, (list(&self.ext.value), self.ext.source)),
+            (
+                ConfigKey::Ext,
+                (
+                    list(self.ext.value.iter().map(String::as_str)),
+                    self.ext.source,
+                ),
+            ),
             (
                 ConfigKey::RespectGitignore,
                 (
@@ -293,7 +318,7 @@ impl Settings {
             ),
             (
                 ConfigKey::Exclude,
-                (list(&self.exclude.value), self.exclude.source),
+                (list(self.exclude.value.sources()), self.exclude.source),
             ),
             (
                 ConfigKey::Lenient,
@@ -383,11 +408,12 @@ fn non_empty(list: Vec<String>) -> Option<Vec<String>> {
 }
 
 /// A list rendered the way `config set` accepts it, or `(none)` when empty.
-fn list(values: &[String]) -> String {
-    if values.is_empty() {
+fn list<'a>(values: impl Iterator<Item = &'a str>) -> String {
+    let joined = values.collect::<Vec<_>>().join(",");
+    if joined.is_empty() {
         "(none)".to_string()
     } else {
-        values.join(",")
+        joined
     }
 }
 
@@ -424,7 +450,7 @@ mod tests {
         let mut command = Cli::command().mut_arg("table_style", |a| a.env(None::<&str>));
         let matches = command.try_get_matches_from_mut(args).unwrap();
         let cli = Cli::from_arg_matches(&matches).unwrap();
-        Settings::resolve(&cli, vault, config, &matches)
+        Settings::resolve(&cli, vault, config, &matches).unwrap()
     }
 
     fn config_with(f: impl FnOnce(&mut Config)) -> Config {
@@ -579,7 +605,7 @@ mod tests {
     fn exclude_flag_replaces_the_configured_list() {
         let config = config_with(|c| c.exclude = Some(vec!["**/a/**".into()]));
         let s = resolve(&["querymatter", "--exclude", "**/b/**"], &config);
-        assert_eq!(s.exclude.value, vec!["**/b/**".to_string()]);
+        assert_eq!(s.exclude.value.sources().collect::<Vec<_>>(), ["**/b/**"]);
     }
 
     /// Without a negation flag there would be no way to turn a configured
@@ -674,7 +700,7 @@ mod tests {
         assert_eq!(opts.exts, vec!["mdx".to_string()]);
         assert!(opts.hidden);
         assert!(opts.respect_gitignore);
-        assert_eq!(opts.excludes, vec!["**/x/**".to_string()]);
+        assert_eq!(opts.excludes.sources().collect::<Vec<_>>(), ["**/x/**"]);
         assert!(opts.ignore_files.is_empty(), "filled by the caller");
     }
 
@@ -700,7 +726,8 @@ mod tests {
         let config = config_with(|c| c.hidden = Some(true));
 
         let settings =
-            Settings::resolve_walk(&init_args.walk, &Config::default(), &config, sub_matches);
+            Settings::resolve_walk(&init_args.walk, &Config::default(), &config, sub_matches)
+                .unwrap();
         assert!(
             settings.hidden.value,
             "config hidden = true must reach init's walk"
@@ -727,7 +754,8 @@ mod tests {
         let vault = config_with(|c| c.hidden = Some(true));
         let config = config_with(|c| c.hidden = Some(false));
 
-        let settings = Settings::resolve_walk(&init_args.walk, &vault, &config, sub_matches);
+        let settings =
+            Settings::resolve_walk(&init_args.walk, &vault, &config, sub_matches).unwrap();
         assert!(
             settings.hidden.value,
             "vault hidden = true must reach init's walk, beating a configured false"
@@ -833,7 +861,8 @@ mod tests {
         let config = config_with(|c| c.max_file_bytes = Some(1000));
 
         let settings =
-            Settings::resolve_walk(&init_args.walk, &Config::default(), &config, sub_matches);
+            Settings::resolve_walk(&init_args.walk, &Config::default(), &config, sub_matches)
+                .unwrap();
         assert_eq!(settings.max_file_bytes.value, 1000);
         assert_eq!(settings.max_file_bytes.source, Source::Config);
         assert_eq!(settings.walk_opts().max_file_bytes, 1000);

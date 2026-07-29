@@ -34,7 +34,7 @@ pub struct WalkOpts {
     pub hidden: bool,
     /// Glob patterns (matched against both the absolute path and the path
     /// relative to `root`); any match excludes the file from the result.
-    pub excludes: Vec<String>,
+    pub excludes: ExcludeSet,
     /// Gitignore-style ignore files to apply (earliest first), always honored
     /// regardless of `respect_gitignore`. Resolved by `Cli::ignore_files`.
     pub ignore_files: Vec<PathBuf>,
@@ -52,7 +52,7 @@ impl Default for WalkOpts {
             exts: vec!["md".to_string(), "markdown".to_string()],
             respect_gitignore: false,
             hidden: false,
-            excludes: Vec::new(),
+            excludes: ExcludeSet::empty(),
             ignore_files: Vec::new(),
             max_file_bytes: DEFAULT_MAX_FILE_BYTES,
         }
@@ -64,8 +64,6 @@ impl Default for WalkOpts {
 ///
 /// Results are sorted for deterministic output.
 pub fn discover(root: &Path, opts: &WalkOpts) -> Vec<PathBuf> {
-    let excludes = build_exclude_set(&opts.excludes);
-
     let mut walker = WalkBuilder::new(root);
     // Set every filtering toggle explicitly rather than relying on
     // `standard_filters`'s own default (which is "on"): gitignore/git-exclude/
@@ -107,7 +105,7 @@ pub fn discover(root: &Path, opts: &WalkOpts) -> Vec<PathBuf> {
         .filter(|entry| entry.file_type().is_some_and(|ft| ft.is_file()))
         .map(ignore::DirEntry::into_path)
         .filter(|path| has_wanted_extension(path, &opts.exts))
-        .filter(|path| !is_excluded(path, root, &excludes))
+        .filter(|path| !is_excluded(path, root, &opts.excludes))
         .collect();
 
     found.sort();
@@ -126,7 +124,7 @@ fn has_wanted_extension(path: &Path, exts: &[String]) -> bool {
 /// True when `path` (either as given, which is absolute since it was
 /// yielded by a walk rooted at an absolute-ified `root`, or relative to
 /// `root`) matches any glob in `excludes`.
-fn is_excluded(path: &Path, root: &Path, excludes: &GlobSet) -> bool {
+fn is_excluded(path: &Path, root: &Path, excludes: &ExcludeSet) -> bool {
     if excludes.is_empty() {
         return false;
     }
@@ -137,35 +135,93 @@ fn is_excluded(path: &Path, root: &Path, excludes: &GlobSet) -> bool {
         .is_ok_and(|relative| excludes.is_match(relative))
 }
 
-/// Rejects any exclude glob `globset` cannot compile, naming the offending
-/// pattern.
-///
-/// [`build_exclude_set`] below has no error channel back to its caller and
-/// silently drops what doesn't compile, so every producer of an exclude list
-/// — `config::set` at config-write time, and query/init's resolved
-/// [`crate::settings::Settings::exclude`] at run time, which also catches a
-/// hand-edited config file that bypassed `config set` — validates through
-/// this one function up front instead.
-pub fn validate_excludes(patterns: &[String]) -> anyhow::Result<()> {
-    for pattern in patterns {
-        Glob::new(pattern).with_context(|| format!("invalid exclude glob {pattern:?}"))?;
-    }
-    Ok(())
+/// One exclude pattern together with its compiled glob — constructing it IS
+/// the validation, so an invalid pattern cannot reach the walk.
+#[derive(Debug, Clone)]
+pub struct ExcludeGlob {
+    source: String,
+    glob: Glob,
 }
 
-/// Compiles `patterns` into a [`GlobSet`], silently dropping any pattern
-/// that fails to parse as a glob (there's no error channel back to the
-/// caller in `discover`'s signature, and an unusable exclude shouldn't
-/// abort discovery of everything else).
-fn build_exclude_set(patterns: &[String]) -> GlobSet {
-    let mut builder = GlobSetBuilder::new();
-    for pattern in patterns {
-        if let Ok(glob) = Glob::new(pattern) {
-            builder.add(glob);
-        }
+impl ExcludeGlob {
+    pub fn source(&self) -> &str {
+        &self.source
     }
-    builder.build().unwrap_or_else(|_| GlobSet::empty())
 }
+
+impl std::str::FromStr for ExcludeGlob {
+    type Err = anyhow::Error;
+    fn from_str(pattern: &str) -> anyhow::Result<Self> {
+        // Byte-identical error contract with the deleted `validate_excludes`
+        // (pinned by tests/cli.rs).
+        let glob =
+            Glob::new(pattern).with_context(|| format!("invalid exclude glob {pattern:?}"))?;
+        Ok(ExcludeGlob {
+            source: pattern.to_string(),
+            glob,
+        })
+    }
+}
+
+/// The full exclude list, parsed once: individual globs (for attribution in
+/// `explain`) plus the combined `GlobSet` the walk matches against.
+#[derive(Debug, Clone, Default)]
+pub struct ExcludeSet {
+    globs: Vec<ExcludeGlob>,
+    set: GlobSet,
+}
+
+impl ExcludeSet {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.globs.is_empty()
+    }
+    pub fn is_match(&self, path: &Path) -> bool {
+        self.set.is_match(path)
+    }
+    /// The first pattern matching `target` (or its root-relative form) —
+    /// `exclude_reason`'s attribution, now guaranteed to agree with the set
+    /// the walk actually used.
+    pub fn first_match(&self, target: &Path, relative: Option<&Path>) -> Option<&str> {
+        self.globs
+            .iter()
+            .find(|g| {
+                let m = g.glob.compile_matcher();
+                m.is_match(target) || relative.is_some_and(|rel| m.is_match(rel))
+            })
+            .map(ExcludeGlob::source)
+    }
+    pub fn sources(&self) -> impl Iterator<Item = &str> {
+        self.globs.iter().map(ExcludeGlob::source)
+    }
+}
+
+impl TryFrom<&[String]> for ExcludeSet {
+    type Error = anyhow::Error;
+    fn try_from(patterns: &[String]) -> anyhow::Result<Self> {
+        let globs: Vec<ExcludeGlob> = patterns
+            .iter()
+            .map(|p| p.parse())
+            .collect::<anyhow::Result<_>>()?;
+        let mut builder = GlobSetBuilder::new();
+        for g in &globs {
+            builder.add(g.glob.clone());
+        }
+        let set = builder.build()?;
+        Ok(ExcludeSet { globs, set })
+    }
+}
+
+impl PartialEq for ExcludeSet {
+    fn eq(&self, other: &Self) -> bool {
+        // Settings derives PartialEq/Eq; GlobSet has neither, and equal
+        // sources imply an equal compiled set.
+        self.sources().eq(other.sources())
+    }
+}
+impl Eq for ExcludeSet {}
 
 /// The result of [`explain`]: whether `target` would be discovered under a
 /// given [`WalkOpts`], and — when not — which filter layer excluded it.
@@ -226,7 +282,7 @@ pub fn explain(root: &Path, target: &Path, opts: &WalkOpts) -> Explanation {
 
     if !opts.excludes.is_empty() {
         let relaxed = WalkOpts {
-            excludes: Vec::new(),
+            excludes: ExcludeSet::empty(),
             ..opts.clone()
         };
         if contains(&discover(root, &relaxed), target) {
@@ -303,21 +359,14 @@ fn hidden_reason(root: &Path, target: &Path) -> String {
 }
 
 /// The `--exclude`-layer reason `target` is excluded, naming the first
-/// pattern in `patterns` that matches it (either as given or relative to
+/// pattern in `excludes` that matches it (either as given or relative to
 /// `root`), once relaxing `opts.excludes` has confirmed the layer is
 /// responsible. Falls back to a generic phrasing on the (surprising) case
 /// that no individual pattern matches despite the layer as a whole being
-/// responsible — e.g. an unparsable pattern [`build_exclude_set`] silently
-/// dropped.
-fn exclude_reason(target: &Path, root: &Path, patterns: &[String]) -> String {
+/// responsible.
+fn exclude_reason(target: &Path, root: &Path, excludes: &ExcludeSet) -> String {
     let relative = target.strip_prefix(root).ok();
-    let matched = patterns.iter().find(|pattern| {
-        let Ok(matcher) = Glob::new(pattern).map(|glob| glob.compile_matcher()) else {
-            return false;
-        };
-        matcher.is_match(target) || relative.is_some_and(|rel| matcher.is_match(rel))
-    });
-    match matched {
+    match excludes.first_match(target, relative) {
         Some(pattern) => format!("matches --exclude glob '{pattern}'"),
         None => "matches an --exclude glob".to_string(),
     }
@@ -343,6 +392,13 @@ mod tests {
         let p = dir.join(rel);
         fs::create_dir_all(p.parent().unwrap()).unwrap();
         fs::write(p, body).unwrap();
+    }
+
+    /// Parses `patterns` into an [`ExcludeSet`], for tests that only care
+    /// about well-formed globs.
+    fn excludes(patterns: &[&str]) -> ExcludeSet {
+        let owned: Vec<String> = patterns.iter().map(|p| p.to_string()).collect();
+        ExcludeSet::try_from(owned.as_slice()).unwrap()
     }
 
     #[test]
@@ -411,7 +467,7 @@ mod tests {
         touch(td.path(), "keep.md", "x");
         touch(td.path(), "templates/t.md", "x");
         let opts = WalkOpts {
-            excludes: vec!["**/templates/**".into()],
+            excludes: excludes(&["**/templates/**"]),
             ..Default::default()
         };
         let got = discover(td.path(), &opts);
@@ -510,7 +566,7 @@ mod tests {
         touch(td.path(), "keep.md", "x");
         let opts = WalkOpts {
             ignore_files: vec![td.path().join(".qmi")],
-            excludes: vec!["**/excluded/**".into()],
+            excludes: excludes(&["**/excluded/**"]),
             ..Default::default()
         };
         let names: Vec<_> = discover(td.path(), &opts)
@@ -523,7 +579,10 @@ mod tests {
     #[test]
     fn validate_excludes_accepts_good_globs() {
         assert!(
-            validate_excludes(&["**/templates/**".to_string(), "*.draft.md".to_string()]).is_ok()
+            ExcludeSet::try_from(
+                ["**/templates/**".to_string(), "*.draft.md".to_string()].as_slice()
+            )
+            .is_ok()
         );
     }
 
@@ -531,7 +590,7 @@ mod tests {
     fn validate_excludes_rejects_a_bad_glob_naming_it() {
         let err = format!(
             "{:#}",
-            validate_excludes(&["[plans/**".to_string()]).unwrap_err()
+            ExcludeSet::try_from(["[plans/**".to_string()].as_slice()).unwrap_err()
         );
         assert!(
             err.contains("[plans/**"),
@@ -644,7 +703,7 @@ mod tests {
         touch(td.path(), "templates/t.md", "x");
         let target = fs::canonicalize(td.path().join("templates/t.md")).unwrap();
         let opts = WalkOpts {
-            excludes: vec!["**/templates/**".into()],
+            excludes: excludes(&["**/templates/**"]),
             ..Default::default()
         };
         match explain(td.path(), &target, &opts) {
@@ -708,7 +767,7 @@ mod tests {
         touch(td.path(), ".qmi", "skip/\n");
         touch(td.path(), "skip/s.md", "x");
         let opts = WalkOpts {
-            excludes: vec!["**/templates/**".into()],
+            excludes: excludes(&["**/templates/**"]),
             ignore_files: vec![td.path().join(".qmi")],
             ..Default::default()
         };

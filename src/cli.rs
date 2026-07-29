@@ -30,9 +30,9 @@ use crate::render::{Format, TableStyle};
 /// [`WalkOpts`](crate::discover::WalkOpts) is
 /// [`Settings::walk_opts`](crate::settings::Settings::walk_opts)'s job, since
 /// only the resolver knows which layer won for each field. Exclude-glob
-/// validation ([`crate::discover::validate_excludes`]) runs on the
-/// *resolved* setting, not the flag alone, so a bad glob from the config
-/// file is caught too — see `run_query`/`run_init` in `main.rs`.
+/// parsing (into a [`crate::discover::ExcludeSet`]) runs on the *resolved*
+/// setting, not the flag alone, so a bad glob from the config file is caught
+/// too — see `run_query`/`run_init` in `main.rs`.
 #[derive(Debug, Args)]
 pub struct WalkFlags {
     /// File extensions (without the leading dot) to include. [default: md,markdown]

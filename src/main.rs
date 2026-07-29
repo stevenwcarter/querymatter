@@ -374,12 +374,12 @@ fn run_init(args: &InitArgs, config: &Config, matches: &ArgMatches) -> anyhow::R
     // ancestry, not the invoking shell's.
     let vault_config = load_vault_config(&target)?;
 
-    let settings = Settings::resolve_walk(&args.walk, &vault_config, config, matches);
     // Validated on the RESOLVED exclude list (flag, vault, config, or
     // default — whichever won), not `args.walk.exclude` alone, so a bad glob
     // from a hand-edited config file is caught too, not just one typed on the
-    // command line (IMPORTANT 1).
-    discover::validate_excludes(&settings.exclude.value)?;
+    // command line (IMPORTANT 1) — `resolve_walk` parses it into an
+    // `ExcludeSet` right here, so an invalid pattern fails this call directly.
+    let settings = Settings::resolve_walk(&args.walk, &vault_config, config, matches)?;
 
     let base = VaultRoot::new(
         fs::canonicalize(&target)
@@ -493,8 +493,7 @@ fn run_explain(args: &ExplainArgs, config: &Config, matches: &ArgMatches) -> any
     // found even when `explain` is invoked from a subdirectory of the vault.
     let vault_config = load_vault_config(&root)?;
 
-    let settings = Settings::resolve_walk(&args.walk, &vault_config, config, matches);
-    discover::validate_excludes(&settings.exclude.value)?;
+    let settings = Settings::resolve_walk(&args.walk, &vault_config, config, matches)?;
 
     let mut opts = settings.walk_opts();
     opts.ignore_files = args.walk.ignore_files()?;
@@ -532,12 +531,12 @@ fn run_config(
             let vault_config = load_vault_config_from_cwd()?;
             println!(
                 "{}",
-                Settings::resolve(cli, &vault_config, config, matches).rows()
+                Settings::resolve(cli, &vault_config, config, matches)?.rows()
             );
         }
         ConfigAction::Get { key } => {
             let vault_config = load_vault_config_from_cwd()?;
-            let settings = Settings::resolve(cli, &vault_config, config, matches);
+            let settings = Settings::resolve(cli, &vault_config, config, matches)?;
             println!("{}", settings.value_of(*key));
             println!("values: {}", key.allowed());
         }
@@ -920,15 +919,14 @@ fn build_session(
     let cwd = env::current_dir().context("failed to determine the current directory")?;
     let vault_config = load_vault_config(&cwd)?;
 
-    let settings = Settings::resolve(cli, &vault_config, config, matches);
     // Validated on the RESOLVED exclude list (flag, vault, config, or
     // default — whichever won), not `cli.walk.exclude` alone: a hand-edited
     // config file's `exclude` must be rejected here too. `config::set`
     // already rejects a bad glob up front for the normal `config set
-    // exclude` path, but a hand-edited file bypasses that, and `discover`'s
-    // own glob compiler has no error channel and would otherwise silently
-    // drop it (IMPORTANT 1).
-    discover::validate_excludes(&settings.exclude.value)?;
+    // exclude` path, but a hand-edited file bypasses that; `Settings::resolve`
+    // parses the resolved list into an `ExcludeSet` right here, so an invalid
+    // pattern fails this call directly (IMPORTANT 1).
+    let settings = Settings::resolve(cli, &vault_config, config, matches)?;
     let mut opts = settings.walk_opts();
     opts.ignore_files = cli.walk.ignore_files()?;
 
@@ -1013,7 +1011,7 @@ fn build_session(
     // The user config layer removed, NOT the vault layer: `.unset` only ever
     // touches the per-user config file, so reverting a key must still honor
     // a vault-supplied value for it.
-    let fallback = Settings::resolve(cli, &vault_config, &Config::default(), matches);
+    let fallback = Settings::resolve(cli, &vault_config, &Config::default(), matches)?;
     let mut session = Session::new(Box::new(store), settings, fallback, session_vault);
     // `file.body` (design W56) is the one column a query can evaluate that
     // needs live disk access beyond the store already built above;

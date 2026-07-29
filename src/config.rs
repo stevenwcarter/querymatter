@@ -232,15 +232,16 @@ pub fn set(config: &mut Config, key: ConfigKey, value: &str) -> anyhow::Result<(
     Ok(())
 }
 
-/// Splits `value` into glob patterns and validates each one via
-/// [`discover::validate_excludes`], so a `config set exclude` with a pattern
+/// Splits `value` into glob patterns and validates each one by parsing it
+/// into a [`discover::ExcludeSet`], so a `config set exclude` with a pattern
 /// `globset` cannot compile is rejected here — at write time, naming the
-/// offending pattern — rather than silently doing nothing at scan time
-/// (`discover`'s own glob compiler has no error channel back to its caller
-/// and drops what doesn't compile).
+/// offending pattern — rather than silently doing nothing at scan time. The
+/// parsed set itself is discarded: `Config.exclude` stays the wire-form
+/// `Vec<String>`, re-parsed once at resolve time by
+/// [`crate::settings::Settings::resolve_walk`].
 fn parse_exclude_list(value: &str) -> anyhow::Result<Vec<String>> {
     let patterns = split_list(value);
-    discover::validate_excludes(&patterns)?;
+    discover::ExcludeSet::try_from(patterns.as_slice())?;
     Ok(patterns)
 }
 
