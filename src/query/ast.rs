@@ -9,6 +9,8 @@
 
 use std::collections::BTreeSet;
 
+use regex::Regex;
+
 use crate::model::FileAttr;
 
 /// A fully-parsed query: the projection plus its optional clauses.
@@ -194,17 +196,19 @@ pub enum Predicate {
     Compare(Expr, CmpOp, Expr),
     /// `<expr> [NOT] LIKE '<pattern>'`; the `bool` is `true` when negated. The
     /// tested side is a general [`Expr`] (e.g. `lower(status) LIKE '%draft%'`),
-    /// matching `Compare`/`Regexp`.
-    Like(Expr, String, /* negated */ bool),
+    /// matching `Compare`/`Regexp`. The pattern arrives already translated and
+    /// compiled (see [`LikePattern`]), so evaluation is a match, never a
+    /// compile.
+    Like(Expr, LikePattern, /* negated */ bool),
     /// `<expr> [NOT] REGEXP '<pattern>'` (`RLIKE` is sqlparser's alias for
     /// the same node — identical semantics); the `bool` is `true` when
     /// negated. Unlike `Like`, the left side is a general [`Expr`] (e.g.
     /// `lower(status) REGEXP 'draft'`), not just a column reference. The
-    /// pattern is validated to compile at parse time
-    /// (`parse::lower_regexp`), so evaluation never sees an invalid regex.
-    /// Matching is always case-sensitive — the user opts into
-    /// case-insensitivity with an inline `(?i)` flag.
-    Regexp(Expr, String, /* negated */ bool),
+    /// pattern arrives already compiled (see [`RegexPattern`]), so an invalid
+    /// regex is rejected at parse time (`parse::lower_regexp`) and evaluation
+    /// can never see one. Matching is always case-sensitive — the user opts
+    /// into case-insensitivity with an inline `(?i)` flag.
+    Regexp(Expr, RegexPattern, /* negated */ bool),
     /// `<expr> [NOT] IN (<literals>)`; the `bool` is `true` when negated.
     In(Expr, Vec<Literal>, /* negated */ bool),
     /// `<expr> MEMBER OF(col)` / `NOT <expr> MEMBER OF(col)`; the `bool` is
@@ -221,6 +225,90 @@ pub enum Predicate {
     Or(Box<Predicate>, Box<Predicate>),
     /// Logical negation.
     Not(Box<Predicate>),
+}
+
+/// A `LIKE` pattern together with its compiled anchored regex. Compiled once
+/// at parse time; evaluation can no longer see an uncompiled pattern.
+#[derive(Debug, Clone)]
+pub struct LikePattern {
+    source: String,
+    regex: Regex,
+}
+
+impl LikePattern {
+    /// Translates a SQL `LIKE` pattern and compiles it: `%` → `.*`, `_` → `.`,
+    /// everything else escaped and matched literally (case-sensitive),
+    /// anchored over the whole value (`^…$`).
+    pub fn new(source: &str) -> Self {
+        let escaped = regex::escape(source);
+        let translated = escaped.replace('%', ".*").replace('_', ".");
+        // `translated` is `regex::escape`'s output with only `.*`/`.`
+        // substituted in, so wrapping it in `^…$` is always a valid regex.
+        let regex = Regex::new(&format!("^{translated}$"))
+            .expect("LIKE pattern translates to a well-formed regex");
+        LikePattern {
+            source: source.to_string(),
+            regex,
+        }
+    }
+
+    /// The literal pattern text as written in the query, for rendering.
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    /// Whether `value` matches the pattern in full.
+    pub fn is_match(&self, value: &str) -> bool {
+        self.regex.is_match(value)
+    }
+}
+
+impl PartialEq for LikePattern {
+    fn eq(&self, other: &Self) -> bool {
+        // [`Predicate`] derives `PartialEq` and parse tests compare nodes; the
+        // compiled regex is a pure function of `source`, and `Regex` is not
+        // itself comparable.
+        self.source == other.source
+    }
+}
+
+/// A `REGEXP` pattern together with its compiled regex. Compiled once at parse
+/// time, which is also what rejects an invalid regex there rather than at
+/// evaluation.
+#[derive(Debug, Clone)]
+pub struct RegexPattern {
+    source: String,
+    regex: Regex,
+}
+
+impl RegexPattern {
+    /// Compiles `source` as-is (no translation), failing on an invalid regex.
+    pub fn new(source: &str) -> Result<Self, regex::Error> {
+        let regex = Regex::new(source)?;
+        Ok(RegexPattern {
+            source: source.to_string(),
+            regex,
+        })
+    }
+
+    /// The literal pattern text as written in the query, for rendering.
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    /// Whether `value` matches the pattern anywhere (unanchored, as SQL
+    /// `REGEXP` is).
+    pub fn is_match(&self, value: &str) -> bool {
+        self.regex.is_match(value)
+    }
+}
+
+impl PartialEq for RegexPattern {
+    fn eq(&self, other: &Self) -> bool {
+        // See [`LikePattern`]'s impl: the compiled regex is a pure function of
+        // `source`.
+        self.source == other.source
+    }
 }
 
 /// A `HAVING` predicate tree: group-level filtering, evaluated once per group
@@ -696,14 +784,16 @@ fn predicate_label(pred: &Predicate) -> String {
             format!("{} {} {}", expr_label(l), cmp_op_symbol(op), expr_label(r))
         }
         Predicate::Like(expr, pattern, negated) => format!(
-            "{} {}like '{pattern}'",
+            "{} {}like '{}'",
             expr_label(expr),
-            if *negated { "not " } else { "" }
+            if *negated { "not " } else { "" },
+            pattern.source()
         ),
         Predicate::Regexp(expr, pattern, negated) => format!(
-            "{} {}regexp '{pattern}'",
+            "{} {}regexp '{}'",
             expr_label(expr),
-            if *negated { "not " } else { "" }
+            if *negated { "not " } else { "" },
+            pattern.source()
         ),
         Predicate::In(expr, lits, negated) => {
             let rendered: Vec<String> = lits.iter().map(literal_label).collect();

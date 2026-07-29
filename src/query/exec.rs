@@ -18,7 +18,6 @@ use std::time::SystemTime;
 use chrono::{DateTime, Duration, Months, NaiveDate, SecondsFormat, Utc};
 use globset::Glob;
 use indexmap::IndexMap;
-use regex::Regex;
 
 use crate::frontmatter;
 use crate::model::{FileAttr, Record, Value, compare_values};
@@ -196,16 +195,9 @@ fn execute_with_schema_at<'a>(
     if !lenient && !disk_reads_allowed && references_body(q) {
         return Err(ExecError::BodyUnavailable);
     }
-    // Task B1/B2: every `LIKE` and `REGEXP` pattern `q` contains is compiled
-    // to a `Regex` exactly once, here, rather than once per row — reused by
-    // both the filter pass (`filter_records`) and the projection pass
-    // (`Expr::Predicate` inside `eval_expr`) via `ctx`, see [`EvalCtx`].
-    let (like_regexes, regexp_regexes) = compile_pattern_regexes(q);
     let ctx = EvalCtx {
         disk_reads_allowed,
         max_file_bytes,
-        like_regexes: &like_regexes,
-        regexp_regexes: &regexp_regexes,
         // Task B10: this base `ctx` isn't scoped to any single record, so it
         // carries no body memo — `execute_ungrouped` derives a fresh
         // per-record `ctx` (with `Some(&cache)`) around each record's own
@@ -219,16 +211,13 @@ fn execute_with_schema_at<'a>(
 }
 
 /// Per-query state threaded through the filter/project/order pipeline
-/// (`eval_expr`, `eval_predicate`, and everything built on them) alongside
-/// `disk_reads_allowed`: every `LIKE` and `REGEXP` pattern the query
-/// contains, already compiled to a [`Regex`] exactly once per query (Tasks
-/// B1/B2) — see [`compile_pattern_regexes`], [`like_matches`], and
-/// [`regexp_matches`]. `Copy` for the same reason `disk_reads_allowed` was
-/// passed by value everywhere before it: a `bool` plus a couple of shared
-/// references cost nothing to copy at each recursive call — including
-/// `body_cache`, which is itself just a shared reference, so re-pointing it
-/// at a fresh per-record cache (see [`execute_ungrouped`]) is one more `Copy`,
-/// not a clone of anything it points to.
+/// (`eval_expr`, `eval_predicate`, and everything built on them). `Copy` for
+/// the same reason `disk_reads_allowed` was passed by value everywhere before
+/// it: a `bool` plus a `u64` plus a shared reference cost nothing to copy at
+/// each recursive call — including `body_cache`, which is itself just a shared
+/// reference, so re-pointing it at a fresh per-record cache (see
+/// [`execute_ungrouped`]) is one more `Copy`, not a clone of anything it
+/// points to.
 #[derive(Clone, Copy)]
 pub(crate) struct EvalCtx<'a> {
     /// Whether `file.body` disk reads are allowed for this query (design
@@ -237,12 +226,6 @@ pub(crate) struct EvalCtx<'a> {
     /// The largest file `file.body` will read off disk for this query
     /// (security fix B8); see [`read_body`].
     max_file_bytes: u64,
-    /// Every `LIKE` pattern in the query, translated and compiled once,
-    /// keyed by its literal pattern text.
-    like_regexes: &'a HashMap<String, Regex>,
-    /// Every `REGEXP` pattern in the query, compiled once, keyed by its
-    /// literal pattern text.
-    regexp_regexes: &'a HashMap<String, Regex>,
     /// Task B10: the current single record's memoized `file.body`, if this
     /// `ctx` is scoped to one record's evaluation. `None` for `ctx` values
     /// that aren't record-scoped (the query-wide base `ctx`, and every
@@ -260,133 +243,6 @@ pub(crate) struct EvalCtx<'a> {
     /// — worse — leak a stale value into the next record if this field were
     /// ever mistakenly left populated across the loop iteration).
     body_cache: Option<&'a RefCell<Option<Value>>>,
-}
-
-/// Compiles every `LIKE` pattern `q` contains into its translated [`Regex`],
-/// and every `REGEXP` pattern into its `Regex` (already proven to compile at
-/// parse time by `parse::lower_regexp`), each exactly once and keyed by
-/// literal pattern text, so [`like_matches`]/[`regexp_matches`] never
-/// recompile the same pattern twice across a query — not in the filter pass
-/// nor the projection pass, and not across rows.
-///
-/// Walks every position a `Predicate::Like`/`Predicate::Regexp` can appear:
-/// `SELECT` expressions (a searched `CASE WHEN` can embed one via
-/// [`Expr::Predicate`]), the `WHERE` filter, and `ORDER BY`'s
-/// computed-expression target. `GROUP BY` (bare `ColRef`s only) and `HAVING`
-/// (see [`Having`]) never contain either, so neither is walked. Two nodes of
-/// the same kind sharing pattern text collapse to one map entry each —
-/// `LIKE` is always case-sensitive (see [`compile_like_pattern`]) and
-/// `REGEXP` has no per-occurrence flags, so the pattern text alone
-/// determines the compiled regex in both maps.
-fn compile_pattern_regexes(q: &Query) -> (HashMap<String, Regex>, HashMap<String, Regex>) {
-    let mut like_patterns = HashSet::new();
-    let mut regexp_patterns = HashSet::new();
-    for item in &q.select {
-        if let SelectExpr::Expr(expr) = &item.expr {
-            collect_regex_patterns_expr(expr, &mut like_patterns, &mut regexp_patterns);
-        }
-    }
-    if let Some(pred) = &q.filter {
-        collect_regex_patterns_predicate(pred, &mut like_patterns, &mut regexp_patterns);
-    }
-    for key in &q.order_by {
-        if let OrderTarget::Expr(expr) = &key.target {
-            collect_regex_patterns_expr(expr, &mut like_patterns, &mut regexp_patterns);
-        }
-    }
-    let like_regexes = like_patterns
-        .into_iter()
-        .map(|pattern| {
-            let regex = compile_like_pattern(&pattern);
-            (pattern, regex)
-        })
-        .collect();
-    let regexp_regexes = regexp_patterns
-        .into_iter()
-        .map(|pattern| {
-            let regex =
-                Regex::new(&pattern).expect("REGEXP pattern validated to compile at parse time");
-            (pattern, regex)
-        })
-        .collect();
-    (like_regexes, regexp_regexes)
-}
-
-/// Walks `expr`'s positions for a `LIKE`/`REGEXP` pattern, for
-/// [`compile_pattern_regexes`] — mirrors [`collect_expr_fields`]-style walks
-/// elsewhere in the crate.
-fn collect_regex_patterns_expr(
-    expr: &Expr,
-    like_patterns: &mut HashSet<String>,
-    regexp_patterns: &mut HashSet<String>,
-) {
-    match expr {
-        Expr::Col(_) | Expr::Lit(_) => {}
-        Expr::Scalar(_, args) | Expr::Coalesce(args) => {
-            for arg in args {
-                collect_regex_patterns_expr(arg, like_patterns, regexp_patterns);
-            }
-        }
-        Expr::Binary(_, l, r) => {
-            collect_regex_patterns_expr(l, like_patterns, regexp_patterns);
-            collect_regex_patterns_expr(r, like_patterns, regexp_patterns);
-        }
-        Expr::Case {
-            operand,
-            whens,
-            else_expr,
-        } => {
-            if let Some(op) = operand {
-                collect_regex_patterns_expr(op, like_patterns, regexp_patterns);
-            }
-            for (cond, then) in whens {
-                collect_regex_patterns_expr(cond, like_patterns, regexp_patterns);
-                collect_regex_patterns_expr(then, like_patterns, regexp_patterns);
-            }
-            if let Some(e) = else_expr {
-                collect_regex_patterns_expr(e, like_patterns, regexp_patterns);
-            }
-        }
-        Expr::Predicate(pred) => {
-            collect_regex_patterns_predicate(pred, like_patterns, regexp_patterns)
-        }
-    }
-}
-
-/// Walks a `WHERE`-style predicate tree's positions for a `LIKE`/`REGEXP`
-/// pattern, for [`compile_pattern_regexes`].
-fn collect_regex_patterns_predicate(
-    pred: &Predicate,
-    like_patterns: &mut HashSet<String>,
-    regexp_patterns: &mut HashSet<String>,
-) {
-    match pred {
-        Predicate::Like(expr, pattern, _) => {
-            collect_regex_patterns_expr(expr, like_patterns, regexp_patterns);
-            like_patterns.insert(pattern.clone());
-        }
-        Predicate::Regexp(expr, pattern, _) => {
-            collect_regex_patterns_expr(expr, like_patterns, regexp_patterns);
-            regexp_patterns.insert(pattern.clone());
-        }
-        Predicate::Compare(l, _, r) => {
-            collect_regex_patterns_expr(l, like_patterns, regexp_patterns);
-            collect_regex_patterns_expr(r, like_patterns, regexp_patterns);
-        }
-        Predicate::IsNull(expr, _) | Predicate::In(expr, _, _) => {
-            collect_regex_patterns_expr(expr, like_patterns, regexp_patterns)
-        }
-        Predicate::MemberOf(value, _, _) => {
-            collect_regex_patterns_expr(value, like_patterns, regexp_patterns)
-        }
-        Predicate::And(a, b) | Predicate::Or(a, b) => {
-            collect_regex_patterns_predicate(a, like_patterns, regexp_patterns);
-            collect_regex_patterns_predicate(b, like_patterns, regexp_patterns);
-        }
-        Predicate::Not(inner) => {
-            collect_regex_patterns_predicate(inner, like_patterns, regexp_patterns)
-        }
-    }
 }
 
 /// Replaces every `Literal::RelativeDate` in `q` with the `Literal::Str`
@@ -461,8 +317,9 @@ fn rewrite_expr_literals(expr: &mut Expr, now: SystemTime) {
 /// tested `Expr` (and every `IN` list element), `MemberOf`'s value `Expr`,
 /// and `Regexp`'s `Expr` operand — all now equally general, so the widened
 /// operands can carry a relative-date literal the same as `Compare` always
-/// could. `Like`/`Regexp`'s pattern is a plain `String` (never a `Literal`),
-/// so neither needs a rewrite of its own beyond the tested expression.
+/// could. `Like`/`Regexp`'s pattern is a compiled pattern over literal text
+/// (never a `Literal`), so neither needs a rewrite of its own beyond the
+/// tested expression.
 fn rewrite_predicate_literals(pred: &mut Predicate, now: SystemTime) {
     match pred {
         Predicate::Compare(l, _, r) => {
@@ -2048,11 +1905,7 @@ fn eval_predicate(record: &Record, pred: &Predicate, ctx: EvalCtx<'_>) -> Option
             if value.is_null() {
                 return None;
             }
-            let base = Some(like_matches(
-                &value.to_cmp_string(),
-                pattern,
-                ctx.like_regexes,
-            ));
+            let base = Some(pattern.is_match(&value.to_cmp_string()));
             maybe_negate(base, *negated)
         }
         Predicate::Regexp(expr, pattern, negated) => {
@@ -2060,11 +1913,7 @@ fn eval_predicate(record: &Record, pred: &Predicate, ctx: EvalCtx<'_>) -> Option
             if value.is_null() {
                 return None;
             }
-            let base = Some(regexp_matches(
-                &value.display(),
-                pattern,
-                ctx.regexp_regexes,
-            ));
+            let base = Some(pattern.is_match(&value.display()));
             maybe_negate(base, *negated)
         }
         Predicate::In(expr, literals, negated) => {
@@ -2180,43 +2029,6 @@ fn apply_cmp(op: &CmpOp, ordering: Ordering) -> bool {
         CmpOp::Gt => ordering == Ordering::Greater,
         CmpOp::Ge => ordering != Ordering::Less,
     }
-}
-
-/// Matches `value` against a SQL `LIKE` pattern: `%` becomes `.*`, `_`
-/// becomes `.`, and everything else is matched literally (case-sensitive).
-///
-/// `like_regexes` is [`compile_pattern_regexes`]'s output — `pattern` was
-/// translated and compiled into it exactly once, up front, rather than here
-/// on every call (Task B1), so this is just a lookup.
-fn like_matches(value: &str, pattern: &str, like_regexes: &HashMap<String, Regex>) -> bool {
-    let re = like_regexes
-        .get(pattern)
-        .expect("compile_pattern_regexes pre-compiles every LIKE pattern the query tree contains");
-    re.is_match(value)
-}
-
-/// Translates a `LIKE` pattern into the compiled [`Regex`] [`like_matches`]
-/// matches against, for [`compile_pattern_regexes`]: `%` becomes `.*`, `_`
-/// becomes `.`, and everything else is escaped and matched literally
-/// (case-sensitive), anchored over the whole value (`^…$`).
-fn compile_like_pattern(pattern: &str) -> Regex {
-    let escaped = regex::escape(pattern);
-    let translated = escaped.replace('%', ".*").replace('_', ".");
-    // `translated` is `regex::escape`'s output with only `.*`/`.` substituted
-    // in, so wrapping it in `^…$` is always a valid regex.
-    Regex::new(&format!("^{translated}$")).expect("LIKE pattern translates to a well-formed regex")
-}
-
-/// Matches `value` against a `REGEXP` pattern. `regexp_regexes` is
-/// [`compile_pattern_regexes`]'s output — `pattern` was already proven to
-/// compile by `parse::lower_regexp` at parse time and compiled into this map
-/// exactly once, up front, rather than here on every call (Task B2), so this
-/// is just a lookup, mirroring [`like_matches`].
-fn regexp_matches(value: &str, pattern: &str, regexp_regexes: &HashMap<String, Regex>) -> bool {
-    let re = regexp_regexes.get(pattern).expect(
-        "compile_pattern_regexes pre-compiles every REGEXP pattern the query tree contains",
-    );
-    re.is_match(value)
 }
 
 /// An `ORDER BY` target resolved against the projection, so sorting doesn't

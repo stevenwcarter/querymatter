@@ -17,15 +17,14 @@
 //! understand — is rejected with a [`ParseError`] rather than silently
 //! ignored.
 
-use regex::Regex;
 use sqlparser::ast as sql;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::model::FileAttr;
 use crate::query::ast::{
-    Aggregate, BinOp, CmpOp, ColRef, Expr, Having, HavingLeaf, Literal, OrderKey, OrderTarget,
-    Predicate, Query, RelDate, ScalarFn, SelectExpr, SelectItem,
+    Aggregate, BinOp, CmpOp, ColRef, Expr, Having, HavingLeaf, LikePattern, Literal, OrderKey,
+    OrderTarget, Predicate, Query, RegexPattern, RelDate, ScalarFn, SelectExpr, SelectItem,
 };
 
 /// An error produced while parsing or lowering a query.
@@ -650,7 +649,7 @@ fn lower_predicate(expr: &sql::Expr) -> Result<Predicate, ParseError> {
             ..
         } => Ok(Predicate::Like(
             lower_expr(expr)?,
-            string_literal(pattern, "LIKE")?,
+            LikePattern::new(&string_literal(pattern, "LIKE")?),
             *negated,
         )),
         sql::Expr::RLike {
@@ -681,10 +680,10 @@ fn lower_predicate(expr: &sql::Expr) -> Result<Predicate, ParseError> {
 
 /// Lowers `<expr> [NOT] REGEXP '<pattern>'` (sqlparser's `RLike` node also
 /// covers the `RLIKE` keyword alias — identical semantics, see
-/// [`Predicate::Regexp`]). The pattern is compiled here purely to reject an
-/// invalid regex at parse time rather than on every row at evaluation time;
-/// the compiled `Regex` itself is discarded — `exec::eval_predicate`
-/// recompiles it against each record.
+/// [`Predicate::Regexp`]). The pattern is compiled here, once: that both
+/// rejects an invalid regex at parse time rather than on every row at
+/// evaluation time, and hands the compiled [`RegexPattern`] to the AST, so
+/// `exec::eval_predicate` only ever matches against it.
 fn lower_regexp(
     expr: &sql::Expr,
     pattern: &sql::Expr,
@@ -692,8 +691,9 @@ fn lower_regexp(
 ) -> Result<Predicate, ParseError> {
     let operand = lower_expr(expr)?;
     let pat = string_literal(pattern, "REGEXP")?;
-    Regex::new(&pat).map_err(|e| unsupported(format!("invalid regex `{pat}`: {e}")))?;
-    Ok(Predicate::Regexp(operand, pat, negated))
+    let compiled =
+        RegexPattern::new(&pat).map_err(|e| unsupported(format!("invalid regex `{pat}`: {e}")))?;
+    Ok(Predicate::Regexp(operand, compiled, negated))
 }
 
 /// Lowers `NOT <expr>`. sqlparser 0.62 rejects the postfix `<value> NOT
@@ -1297,7 +1297,7 @@ mod tests {
         );
         match q.filter.unwrap() {
             Predicate::Like(Expr::Col(ColRef::File(FileAttr::Body)), pattern, false) => {
-                assert_eq!(pattern, "%TODO%")
+                assert_eq!(pattern, LikePattern::new("%TODO%"))
             }
             p => panic!("unexpected {p:?}"),
         }
@@ -1341,7 +1341,7 @@ mod tests {
                 .filter,
             Some(Predicate::Like(
                 Expr::Col(ColRef::Field(vec!["slice".into()])),
-                "mobile%".into(),
+                LikePattern::new("mobile%"),
                 false
             ))
         );
@@ -1351,7 +1351,7 @@ mod tests {
                 .filter,
             Some(Predicate::Like(
                 Expr::Col(ColRef::Field(vec!["slice".into()])),
-                "mobile%".into(),
+                LikePattern::new("mobile%"),
                 true
             ))
         );
@@ -1386,7 +1386,7 @@ mod tests {
                     ScalarFn::Lower,
                     vec![Expr::Col(ColRef::Field(vec!["status".into()]))]
                 ),
-                "%d%".into(),
+                LikePattern::new("%d%"),
                 false
             ))
         );
@@ -1409,7 +1409,7 @@ mod tests {
                 .filter,
             Some(Predicate::Regexp(
                 Expr::Col(ColRef::Field(vec!["jira".into()])),
-                "^DCP-[0-9]+$".into(),
+                RegexPattern::new("^DCP-[0-9]+$").unwrap(),
                 false
             ))
         );
@@ -1419,7 +1419,7 @@ mod tests {
                 .filter,
             Some(Predicate::Regexp(
                 Expr::Col(ColRef::Field(vec!["jira".into()])),
-                "^DCP-".into(),
+                RegexPattern::new("^DCP-").unwrap(),
                 true
             ))
         );
@@ -1435,7 +1435,7 @@ mod tests {
                     ScalarFn::Lower,
                     vec![Expr::Col(ColRef::Field(vec!["status".into()]))]
                 ),
-                "draft".into(),
+                RegexPattern::new("draft").unwrap(),
                 false
             ))
         );
@@ -1447,7 +1447,7 @@ mod tests {
                 .filter,
             Some(Predicate::Regexp(
                 Expr::Col(ColRef::Field(vec!["jira".into()])),
-                "^DCP-".into(),
+                RegexPattern::new("^DCP-").unwrap(),
                 false
             ))
         );
@@ -2161,15 +2161,16 @@ mod tests {
 
     #[test]
     fn like_pattern_resembling_reldate_stays_literal_text() {
-        // `Predicate::Like`'s pattern is a plain `String`, never a
-        // `Literal` — it must never be reinterpreted as a relative date
-        // even when the pattern text happens to match the grammar.
+        // `Predicate::Like`'s pattern is a `LikePattern` over the literal
+        // pattern text, never a `Literal` — it must never be reinterpreted as
+        // a relative date even when the pattern text happens to match the
+        // grammar.
         let q = parse("SELECT file.name WHERE jira LIKE '-7d'").unwrap();
         assert_eq!(
             q.filter,
             Some(Predicate::Like(
                 Expr::Col(ColRef::Field(vec!["jira".into()])),
-                "-7d".into(),
+                LikePattern::new("-7d"),
                 false
             ))
         );
