@@ -23,8 +23,9 @@ use sqlparser::parser::Parser;
 
 use crate::model::FileAttr;
 use crate::query::ast::{
-    Aggregate, BinOp, CmpOp, ColRef, Expr, Having, HavingLeaf, LikePattern, Literal, OrderKey,
-    OrderTarget, Predicate, Query, RegexPattern, RelDate, ScalarFn, SelectExpr, SelectItem,
+    Aggregate, BinOp, CmpOp, ColRef, Expr, GroupedOrderKey, GroupedOrderTarget, Grouping, Having,
+    HavingLeaf, LikePattern, Literal, OrderKey, OrderTarget, Predicate, Query, RegexPattern,
+    RelDate, ScalarFn, SelectExpr, SelectItem,
 };
 
 /// An error produced while parsing or lowering a query.
@@ -89,31 +90,77 @@ fn lower_query(query: &sql::Query) -> Result<Query, ParseError> {
         .collect();
 
     let filter = select.selection.as_ref().map(lower_predicate).transpose()?;
-    let group_by = lower_group_by(&select.group_by, &select_items)?;
+    let keys = lower_group_by(&select.group_by, &select_items)?;
     let distinct = lower_distinct(select.distinct.as_ref())?;
-    if distinct && !group_by.is_empty() {
-        // A grouped query already yields one row per distinct group key, so
-        // combining the two is redundant/confusing rather than meaningful.
-        return Err(unsupported("DISTINCT combined with GROUP BY"));
-    }
-    let having = lower_having(select.having.as_ref(), &group_by, &select_items)?;
-    let order_by = lower_order_by(query.order_by.as_ref(), &aliases, &group_by)?;
+    let grouping = lower_grouping(
+        query.order_by.as_ref(),
+        select.having.as_ref(),
+        distinct,
+        keys,
+        &select_items,
+        &aliases,
+    )?;
     let (limit, offset) = lower_limit(query.limit_clause.as_ref())?;
 
     Ok(Query {
         select: select_items,
-        distinct,
         from_glob,
         filter,
-        group_by,
-        having,
-        order_by,
+        grouping,
         limit,
         offset,
     })
 }
 
-/// Lowers the `SELECT [DISTINCT | ALL]` marker to `Query.distinct`.
+/// Builds the [`Grouping`] variant this query belongs to, lowering `HAVING`
+/// and `ORDER BY` into whichever side accepts them.
+///
+/// A query is grouped when it has explicit `GROUP BY` keys *or* any aggregate
+/// `SELECT` item (the implicit single group) — the same test the executor
+/// used to make for itself when it dispatched between its two pipelines, made
+/// once here so the two can never disagree.
+///
+/// `DISTINCT` belongs to the ungrouped side only: a grouped query already
+/// yields one row per distinct group key, so combining the two is
+/// redundant/confusing rather than meaningful. Both rejections say so, in the
+/// terms the query itself used — an explicit `GROUP BY`, or the aggregate
+/// that grouped it implicitly.
+fn lower_grouping(
+    order_by: Option<&sql::OrderBy>,
+    having: Option<&sql::Expr>,
+    distinct: bool,
+    keys: Vec<ColRef>,
+    select_items: &[SelectItem],
+    aliases: &[&str],
+) -> Result<Grouping, ParseError> {
+    let has_aggregate = select_items
+        .iter()
+        .any(|item| matches!(item.expr, SelectExpr::Agg(_)));
+    if !keys.is_empty() || has_aggregate {
+        if distinct {
+            return Err(unsupported(if keys.is_empty() {
+                "DISTINCT combined with aggregate functions"
+            } else {
+                "DISTINCT combined with GROUP BY"
+            }));
+        }
+        return Ok(Grouping::Grouped {
+            having: lower_having(having, &keys, select_items)?,
+            order_by: lower_grouped_order_by(order_by, aliases, &keys)?,
+            keys,
+        });
+    }
+    if having.is_some() {
+        return Err(unsupported("HAVING requires GROUP BY"));
+    }
+    Ok(Grouping::Ungrouped {
+        distinct,
+        order_by: lower_order_by(order_by, aliases)?,
+    })
+}
+
+/// Lowers the `SELECT [DISTINCT | ALL]` marker to the flag
+/// [`lower_grouping`] either stores on [`Grouping::Ungrouped`] or rejects.
 ///
 /// Only the plain `DISTINCT` form sets the flag; a bare `SELECT` and the
 /// explicit `ALL` form (which just spells out the default of keeping
@@ -875,7 +922,7 @@ fn lower_group_by(
 
 /// Lowers a single `GROUP BY` expression. A bare identifier that matches a
 /// `SELECT` alias resolves to that item's underlying column — mirroring
-/// [`lower_order_expr`], the alias wins even when a real field shares the
+/// [`lower_order_target`], the alias wins even when a real field shares the
 /// same name. An alias on an aggregate or a computed expression is not a
 /// valid grouping key, since there is no single column to group rows by.
 /// Anything else (including a `file.*` compound identifier) falls back to
@@ -903,9 +950,11 @@ fn lower_group_by_expr(
 }
 
 /// Lowers a `HAVING` clause into a [`Having`] tree, or `None` when the query
-/// has no `HAVING`. `HAVING` on an ungrouped query (`group_by` empty) is
-/// rejected — it only makes sense to filter on group aggregates once there
-/// are groups.
+/// has no `HAVING`. Called only for a grouped query ([`lower_grouping`]
+/// rejects `HAVING` outright on an ungrouped one), and rejects it again when
+/// `group_by` is empty — the implicit single group of an aggregate-only
+/// `SELECT` has no grouping keys to filter on, so `HAVING` there is as
+/// meaningless as it is with no grouping at all.
 fn lower_having(
     having: Option<&sql::Expr>,
     group_by: &[ColRef],
@@ -1099,69 +1148,104 @@ fn flip_cmp_op(op: CmpOp) -> CmpOp {
     }
 }
 
-/// Lowers an `ORDER BY` clause, resolving identifiers that match a projection
-/// alias to [`OrderTarget::Alias`], a bare aggregate call to
-/// [`OrderTarget::Agg`], a bare column to [`OrderTarget::Col`], and anything
-/// else (arithmetic, a scalar-fn call, `CASE`, …) to [`OrderTarget::Expr`]
-/// via [`lower_expr`].
+/// Lowers an ungrouped query's `ORDER BY` clause. A bare aggregate call has
+/// no sort target to lower into here — [`OrderTarget`] has no aggregate
+/// variant — so it is rejected outright, mirroring how [`lower_having`]
+/// rejects `HAVING` without a `GROUP BY`.
 fn lower_order_by(
     order_by: Option<&sql::OrderBy>,
     aliases: &[&str],
-    group_by: &[ColRef],
 ) -> Result<Vec<OrderKey>, ParseError> {
-    let Some(order_by) = order_by else {
-        return Ok(Vec::new());
-    };
-    let exprs = match &order_by.kind {
-        sql::OrderByKind::Expressions(exprs) => exprs,
-        sql::OrderByKind::All(_) => return Err(unsupported("ORDER BY ALL")),
-    };
-    exprs
+    order_by_terms(order_by)?
         .iter()
-        .map(|order| lower_order_expr(order, aliases, group_by))
+        .map(|order| match try_order_aggregate(&order.expr)? {
+            Some(_) => Err(unsupported("ORDER BY an aggregate requires GROUP BY")),
+            None => Ok(OrderKey {
+                target: lower_order_target(&order.expr, aliases)?,
+                desc: is_desc(order),
+            }),
+        })
         .collect()
 }
 
-/// Lowers a single `ORDER BY` term. A `Function` expression is a bare
-/// aggregate call (e.g. `ORDER BY count(*) DESC`, no `AS` alias needed) —
-/// checked before the alias/column/expression fallbacks, and only valid
-/// alongside a non-empty `group_by`, mirroring how [`lower_having`] rejects
-/// an aggregate on an ungrouped query (including the implicit single-group
-/// case, where `group_by` is empty too).
+/// Lowers a grouped query's `ORDER BY` clause, which additionally accepts a
+/// bare aggregate call (e.g. `ORDER BY count(*) DESC`, no `AS` alias needed).
 ///
-/// [`lower_aggregate`] runs FIRST, before the `group_by` check: it already
-/// rejects a non-aggregate function name (e.g. `ORDER BY upper(status)`)
-/// with a clean "function `upper`" message, so that case must never be
-/// misreported as "requires GROUP BY" — a message that only makes sense once
-/// the function is confirmed to actually be an aggregate. A bare identifier
-/// or compound identifier lowers to a plain column via [`lower_col_ref`],
-/// exactly as before this generalized to expressions; everything else
-/// (arithmetic, `CASE`, a scalar-fn call, …) lowers through [`lower_expr`]
-/// into [`OrderTarget::Expr`], so `ORDER BY` accepts the same expression
-/// grammar a `SELECT` item does.
-fn lower_order_expr(
-    order: &sql::OrderByExpr,
+/// That aggregate form still requires *explicit* `keys`: the implicit single
+/// group of an aggregate-only `SELECT` doesn't qualify, matching how
+/// [`lower_having`] rejects `HAVING` on the same query shape.
+fn lower_grouped_order_by(
+    order_by: Option<&sql::OrderBy>,
     aliases: &[&str],
-    group_by: &[ColRef],
-) -> Result<OrderKey, ParseError> {
-    let desc = order.options.asc == Some(false);
-    let target = match &order.expr {
-        sql::Expr::Function(func) => {
-            let agg = lower_aggregate(func)?;
-            if group_by.is_empty() {
-                return Err(unsupported("ORDER BY an aggregate requires GROUP BY"));
-            }
-            OrderTarget::Agg(agg)
-        }
+    keys: &[ColRef],
+) -> Result<Vec<GroupedOrderKey>, ParseError> {
+    order_by_terms(order_by)?
+        .iter()
+        .map(|order| {
+            let target = match try_order_aggregate(&order.expr)? {
+                Some(_) if keys.is_empty() => {
+                    return Err(unsupported("ORDER BY an aggregate requires GROUP BY"));
+                }
+                Some(agg) => GroupedOrderTarget::Agg(agg),
+                None => GroupedOrderTarget::Scalar(lower_order_target(&order.expr, aliases)?),
+            };
+            Ok(GroupedOrderKey {
+                target,
+                desc: is_desc(order),
+            })
+        })
+        .collect()
+}
+
+/// The terms of an `ORDER BY` clause, or an empty slice when the query has no
+/// `ORDER BY` at all. `ORDER BY ALL` is outside this subset.
+fn order_by_terms(order_by: Option<&sql::OrderBy>) -> Result<&[sql::OrderByExpr], ParseError> {
+    let Some(order_by) = order_by else {
+        return Ok(&[]);
+    };
+    match &order_by.kind {
+        sql::OrderByKind::Expressions(exprs) => Ok(exprs),
+        sql::OrderByKind::All(_) => Err(unsupported("ORDER BY ALL")),
+    }
+}
+
+/// Lowers an `ORDER BY` term's aggregate form, if it has one: a function call
+/// is always a bare aggregate here, and anything else is `None` so the caller
+/// falls through to [`lower_order_target`].
+///
+/// [`lower_aggregate`] runs FIRST, before either caller's "requires GROUP BY"
+/// check: it already rejects a non-aggregate function name (e.g. `ORDER BY
+/// upper(status)`) with a clean "function `upper`" message, so that case must
+/// never be misreported as "requires GROUP BY" — a message that only makes
+/// sense once the function is confirmed to actually be an aggregate.
+fn try_order_aggregate(expr: &sql::Expr) -> Result<Option<Aggregate>, ParseError> {
+    match expr {
+        sql::Expr::Function(func) => Ok(Some(lower_aggregate(func)?)),
+        _ => Ok(None),
+    }
+}
+
+/// Lowers an `ORDER BY` term's non-aggregate target: an identifier matching a
+/// projection alias becomes [`OrderTarget::Alias`], a bare or compound
+/// identifier a plain column via [`lower_col_ref`], and everything else
+/// (arithmetic, `CASE`, a scalar-fn call, …) an [`OrderTarget::Expr`] via
+/// [`lower_expr`] — so `ORDER BY` accepts the same expression grammar a
+/// `SELECT` item does.
+fn lower_order_target(expr: &sql::Expr, aliases: &[&str]) -> Result<OrderTarget, ParseError> {
+    match expr {
         sql::Expr::Identifier(ident) if aliases.contains(&ident.value.as_str()) => {
-            OrderTarget::Alias(ident.value.clone())
+            Ok(OrderTarget::Alias(ident.value.clone()))
         }
         sql::Expr::Identifier(_) | sql::Expr::CompoundIdentifier(_) => {
-            OrderTarget::Col(lower_col_ref(&order.expr)?)
+            Ok(OrderTarget::Col(lower_col_ref(expr)?))
         }
-        other => OrderTarget::Expr(lower_expr(other)?),
-    };
-    Ok(OrderKey { target, desc })
+        other => Ok(OrderTarget::Expr(lower_expr(other)?)),
+    }
+}
+
+/// Whether an `ORDER BY` term asked for `DESC`; `ASC` is the default.
+fn is_desc(order: &sql::OrderByExpr) -> bool {
+    order.options.asc == Some(false)
 }
 
 /// Lowers a `LIMIT` / `OFFSET` clause into `(limit, offset)`.
@@ -1222,6 +1306,30 @@ mod tests {
     use crate::model::FileAttr;
     use crate::query::ast::*;
 
+    /// The `GROUP BY` keys, `HAVING`, and `ORDER BY` of a query the test
+    /// expects to have lowered to [`Grouping::Grouped`] — panicking when it
+    /// didn't, since an assertion about those clauses is meaningless on a
+    /// query the parser decided was ungrouped.
+    fn grouped(q: &Query) -> (&[ColRef], Option<&Having>, &[GroupedOrderKey]) {
+        match &q.grouping {
+            Grouping::Grouped {
+                keys,
+                having,
+                order_by,
+            } => (keys, having.as_ref(), order_by),
+            Grouping::Ungrouped { .. } => panic!("expected a grouped query: {:?}", q.grouping),
+        }
+    }
+
+    /// The `DISTINCT` flag and `ORDER BY` of a query the test expects to have
+    /// lowered to [`Grouping::Ungrouped`]; the counterpart to [`grouped`].
+    fn ungrouped(q: &Query) -> (bool, &[OrderKey]) {
+        match &q.grouping {
+            Grouping::Ungrouped { distinct, order_by } => (*distinct, order_by),
+            Grouping::Grouped { .. } => panic!("expected an ungrouped query: {:?}", q.grouping),
+        }
+    }
+
     #[test]
     fn select_fields_with_alias_no_from() {
         let q = parse("SELECT status, count(*) AS Count GROUP BY status").unwrap();
@@ -1239,7 +1347,8 @@ mod tests {
                 alias: Some("Count".into())
             }
         );
-        assert_eq!(q.group_by, vec![ColRef::Field(vec!["status".into()])]);
+        let (keys, _, _) = grouped(&q);
+        assert_eq!(keys, [ColRef::Field(vec!["status".into()])]);
         assert_eq!(q.from_glob, None);
     }
     #[test]
@@ -1509,10 +1618,11 @@ mod tests {
         let q =
             parse("SELECT status, count(*) AS n GROUP BY status ORDER BY n DESC LIMIT 5 OFFSET 2")
                 .unwrap();
+        let (_, _, order_by) = grouped(&q);
         assert_eq!(
-            q.order_by,
-            vec![OrderKey {
-                target: OrderTarget::Alias("n".into()),
+            order_by,
+            [GroupedOrderKey {
+                target: GroupedOrderTarget::Scalar(OrderTarget::Alias("n".into())),
                 desc: true
             }]
         );
@@ -1524,10 +1634,11 @@ mod tests {
         // No `AS` alias needed: `ORDER BY count(*)` lowers straight to an
         // aggregate order target.
         let q = parse("SELECT status, count(*) GROUP BY status ORDER BY count(*) DESC").unwrap();
+        let (_, _, order_by) = grouped(&q);
         assert_eq!(
-            q.order_by,
-            vec![OrderKey {
-                target: OrderTarget::Agg(Aggregate::CountStar),
+            order_by,
+            [GroupedOrderKey {
+                target: GroupedOrderTarget::Agg(Aggregate::CountStar),
                 desc: true
             }]
         );
@@ -1540,9 +1651,10 @@ mod tests {
         // expression grammar a `SELECT` item accepts.
         let q =
             parse("SELECT status ORDER BY CASE WHEN status = 'draft' THEN 0 ELSE 1 END").unwrap();
+        let (_, order_by) = ungrouped(&q);
         assert_eq!(
-            q.order_by,
-            vec![OrderKey {
+            order_by,
+            [OrderKey {
                 target: OrderTarget::Expr(Expr::Case {
                     operand: None,
                     whens: vec![(
@@ -1565,14 +1677,15 @@ mod tests {
     }
     #[test]
     fn order_by_aggregate_implicit_group_errors() {
-        // `group_by` is empty here too (there's no explicit GROUP BY, only
-        // an implicit single group from the bare aggregate SELECT item),
-        // matching how `HAVING` rejects that same case.
+        // This query IS grouped (the bare aggregate SELECT item makes one
+        // implicit group), but its grouping `keys` are empty — and an
+        // aggregate ORDER BY needs a real GROUP BY, matching how `HAVING`
+        // rejects that same case.
         assert!(crate::query::parse("SELECT count(*) ORDER BY count(*)").is_err());
     }
     #[test]
     fn order_by_scalar_fn_does_not_claim_requires_group_by() {
-        // `upper` isn't an aggregate at all, so an empty `group_by` must
+        // `upper` isn't an aggregate at all, so the absent GROUP BY must
         // never be blamed — the error should name the unsupported function
         // instead of the (irrelevant) GROUP BY requirement.
         let err = crate::query::parse("SELECT status ORDER BY upper(status)").unwrap_err();
@@ -1585,14 +1698,16 @@ mod tests {
         // GROUP BY s resolves through the `status AS s` alias, exactly as
         // `GROUP BY status` would.
         let q = parse("SELECT status AS s, count(*) AS n GROUP BY s ORDER BY s").unwrap();
-        assert_eq!(q.group_by, vec![ColRef::Field(vec!["status".into()])]);
+        let (keys, _, _) = grouped(&q);
+        assert_eq!(keys, [ColRef::Field(vec!["status".into()])]);
     }
     #[test]
     fn group_by_alias_precedence_over_same_named_field() {
         // A name that is both a real field and a SELECT alias resolves to
         // the alias, matching how ORDER BY resolves the same ambiguity.
         let q = parse("SELECT jira AS status, count(*) AS n GROUP BY status").unwrap();
-        assert_eq!(q.group_by, vec![ColRef::Field(vec!["jira".into()])]);
+        let (keys, _, _) = grouped(&q);
+        assert_eq!(keys, [ColRef::Field(vec!["jira".into()])]);
     }
     #[test]
     fn group_by_alias_on_aggregate_or_expr_is_rejected() {
@@ -1646,7 +1761,8 @@ mod tests {
             q.select[5].expr,
             SelectExpr::Agg(Aggregate::Count(ColRef::Field(vec!["status".into()]), true))
         );
-        assert_eq!(q.group_by, vec![ColRef::Field(vec!["epic".into()])]);
+        let (keys, _, _) = grouped(&q);
+        assert_eq!(keys, [ColRef::Field(vec!["epic".into()])]);
     }
     #[test]
     fn unsupported_join_errors() {
@@ -1874,9 +1990,10 @@ mod tests {
     #[test]
     fn having_lowers_to_compare_of_agg_and_literal() {
         let q = parse("SELECT status, count(*) AS n GROUP BY status HAVING count(*) > 1").unwrap();
+        let (_, having, _) = grouped(&q);
         assert_eq!(
-            q.having,
-            Some(Having::Compare(
+            having,
+            Some(&Having::Compare(
                 HavingLeaf::Agg(Aggregate::CountStar),
                 CmpOp::Gt,
                 Literal::Int(1)
@@ -1886,9 +2003,10 @@ mod tests {
     #[test]
     fn having_leaf_may_be_a_grouping_key_column() {
         let q = parse("SELECT status GROUP BY status HAVING status = 'draft'").unwrap();
+        let (_, having, _) = grouped(&q);
         assert_eq!(
-            q.having,
-            Some(Having::Compare(
+            having,
+            Some(&Having::Compare(
                 HavingLeaf::Group(ColRef::Field(vec!["status".into()])),
                 CmpOp::Eq,
                 Literal::Str("draft".into())
@@ -1898,9 +2016,10 @@ mod tests {
     #[test]
     fn having_leaf_on_right_flips_operator() {
         let q = parse("SELECT status GROUP BY status HAVING 1 < count(*)").unwrap();
+        let (_, having, _) = grouped(&q);
         assert_eq!(
-            q.having,
-            Some(Having::Compare(
+            having,
+            Some(&Having::Compare(
                 HavingLeaf::Agg(Aggregate::CountStar),
                 CmpOp::Gt,
                 Literal::Int(1)
@@ -1913,7 +2032,8 @@ mod tests {
             "SELECT status GROUP BY status HAVING count(*) > 1 AND NOT (status = 'draft' OR status = 'x')",
         )
         .unwrap();
-        assert!(matches!(q.having, Some(Having::And(_, _))));
+        let (_, having, _) = grouped(&q);
+        assert!(matches!(having, Some(Having::And(_, _))));
     }
     #[test]
     fn having_non_group_key_column_is_unsupported() {
@@ -1936,9 +2056,10 @@ mod tests {
         // `count` is the alias for count(*); HAVING resolves it to the
         // aggregate, exactly as if the user had written `HAVING count(*) > 1`.
         let q = parse("SELECT type, count(*) AS count GROUP BY type HAVING count > 1").unwrap();
+        let (_, having, _) = grouped(&q);
         assert_eq!(
-            q.having,
-            Some(Having::Compare(
+            having,
+            Some(&Having::Compare(
                 HavingLeaf::Agg(Aggregate::CountStar),
                 CmpOp::Gt,
                 Literal::Int(1)
@@ -1947,16 +2068,17 @@ mod tests {
         // The alias form and the aggregate-call form must lower identically.
         let agg_form =
             parse("SELECT type, count(*) AS count GROUP BY type HAVING count(*) > 1").unwrap();
-        assert_eq!(q.having, agg_form.having);
+        assert_eq!(having, grouped(&agg_form).1);
     }
     #[test]
     fn having_resolves_an_aggregate_alias_on_either_side() {
         // Alias resolution also works when the leaf is on the right of the
         // comparison (operator flips, same as a bare aggregate call).
         let q = parse("SELECT type, count(*) AS n GROUP BY type HAVING 1 < n").unwrap();
+        let (_, having, _) = grouped(&q);
         assert_eq!(
-            q.having,
-            Some(Having::Compare(
+            having,
+            Some(&Having::Compare(
                 HavingLeaf::Agg(Aggregate::CountStar),
                 CmpOp::Gt,
                 Literal::Int(1)
@@ -1968,9 +2090,10 @@ mod tests {
         // Aliasing a GROUP BY key and referencing the alias in HAVING resolves
         // to that group key (previously rejected as "not a GROUP BY key").
         let q = parse("SELECT status AS s GROUP BY status HAVING s = 'draft'").unwrap();
+        let (_, having, _) = grouped(&q);
         assert_eq!(
-            q.having,
-            Some(Having::Compare(
+            having,
+            Some(&Having::Compare(
                 HavingLeaf::Group(ColRef::Field(vec!["status".into()])),
                 CmpOp::Eq,
                 Literal::Str("draft".into())
@@ -2007,9 +2130,9 @@ mod tests {
     }
     #[test]
     fn distinct_sets_the_flag() {
-        assert!(!parse("SELECT jira").unwrap().distinct);
-        assert!(!parse("SELECT ALL jira").unwrap().distinct);
-        assert!(parse("SELECT DISTINCT jira").unwrap().distinct);
+        assert!(!ungrouped(&parse("SELECT jira").unwrap()).0);
+        assert!(!ungrouped(&parse("SELECT ALL jira").unwrap()).0);
+        assert!(ungrouped(&parse("SELECT DISTINCT jira").unwrap()).0);
     }
     #[test]
     fn rejects_distinct_on() {
@@ -2021,6 +2144,19 @@ mod tests {
     #[test]
     fn distinct_with_group_by_is_rejected() {
         assert!(parse("SELECT DISTINCT status, count(*) GROUP BY status").is_err());
+    }
+    #[test]
+    fn distinct_with_implicit_aggregate_grouping_is_rejected() {
+        // An aggregate SELECT item groups every row into one implicit group,
+        // so `DISTINCT` is as redundant/confusing here as it is alongside an
+        // explicit `GROUP BY` — and it used to be silently dropped, since the
+        // executor only ever read `distinct` on the ungrouped path.
+        let err = parse("SELECT DISTINCT count(*) FROM x").unwrap_err();
+        assert!(matches!(err, ParseError::Unsupported(_)));
+        assert_eq!(
+            err.to_string(),
+            "unsupported query feature: DISTINCT combined with aggregate functions"
+        );
     }
     #[test]
     fn rejects_set_operation() {

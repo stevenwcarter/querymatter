@@ -63,8 +63,8 @@ SELECT [DISTINCT] cols [AS alias] [FROM 'glob'] [WHERE ...] [GROUP BY ...] [HAVI
   expression (below), or an aggregate: `count(*)`, `count(col)`, `count(distinct
   col)`, `min`, `max`, `sum`, `avg`, `group_concat`. `SELECT DISTINCT` drops
   duplicate output rows (after projection, before `ORDER BY`); it cannot be
-  combined with `GROUP BY` (a grouped query already yields one row per
-  distinct key).
+  combined with `GROUP BY` or with an aggregate (either way the query already
+  yields one row per group).
 - **Scalar expressions** — usable in `SELECT` and on either side of a `WHERE`
   comparison: arithmetic `+ - * / %`, string concat `||`, and the functions
   `lower(s)`, `upper(s)` (both Unicode-aware, not ASCII-only), `length(s)`,
@@ -146,8 +146,10 @@ A few spots where this subset stops short of full SQL:
 - **`GROUP BY`** keys must be plain columns (directly, or via a `SELECT AS`
   alias on a plain column) — an alias on a computed expression or an
   aggregate is not a valid grouping key.
-- **`DISTINCT` + `GROUP BY`** together are rejected; a grouped query already
-  produces one row per distinct key.
+- **`DISTINCT` + grouping** is rejected — both an explicit `GROUP BY` and an
+  aggregate `SELECT` item (`SELECT DISTINCT count(*)`, which groups every row
+  into one implicit group). A grouped query already produces one row per
+  group.
 
 ### Headline example
 

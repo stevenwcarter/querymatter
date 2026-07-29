@@ -5,7 +5,9 @@
 //! produces a [`ResultTable`]. It dispatches between two pipelines: the
 //! **non-grouped** path (no `GROUP BY`, no aggregate `SELECT` items) and the
 //! **grouped/aggregate** path (a `GROUP BY` clause and/or an aggregate
-//! `SELECT` item); see [`is_grouped_or_aggregate`] for the dispatch check.
+//! `SELECT` item). Which one a query takes is not re-derived here — it is
+//! [`Grouping`], decided once by `query::parse`, and each pipeline receives
+//! exactly the clauses its own variant carries.
 
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -24,8 +26,9 @@ use crate::model::{FileAttr, Record, Value, compare_values};
 use crate::paths::{FilePath, VaultRoot};
 use crate::query::ResultTable;
 use crate::query::ast::{
-    Aggregate, BinOp, CmpOp, ColRef, DateUnit, Expr, Having, HavingLeaf, Literal, OrderKey,
-    OrderTarget, Predicate, Query, RelDate, ScalarFn, SelectExpr, SelectItem,
+    Aggregate, BinOp, CmpOp, ColRef, DateUnit, Expr, GroupedOrderKey, GroupedOrderTarget, Grouping,
+    Having, HavingLeaf, Literal, OrderKey, OrderTarget, Predicate, Query, RelDate, ScalarFn,
+    SelectExpr, SelectItem,
 };
 
 /// An error that can occur while executing a parsed [`Query`].
@@ -45,14 +48,6 @@ pub enum ExecError {
     /// An `ORDER BY` alias didn't match any `SELECT` alias.
     #[error("unknown ORDER BY alias `{0}`")]
     UnknownAlias(String),
-    /// An `ORDER BY` aggregate target reached the ungrouped execution path.
-    /// `parse::lower_order_expr` rejects this at parse time (an aggregate
-    /// `ORDER BY` requires a non-empty `GROUP BY`, which always routes to
-    /// [`execute_grouped`]), so this is unreachable for any [`Query`] built
-    /// by [`crate::query::parse`]; it exists only so [`resolve_order_targets`]
-    /// stays total for a hand-built `Query` that bypasses that guarantee.
-    #[error("ORDER BY an aggregate requires GROUP BY")]
-    AggregateOrderWithoutGroupBy,
     /// A `SELECT`/`WHERE`/`GROUP BY`/`ORDER BY`/`HAVING`/`MEMBER OF` column
     /// that isn't in the record set's schema — almost always a typo. Skipped
     /// entirely under `--lenient` (see [`execute`]), where an unknown column
@@ -138,8 +133,7 @@ pub fn execute<'a>(
 /// `Value::Null`, exactly like an unreadable file — see [`read_body`].
 /// Callers pass their resolved [`crate::settings::Settings::max_file_bytes`].
 ///
-/// Dispatches on whether `q` is grouped/aggregate; see
-/// [`is_grouped_or_aggregate`].
+/// Dispatches on `q.grouping`; see [`Grouping`].
 pub fn execute_with_schema<'a>(
     q: &Query,
     records: impl Iterator<Item = &'a Record>,
@@ -204,10 +198,16 @@ fn execute_with_schema_at<'a>(
         // filter/projection/order evaluation instead. See [`EvalCtx::body_cache`].
         body_cache: None,
     };
-    if is_grouped_or_aggregate(q) {
-        return execute_grouped(q, records.into_iter(), ctx);
+    match &q.grouping {
+        Grouping::Ungrouped { distinct, order_by } => {
+            execute_ungrouped(q, records.into_iter(), ctx, *distinct, order_by)
+        }
+        Grouping::Grouped {
+            keys,
+            having,
+            order_by,
+        } => execute_grouped(q, records.into_iter(), ctx, keys, having.as_ref(), order_by),
     }
-    execute_ungrouped(q, records.into_iter(), ctx)
 }
 
 /// Per-query state threaded through the filter/project/order pipeline
@@ -261,13 +261,34 @@ fn rewrite_relative_dates(q: &mut Query, now: SystemTime) {
     if let Some(pred) = &mut q.filter {
         rewrite_predicate_literals(pred, now);
     }
-    for key in &mut q.order_by {
-        if let OrderTarget::Expr(expr) = &mut key.target {
-            rewrite_expr_literals(expr, now);
+    match &mut q.grouping {
+        Grouping::Ungrouped { order_by, .. } => {
+            for key in order_by {
+                rewrite_order_target_literals(&mut key.target, now);
+            }
+        }
+        Grouping::Grouped {
+            having, order_by, ..
+        } => {
+            for key in order_by {
+                // An aggregate target holds only a column reference, so it
+                // has no literal position to rewrite.
+                if let GroupedOrderTarget::Scalar(target) = &mut key.target {
+                    rewrite_order_target_literals(target, now);
+                }
+            }
+            if let Some(having) = having {
+                rewrite_having_literals(having, now);
+            }
         }
     }
-    if let Some(having) = &mut q.having {
-        rewrite_having_literals(having, now);
+}
+
+/// Walks a scalar `ORDER BY` target's literal positions for
+/// [`rewrite_relative_dates`]; only a computed expression target has any.
+fn rewrite_order_target_literals(target: &mut OrderTarget, now: SystemTime) {
+    if let OrderTarget::Expr(expr) = target {
+        rewrite_expr_literals(expr, now);
     }
 }
 
@@ -450,15 +471,6 @@ fn suggestion_suffix(suggestion: &Option<String>) -> String {
     }
 }
 
-/// True when `q` needs the grouped/aggregate execution path (Task 8): a
-/// `GROUP BY` clause, or any `SELECT` item that is an aggregate.
-fn is_grouped_or_aggregate(q: &Query) -> bool {
-    !q.group_by.is_empty()
-        || q.select
-            .iter()
-            .any(|item| matches!(item.expr, SelectExpr::Agg(_)))
-}
-
 /// A record that survived [`filter_records`]'s `FROM`/`WHERE` pass, paired
 /// with the per-record `file.body` memo (Task B10) built while evaluating
 /// its `WHERE` clause — see [`filter_records`]'s doc for how each caller uses
@@ -514,10 +526,17 @@ fn filter_records<'a>(
 type ProjectedRow<'a> = (&'a Record, Vec<Value>, RefCell<Option<Value>>);
 
 /// The filter / project / order / limit pipeline for a non-grouped query.
+///
+/// `distinct` and `order_by` come from [`Grouping::Ungrouped`] rather than
+/// from `q`, so this path can only ever see the clauses an ungrouped query is
+/// allowed to carry — in particular, a sort key here is scalar by
+/// construction (see [`resolve_order_targets`]).
 fn execute_ungrouped<'a>(
     q: &Query,
     records: impl Iterator<Item = &'a Record>,
     ctx: EvalCtx<'_>,
+    distinct: bool,
+    order_by: &[OrderKey],
 ) -> Result<ResultTable, ExecError> {
     let filtered = filter_records(q, records, ctx)?;
     let record_refs: Vec<&Record> = filtered.iter().map(|(record, _)| *record).collect();
@@ -543,11 +562,11 @@ fn execute_ungrouped<'a>(
         })
         .collect();
 
-    if q.distinct {
+    if distinct {
         dedup_rows(&mut rows);
     }
 
-    let order = resolve_order_targets(&q.order_by, &headers)?;
+    let order = resolve_order_targets(order_by, &headers)?;
 
     // Each row's sort key(s) are resolved here, once, up front — the same
     // decorate-sort-undecorate shape `execute_grouped` uses for its groups —
@@ -657,16 +676,22 @@ fn dedup_rows(rows: &mut Vec<ProjectedRow<'_>>) {
 /// The filter / group / aggregate / `HAVING` / order / limit pipeline for a
 /// query with a `GROUP BY` clause and/or aggregate `SELECT` items.
 ///
-/// With aggregates but no `GROUP BY`, every filtered row is treated as one
-/// group (see [`group_rows`]). Group order is made deterministic by sorting
-/// on the key tuple before `ORDER BY` is applied, so results are stable even
-/// when the query has no explicit ordering. `HAVING`, when present, drops
-/// groups after their `SELECT` row is projected but before `ORDER BY` /
-/// `LIMIT` / `OFFSET` run — see [`eval_having`].
+/// `keys`, `having`, and `order_by` come from [`Grouping::Grouped`] rather
+/// than from `q`, so this path can only ever see the clauses a grouped query
+/// is allowed to carry. With aggregates but no `GROUP BY`, `keys` is empty
+/// and every filtered row is treated as one group (see [`group_rows`]). Group
+/// order is made deterministic by sorting on the key tuple before `ORDER BY`
+/// is applied, so results are stable even when the query has no explicit
+/// ordering. `HAVING`, when present, drops groups after their `SELECT` row is
+/// projected but before `ORDER BY` / `LIMIT` / `OFFSET` run — see
+/// [`eval_having`].
 fn execute_grouped<'a>(
     q: &Query,
     records: impl Iterator<Item = &'a Record>,
     ctx: EvalCtx<'_>,
+    keys: &[ColRef],
+    having: Option<&Having>,
+    order_by: &[GroupedOrderKey],
 ) -> Result<ResultTable, ExecError> {
     // Task B10's per-record `body_cache` (see `filter_records`) isn't reused
     // here: the grouped/aggregate path folds many records per group rather
@@ -677,18 +702,13 @@ fn execute_grouped<'a>(
         .map(|(record, _)| record)
         .collect();
 
-    let items = validate_grouped_select(q)?;
+    let items = validate_grouped_select(&q.select, keys)?;
     let headers: Vec<String> = q.select.iter().map(|item| item.header()).collect();
 
-    let mut groups = group_rows(
-        &filtered,
-        &q.group_by,
-        ctx.disk_reads_allowed,
-        ctx.max_file_bytes,
-    );
+    let mut groups = group_rows(&filtered, keys, ctx.disk_reads_allowed, ctx.max_file_bytes);
     groups.sort_by(|a, b| compare_key_tuple(&a.key, &b.key));
 
-    let order = resolve_group_order_targets(&q.order_by, &headers, &q.group_by)?;
+    let order = resolve_group_order_targets(order_by, &headers, keys)?;
 
     // Each order key's value is resolved here, while `group.rows` is still
     // around — an aggregate order target (Task 8) is computed fresh from
@@ -704,14 +724,14 @@ fn execute_grouped<'a>(
                 .collect();
             (group, row, order_keys)
         })
-        .filter(|(group, _, _)| match &q.having {
+        .filter(|(group, _, _)| match having {
             // SQL 3VL, same rule as WHERE: a group is kept only when HAVING
             // is definitely true; unknown/false both drop it.
             Some(having) => {
                 eval_having(
                     having,
                     group,
-                    &q.group_by,
+                    keys,
                     ctx.disk_reads_allowed,
                     ctx.max_file_bytes,
                 ) == Some(true)
@@ -768,22 +788,22 @@ enum GroupedSelectItem {
     Agg(Aggregate),
 }
 
-/// Validates `q.select` for the grouped path: every non-aggregate item's
-/// expression must reference only columns that also appear in `q.group_by`
-/// (a bare grouping-key column trivially satisfies this, and so does a
+/// Validates `select` for the grouped path: every non-aggregate item's
+/// expression must reference only columns that also appear in the grouping
+/// `keys` (a bare grouping-key column trivially satisfies this, and so does a
 /// column-free literal/computed expression); anything else — a column
 /// outside the grouping keys, or `*` — is rejected, since neither reduces to
 /// a single value per group.
-fn validate_grouped_select(q: &Query) -> Result<Vec<GroupedSelectItem>, ExecError> {
-    q.select
+fn validate_grouped_select(
+    select: &[SelectItem],
+    keys: &[ColRef],
+) -> Result<Vec<GroupedSelectItem>, ExecError> {
+    select
         .iter()
         .map(|item| match &item.expr {
             SelectExpr::Agg(agg) => Ok(GroupedSelectItem::Agg(agg.clone())),
             SelectExpr::Expr(expr) => {
-                if expr_columns(expr)
-                    .into_iter()
-                    .all(|col| q.group_by.contains(col))
-                {
+                if expr_columns(expr).into_iter().all(|col| keys.contains(col)) {
                     Ok(GroupedSelectItem::Expr(expr.clone()))
                 } else {
                     Err(ExecError::NonGroupedColumn(item.header()))
@@ -865,16 +885,36 @@ fn references_body(q: &Query) -> bool {
         .filter
         .as_ref()
         .is_some_and(|pred| predicate_columns(pred).into_iter().any(is_body_col));
-    let group_hit = q.group_by.iter().any(is_body_col);
-    let order_hit = q.order_by.iter().any(|key| match &key.target {
+    let grouping_hit = match &q.grouping {
+        Grouping::Ungrouped { order_by, .. } => order_by
+            .iter()
+            .any(|key| order_target_references_body(&key.target)),
+        Grouping::Grouped {
+            keys,
+            having,
+            order_by,
+        } => {
+            keys.iter().any(is_body_col)
+                || order_by.iter().any(|key| match &key.target {
+                    GroupedOrderTarget::Scalar(target) => order_target_references_body(target),
+                    GroupedOrderTarget::Agg(agg) => aggregate_col(agg).is_some_and(is_body_col),
+                })
+                || having.as_ref().is_some_and(having_references_body)
+        }
+    };
+
+    select_hit || where_hit || grouping_hit
+}
+
+/// Whether a scalar `ORDER BY` target references `file.body`, for
+/// [`references_body`]. An alias names a `SELECT` item, which the projection
+/// scan has already covered.
+fn order_target_references_body(target: &OrderTarget) -> bool {
+    match target {
         OrderTarget::Alias(_) => false,
         OrderTarget::Col(col) => is_body_col(col),
-        OrderTarget::Agg(agg) => aggregate_col(agg).is_some_and(is_body_col),
         OrderTarget::Expr(expr) => expr_columns(expr).into_iter().any(is_body_col),
-    });
-    let having_hit = q.having.as_ref().is_some_and(having_references_body);
-
-    select_hit || where_hit || group_hit || order_hit || having_hit
+    }
 }
 
 /// True for `file.body`'s `ColRef`; every other column (a frontmatter field
@@ -1411,7 +1451,7 @@ enum ResolvedGroupOrderTarget {
 /// [`validate_grouped_select`]) — every column it references must be one of
 /// `group_by`'s keys.
 fn resolve_group_order_targets(
-    order_by: &[OrderKey],
+    order_by: &[GroupedOrderKey],
     headers: &[String],
     group_by: &[ColRef],
 ) -> Result<Vec<(ResolvedGroupOrderTarget, bool)>, ExecError> {
@@ -1419,18 +1459,18 @@ fn resolve_group_order_targets(
         .iter()
         .map(|key| {
             let target = match &key.target {
-                OrderTarget::Alias(name) => headers
+                GroupedOrderTarget::Agg(agg) => ResolvedGroupOrderTarget::Agg(agg.clone()),
+                GroupedOrderTarget::Scalar(OrderTarget::Alias(name)) => headers
                     .iter()
                     .position(|h| h == name)
                     .map(ResolvedGroupOrderTarget::Row)
                     .ok_or_else(|| ExecError::UnknownAlias(name.clone()))?,
-                OrderTarget::Col(col) => group_by
+                GroupedOrderTarget::Scalar(OrderTarget::Col(col)) => group_by
                     .iter()
                     .position(|g| g == col)
                     .map(ResolvedGroupOrderTarget::GroupKey)
                     .ok_or_else(|| ExecError::NonGroupedColumn(col_header(col)))?,
-                OrderTarget::Agg(agg) => ResolvedGroupOrderTarget::Agg(agg.clone()),
-                OrderTarget::Expr(expr) => {
+                GroupedOrderTarget::Scalar(OrderTarget::Expr(expr)) => {
                     if expr_columns(expr)
                         .into_iter()
                         .all(|col| group_by.contains(col))
@@ -1510,8 +1550,13 @@ fn filter_by_glob<'a>(
 /// `SelectExpr::Star` to the sorted union of `filtered`'s field names (each
 /// becoming a bare `Expr::Col`).
 ///
-/// Aggregate select items cannot appear here: [`execute`] routes queries
-/// containing one to the grouped path before this function runs.
+/// Aggregate select items cannot appear here: only [`execute_ungrouped`]
+/// calls this, and `query::parse` is the sole producer of a [`Query`] — its
+/// [`Grouping::Ungrouped`] arm is chosen precisely when no `SELECT` item is
+/// an aggregate (see `parse::lower_grouping`). The dispatch reads
+/// `q.grouping` rather than re-deriving grouped-ness from `q.select`, so this
+/// relies on those two agreeing; they can only disagree in a `Query` built by
+/// hand rather than parsed.
 fn expand_select(q: &Query, filtered: &[&Record]) -> Vec<(String, Expr)> {
     let mut columns = Vec::with_capacity(q.select.len());
     for item in &q.select {
@@ -1523,7 +1568,7 @@ fn expand_select(q: &Query, filtered: &[&Record]) -> Vec<(String, Expr)> {
             }
             SelectExpr::Expr(expr) => columns.push((item.header(), expr.clone())),
             SelectExpr::Agg(_) => {
-                unreachable!("execute() routes aggregate SELECT items to execute_grouped")
+                unreachable!("Grouping::Ungrouped implies no aggregate SELECT item")
             }
         }
     }
@@ -2046,9 +2091,8 @@ enum ResolvedOrderTarget {
 /// Resolves each `ORDER BY` key's target once, up front, returning the
 /// resolved target paired with its `DESC` flag.
 ///
-/// `OrderTarget::Agg` has no resolution here — see
-/// [`ExecError::AggregateOrderWithoutGroupBy`] for why it's unreachable for
-/// any [`Query`] the parser produces.
+/// An aggregate sort key needs no rejection here: [`Grouping::Ungrouped`]'s
+/// keys are [`OrderKey`]s, which have no aggregate target to reject.
 fn resolve_order_targets(
     order_by: &[OrderKey],
     headers: &[String],
@@ -2065,7 +2109,6 @@ fn resolve_order_targets(
                     ResolvedOrderTarget::AliasIndex(idx)
                 }
                 OrderTarget::Col(col) => ResolvedOrderTarget::Col(col.clone()),
-                OrderTarget::Agg(_) => return Err(ExecError::AggregateOrderWithoutGroupBy),
                 OrderTarget::Expr(expr) => ResolvedOrderTarget::Expr(expr.clone()),
             };
             Ok((target, key.desc))

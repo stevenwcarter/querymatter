@@ -16,33 +16,76 @@ use crate::model::FileAttr;
 /// A fully-parsed query: the projection plus its optional clauses.
 ///
 /// Absent clauses are represented by empty collections / `None` rather than a
-/// sentinel, so the executor can treat "no `GROUP BY`" and "grouped by nothing"
-/// uniformly.
+/// sentinel. The grouping-dependent clauses (`DISTINCT`, `GROUP BY`,
+/// `HAVING`, `ORDER BY`) live inside [`Grouping`] instead, so each is
+/// reachable only from the side of the grouped/ungrouped split that gives it
+/// a meaning.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Query {
     /// Projected columns / expressions, in output order.
     pub select: Vec<SelectItem>,
-    /// Whether `SELECT DISTINCT` was specified: duplicate result rows (keyed
-    /// on the final projected cells) are dropped, keeping the first
-    /// occurrence. The parser rejects this combined with `GROUP BY` rather
-    /// than leaving that combination representable.
-    pub distinct: bool,
     /// The glob or directory the query scans, if a `FROM` clause was given.
     pub from_glob: Option<String>,
     /// The `WHERE` predicate, if any.
     pub filter: Option<Predicate>,
-    /// `GROUP BY` keys, in order; empty when the query is not grouped.
-    pub group_by: Vec<ColRef>,
-    /// The `HAVING` predicate over group aggregates, if any. Only meaningful
-    /// alongside a non-empty `group_by` — the parser rejects `HAVING` on an
-    /// ungrouped query rather than leaving this representable.
-    pub having: Option<Having>,
-    /// `ORDER BY` keys, in order; empty when the query is unordered.
-    pub order_by: Vec<OrderKey>,
+    /// How rows are grouped — and, since they differ per side, `DISTINCT`,
+    /// `GROUP BY`, `HAVING`, and `ORDER BY`. See [`Grouping`].
+    pub grouping: Grouping,
     /// `LIMIT` row cap, if given.
     pub limit: Option<usize>,
     /// `OFFSET` row skip, if given.
     pub offset: Option<usize>,
+}
+
+/// How the query groups rows, and the clauses that only make sense on one
+/// side of that split.
+///
+/// This replaces what used to be three independent `Query` fields
+/// (`distinct` / `group_by` / `having`) plus a shared `order_by`. Their
+/// invalid combinations — `DISTINCT` with grouping, `HAVING` without it, an
+/// aggregate `ORDER BY` target on an ungrouped query — were representable,
+/// and the executor read each field on only one of its two pipelines, so a
+/// `Query` carrying an invalid combination silently *dropped* the offending
+/// clause instead of failing. Splitting the fields across the variants makes
+/// those combinations unconstructible rather than merely rejected by
+/// `query::parse`, which mattered because `exec::execute_with_schema_at`
+/// clones and rewrites the AST after the parser's checks have run.
+///
+/// The one combination this shape still admits is a clause that is invalid
+/// only for `Grouped`'s *empty*-`keys` case (the implicit single group of an
+/// aggregate-only `SELECT`): `HAVING` and aggregate `ORDER BY` targets both
+/// require an explicit `GROUP BY`, so `query::parse` continues to reject them
+/// there — see [`Grouping::Grouped`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum Grouping {
+    /// No `GROUP BY` and no aggregate `SELECT` item: one output row per
+    /// surviving record.
+    Ungrouped {
+        /// Whether `SELECT DISTINCT` was specified: duplicate result rows
+        /// (keyed on the final projected cells) are dropped, keeping the
+        /// first occurrence.
+        distinct: bool,
+        /// `ORDER BY` keys, in order; empty when the query is unordered.
+        /// Scalar targets only — a bare aggregate `ORDER BY` is
+        /// unrepresentable here (see [`GroupedOrderTarget`]).
+        order_by: Vec<OrderKey>,
+    },
+    /// A `GROUP BY` clause, or the implicit single group of an
+    /// aggregate-only `SELECT` (where `keys` is empty): one output row per
+    /// group. `DISTINCT` is unrepresentable here; `HAVING` and aggregate
+    /// `ORDER BY` targets exist only here.
+    ///
+    /// Both of the latter additionally require a *non-empty* `keys` — the
+    /// implicit single group is not enough — which `query::parse` enforces,
+    /// since `keys`' emptiness is not visible in the type.
+    Grouped {
+        /// `GROUP BY` keys, in order; empty for the implicit single group.
+        keys: Vec<ColRef>,
+        /// The `HAVING` predicate over group aggregates, if any.
+        having: Option<Having>,
+        /// `ORDER BY` keys, in order; empty when the query is unordered.
+        order_by: Vec<GroupedOrderKey>,
+    },
 }
 
 /// One item in the `SELECT` projection: an expression with an optional alias.
@@ -478,7 +521,8 @@ impl RelDate {
     }
 }
 
-/// One `ORDER BY` key: what to sort on and in which direction.
+/// One `ORDER BY` key of an ungrouped query: what to sort on and in which
+/// direction. See [`GroupedOrderKey`] for the grouped counterpart.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OrderKey {
     /// The value to sort by.
@@ -487,20 +531,17 @@ pub struct OrderKey {
     pub desc: bool,
 }
 
-/// The sort key of an `ORDER BY` clause: a projection alias, a column, a
-/// bare aggregate call, or an arbitrary computed expression.
+/// The scalar sort key of an `ORDER BY` clause: a projection alias, a column,
+/// or an arbitrary computed expression — everything that sorts a query with
+/// or without grouping. An aggregate sort key is *not* one of these; it lives
+/// on [`GroupedOrderTarget`], which is reachable only from
+/// [`Grouping::Grouped`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum OrderTarget {
     /// An identifier that matched a `SELECT` alias.
     Alias(String),
     /// A direct column reference.
     Col(ColRef),
-    /// A bare aggregate function call with no `AS` alias, e.g. `ORDER BY
-    /// count(*) DESC`. Only valid alongside a non-empty `GROUP BY` — the
-    /// parser rejects it on an ungrouped query (including the implicit
-    /// single-group case, where `group_by` is empty too) rather than
-    /// leaving that combination representable.
-    Agg(Aggregate),
     /// Any other computed expression, e.g. `ORDER BY CASE WHEN status =
     /// 'draft' THEN 0 ELSE 1 END` or `ORDER BY n + 1`. Evaluated per row
     /// (ungrouped) or over a group's representative row (grouped, only
@@ -508,6 +549,32 @@ pub enum OrderTarget {
     /// `exec::resolve_group_order_targets`), the same as an
     /// `Expr` `SELECT` item.
     Expr(Expr),
+}
+
+/// One `ORDER BY` key of a grouped query — [`OrderKey`] widened with the
+/// aggregate targets only grouping makes sense of.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupedOrderKey {
+    /// The value to sort groups by.
+    pub target: GroupedOrderTarget,
+    /// `true` for `DESC`, `false` for `ASC` (the default).
+    pub desc: bool,
+}
+
+/// The sort key of a grouped query's `ORDER BY` clause: either one of the
+/// scalar targets an ungrouped query also accepts, or a bare aggregate call.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GroupedOrderTarget {
+    /// A target that needs no grouping to make sense — resolved against the
+    /// projection, the grouping keys, or the group's representative row (see
+    /// `exec::resolve_group_order_targets`).
+    Scalar(OrderTarget),
+    /// A bare aggregate function call with no `AS` alias, e.g. `ORDER BY
+    /// count(*) DESC`. Additionally requires non-empty grouping keys (see
+    /// [`Grouping::Grouped`]): the parser rejects it on the implicit single
+    /// group of an aggregate-only `SELECT`, mirroring how it rejects
+    /// `HAVING` there.
+    Agg(Aggregate),
 }
 
 impl Query {
@@ -541,21 +608,47 @@ impl Query {
         if let Some(pred) = &self.filter {
             collect_predicate_fields(pred, &mut fields);
         }
-        for col in &self.group_by {
-            collect_col_field(col, &mut fields);
-        }
-        for key in &self.order_by {
-            match &key.target {
-                OrderTarget::Alias(_) => {}
-                OrderTarget::Col(col) => collect_col_field(col, &mut fields),
-                OrderTarget::Agg(agg) => collect_aggregate_fields(agg, &mut fields),
-                OrderTarget::Expr(expr) => collect_expr_fields(expr, &mut fields),
+        match &self.grouping {
+            Grouping::Ungrouped { order_by, .. } => {
+                for key in order_by {
+                    collect_order_target_fields(&key.target, &mut fields);
+                }
+            }
+            Grouping::Grouped {
+                keys,
+                having,
+                order_by,
+            } => {
+                for col in keys {
+                    collect_col_field(col, &mut fields);
+                }
+                for key in order_by {
+                    match &key.target {
+                        GroupedOrderTarget::Scalar(target) => {
+                            collect_order_target_fields(target, &mut fields);
+                        }
+                        GroupedOrderTarget::Agg(agg) => {
+                            collect_aggregate_fields(agg, &mut fields);
+                        }
+                    }
+                }
+                if let Some(having) = having {
+                    collect_having_fields(having, &mut fields);
+                }
             }
         }
-        if let Some(having) = &self.having {
-            collect_having_fields(having, &mut fields);
-        }
         fields
+    }
+}
+
+/// Walks a scalar `ORDER BY` target's column positions; an alias names a
+/// `SELECT` item rather than a column, so it contributes nothing (see
+/// [`Query::referenced_fields`]).
+fn collect_order_target_fields(target: &OrderTarget, fields: &mut BTreeSet<String>) {
+    match target {
+        OrderTarget::Alias(_) => {}
+        OrderTarget::Col(col) => collect_col_field(col, fields),
+        OrderTarget::Expr(expr) => collect_expr_fields(expr, fields),
     }
 }
 
