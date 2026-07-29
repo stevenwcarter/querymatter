@@ -160,24 +160,24 @@ pub struct Cli {
 
     /// Ignore any `.querymatter` cache and always live-scan (today's behavior).
     #[arg(long)]
-    pub no_cache: bool,
+    no_cache: bool,
 
     /// Trust the `.querymatter` cache verbatim with no filesystem access;
     /// errors when no cache is found.
     #[arg(long)]
-    pub force_cache: bool,
+    force_cache: bool,
 
     /// Use the dir-mtime + TTL hybrid freshness check instead of per-file.
     #[arg(long)]
-    pub fast: bool,
+    fast: bool,
 
     /// Force a re-scan of PATH's subtree before querying; repeatable.
     #[arg(long, value_name = "PATH")]
-    pub refresh: Vec<PathBuf>,
+    refresh: Vec<PathBuf>,
 
     /// Force a re-scan of the whole vault before querying.
     #[arg(long)]
-    pub refresh_all: bool,
+    refresh_all: bool,
 
     /// Exit 0 when the query matched at least one row, 1 when it matched
     /// none, and 2 on a parse/exec/IO error — grep-style, for scripting.
@@ -369,27 +369,36 @@ pub struct CompletionsArgs {
     pub install: bool,
 }
 
-impl Cli {
-    /// Maps the freshness flags to a [`Freshness`] mode: `--force-cache` wins,
-    /// then `--fast`, otherwise the accurate per-file default. Mutually
-    /// exclusive combinations are rejected by [`Self::validate`] before this is
-    /// consulted, so the precedence here only picks among individually valid
-    /// inputs.
-    pub fn freshness(&self) -> Freshness {
-        if self.force_cache {
-            Freshness::ForceCache
-        } else if self.fast {
-            Freshness::Fast
-        } else {
-            Freshness::PerFile
-        }
-    }
+/// How this invocation uses the `.querymatter` cache — derived once from the
+/// five raw flags, so their four contradictory combinations are rejected in
+/// exactly one place and everything downstream matches on a valid mode.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CacheMode {
+    /// `--no-cache`: always live-scan.
+    Live,
+    /// Normal cached operation.
+    Cached {
+        freshness: Freshness,
+        refresh: RefreshScope,
+    },
+    /// `--force-cache`: trust the cache verbatim, no filesystem access —
+    /// structurally carries no refresh scope and no fast mode.
+    TrustCache,
+}
 
-    /// Rejects contradictory combinations of the cache flags, with a clear
-    /// message naming the offending pair. Called in `main` before any cache
-    /// work so a bad combination fails fast with a non-zero exit rather than
-    /// silently picking one interpretation.
-    pub fn validate(&self) -> anyhow::Result<()> {
+/// Which part of the vault a `--refresh`/`--refresh-all` re-scans first.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RefreshScope {
+    None,
+    All,
+    Subtrees(Vec<PathBuf>),
+}
+
+impl Cli {
+    /// The single fallible translation of the raw cache flags. The four
+    /// `ensure!` messages are byte-identical to the deleted `validate`'s
+    /// (pinned by tests/cli.rs).
+    pub fn cache_mode(&self) -> anyhow::Result<CacheMode> {
         let wants_refresh = self.refresh_all || !self.refresh.is_empty();
         anyhow::ensure!(
             !(self.force_cache && wants_refresh),
@@ -409,7 +418,25 @@ impl Cli {
             !(self.force_cache && self.fast),
             "--force-cache cannot be combined with --fast"
         );
-        Ok(())
+        if self.no_cache {
+            return Ok(CacheMode::Live);
+        }
+        if self.force_cache {
+            return Ok(CacheMode::TrustCache);
+        }
+        let freshness = if self.fast {
+            Freshness::Fast
+        } else {
+            Freshness::PerFile
+        };
+        let refresh = if self.refresh_all {
+            RefreshScope::All
+        } else if !self.refresh.is_empty() {
+            RefreshScope::Subtrees(self.refresh.clone())
+        } else {
+            RefreshScope::None
+        };
+        Ok(CacheMode::Cached { freshness, refresh })
     }
 }
 
@@ -449,13 +476,16 @@ pub(crate) fn canonicalize_roots(dirs: &[PathBuf]) -> anyhow::Result<Vec<PathBuf
 
 #[cfg(test)]
 mod tests {
-    use super::{CacheAction, Cli, Command, ConfigAction, QueryAction, canonicalize_roots};
+    use super::{
+        CacheAction, CacheMode, Cli, Command, ConfigAction, QueryAction, RefreshScope,
+        canonicalize_roots,
+    };
     use crate::cache::Freshness;
     use crate::config::ConfigKey;
     use crate::render::{Format, TableStyle};
     use clap::{CommandFactory, FromArgMatches};
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use tempfile::tempdir;
 
     /// Parses `args` with the `--table-style` env fallback disabled.
@@ -556,71 +586,111 @@ mod tests {
     }
 
     #[test]
-    fn freshness_force_cache_wins_over_fast() {
-        // `--force-cache` and `--fast` are individually valid; `freshness()`
-        // is the pure mapping (validation of the conflict lives in `validate`).
-        let cli = parse(&["querymatter", "--force-cache", "--fast"]);
-        assert_eq!(cli.freshness(), Freshness::ForceCache);
-    }
-
-    #[test]
-    fn freshness_fast_when_only_fast() {
+    fn cache_mode_fast_when_only_fast() {
         let cli = parse(&["querymatter", "--fast"]);
-        assert_eq!(cli.freshness(), Freshness::Fast);
+        assert_eq!(
+            cli.cache_mode().unwrap(),
+            CacheMode::Cached {
+                freshness: Freshness::Fast,
+                refresh: RefreshScope::None,
+            }
+        );
     }
 
     #[test]
-    fn freshness_defaults_to_per_file() {
+    fn cache_mode_defaults_to_per_file() {
         let cli = parse(&["querymatter"]);
-        assert_eq!(cli.freshness(), Freshness::PerFile);
+        assert_eq!(
+            cli.cache_mode().unwrap(),
+            CacheMode::Cached {
+                freshness: Freshness::PerFile,
+                refresh: RefreshScope::None,
+            }
+        );
     }
 
     #[test]
-    fn force_cache_conflicts_with_refresh() {
+    fn cache_mode_no_cache_is_live() {
+        let cli = parse(&["querymatter", "--no-cache"]);
+        assert_eq!(cli.cache_mode().unwrap(), CacheMode::Live);
+    }
+
+    #[test]
+    fn cache_mode_force_cache_is_trust_cache() {
+        let cli = parse(&["querymatter", "--force-cache"]);
+        assert_eq!(cli.cache_mode().unwrap(), CacheMode::TrustCache);
+    }
+
+    #[test]
+    fn cache_mode_refresh_all_sets_refresh_scope_all() {
+        let cli = parse(&["querymatter", "--refresh-all"]);
+        assert_eq!(
+            cli.cache_mode().unwrap(),
+            CacheMode::Cached {
+                freshness: Freshness::PerFile,
+                refresh: RefreshScope::All,
+            }
+        );
+    }
+
+    #[test]
+    fn cache_mode_refresh_paths_set_refresh_scope_subtrees() {
+        let cli = parse(&["querymatter", "--refresh", "a", "--refresh", "b"]);
+        assert_eq!(
+            cli.cache_mode().unwrap(),
+            CacheMode::Cached {
+                freshness: Freshness::PerFile,
+                refresh: RefreshScope::Subtrees(vec![PathBuf::from("a"), PathBuf::from("b")]),
+            }
+        );
+    }
+
+    #[test]
+    fn cache_mode_force_cache_conflicts_with_refresh() {
         let cli = parse(&["querymatter", "--force-cache", "--refresh", "sub"]);
-        assert!(cli.validate().is_err());
+        assert!(cli.cache_mode().is_err());
     }
 
     #[test]
-    fn force_cache_conflicts_with_refresh_all() {
+    fn cache_mode_force_cache_conflicts_with_refresh_all() {
         let cli = parse(&["querymatter", "--force-cache", "--refresh-all"]);
-        assert!(cli.validate().is_err());
+        assert!(cli.cache_mode().is_err());
     }
 
     #[test]
-    fn no_cache_conflicts_with_force_cache() {
+    fn cache_mode_no_cache_conflicts_with_force_cache() {
         let cli = parse(&["querymatter", "--no-cache", "--force-cache"]);
-        assert!(cli.validate().is_err());
+        assert!(cli.cache_mode().is_err());
     }
 
     #[test]
-    fn no_cache_conflicts_with_refresh() {
+    fn cache_mode_no_cache_conflicts_with_refresh() {
         let cli = parse(&["querymatter", "--no-cache", "--refresh", "sub"]);
-        assert!(cli.validate().is_err());
+        assert!(cli.cache_mode().is_err());
     }
 
     #[test]
-    fn no_cache_conflicts_with_refresh_all() {
+    fn cache_mode_no_cache_conflicts_with_refresh_all() {
         let cli = parse(&["querymatter", "--no-cache", "--refresh-all"]);
-        assert!(cli.validate().is_err());
+        assert!(cli.cache_mode().is_err());
     }
 
     #[test]
-    fn force_cache_conflicts_with_fast() {
+    fn cache_mode_force_cache_conflicts_with_fast() {
         let cli = parse(&["querymatter", "--force-cache", "--fast"]);
-        assert!(cli.validate().is_err());
+        assert!(cli.cache_mode().is_err());
     }
 
     #[test]
-    fn compatible_flags_pass_validation() {
-        assert!(parse(&["querymatter"]).validate().is_ok());
-        assert!(parse(&["querymatter", "--fast"]).validate().is_ok());
+    fn cache_mode_compatible_flags_are_ok() {
+        assert!(parse(&["querymatter"]).cache_mode().is_ok());
+        assert!(parse(&["querymatter", "--fast"]).cache_mode().is_ok());
         assert!(
             parse(&["querymatter", "--refresh", "a", "--refresh", "b"])
-                .validate()
+                .cache_mode()
                 .is_ok()
         );
-        assert!(parse(&["querymatter", "--no-cache"]).validate().is_ok());
+        assert!(parse(&["querymatter", "--no-cache"]).cache_mode().is_ok());
     }
 
     #[test]

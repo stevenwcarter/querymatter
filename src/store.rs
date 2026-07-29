@@ -135,14 +135,21 @@ impl InMemoryStore {
     /// it against the live filesystem per `mode` and returning the populated
     /// store alongside a [`LoadReport`] of what was (re)loaded/skipped.
     ///
+    /// `mode` is `Some(freshness)` for normal cached operation (see
+    /// [`Freshness`]), or `None` to trust the on-disk cache verbatim with no
+    /// filesystem access at all — [`crate::cli::CacheMode::TrustCache`]
+    /// (`--force-cache`)'s decision, made once in `main::build_session` and
+    /// handed down here rather than re-derived. Under `None`, `cached` is
+    /// returned unchanged and `changed` is always `false`.
+    ///
     /// A missing or incompatible on-disk cache ([`cache::load_cache`]
     /// returning `None`) is treated as an empty one with [`DEFAULT_TTL_SECS`],
     /// so the freshness pass below rebuilds it by scanning every file. When
     /// that pass reports the result changed, it's persisted back via
-    /// [`cache::save_cache`] — unless `mode` is [`Freshness::ForceCache`],
-    /// which never touches the filesystem beyond the initial cache read and
-    /// so never has anything new to persist. A save failure is folded into
-    /// the report's warnings rather than panicking.
+    /// [`cache::save_cache`] — which never happens under `mode = None` since
+    /// `changed` is always `false` there, so trusting the cache never touches
+    /// the filesystem beyond the initial cache read. A save failure is folded
+    /// into the report's warnings rather than panicking.
     ///
     /// The two `None` causes are distinguished (design spec §9): when a
     /// `manifest.bin` is present on disk but [`cache::load_cache`] rejected it
@@ -175,7 +182,7 @@ impl InMemoryStore {
     pub fn from_cache(
         vault: &VaultRoot,
         opts: WalkOpts,
-        mode: Freshness,
+        mode: Option<Freshness>,
         wanted: Option<&BTreeSet<String>>,
         scope: Option<&[PathBuf]>,
     ) -> (Self, LoadReport) {
@@ -192,15 +199,22 @@ impl InMemoryStore {
                 ),
             };
 
-        let (fresh, refresh_report, changed) =
-            cache::refresh_against_cache_scoped(vault, &cached, &opts, mode, ttl_secs, scope);
+        // `mode = None` is the trust-cache case: skip the live-filesystem
+        // refresh entirely and hand `cached` back verbatim, with
+        // `changed = false` so the save below never fires.
+        let (fresh, refresh_report, changed) = match mode {
+            Some(freshness) => cache::refresh_against_cache_scoped(
+                vault, &cached, &opts, freshness, ttl_secs, scope,
+            ),
+            None => (cached, LoadReport::default(), false),
+        };
 
         // Task 7/T6: a per-directory blob that failed to decode (e.g. a
         // poisoned `rel_path`, B6) is silently absent from `cached` above —
         // `blob_warnings` is what turns that into a skip + warning, seeded
-        // BEFORE `refresh_report` is merged in so it survives every
-        // `Freshness` mode, including `ForceCache` (whose own `LoadReport`
-        // is always empty — it does no filesystem work of its own).
+        // BEFORE `refresh_report` is merged in so it survives every `mode`,
+        // including the trust-cache case (whose own `LoadReport` is always
+        // empty — it does no filesystem work of its own).
         let mut report = LoadReport {
             skipped: blob_warnings.len(),
             warnings: blob_warnings,
@@ -220,7 +234,6 @@ impl InMemoryStore {
 
         if scope.is_none()
             && changed
-            && mode != Freshness::ForceCache
             && let Err(err) = cache::save_cache(vault, &fresh, ttl_secs)
         {
             report.warnings.push(format!("saving cache: {err}"));
@@ -592,8 +605,13 @@ mod tests {
         let vault = VaultRoot::new(td.path().to_path_buf());
         cache::build_vault(&vault, &WalkOpts::default(), 300).unwrap();
 
-        let (store, _report) =
-            InMemoryStore::from_cache(&vault, WalkOpts::default(), Freshness::PerFile, None, None);
+        let (store, _report) = InMemoryStore::from_cache(
+            &vault,
+            WalkOpts::default(),
+            Some(Freshness::PerFile),
+            None,
+            None,
+        );
 
         assert_file_size_and_mtime_row(&store);
     }
@@ -641,8 +659,13 @@ mod tests {
         let vault = VaultRoot::new(td.path().to_path_buf());
         cache::build_vault(&vault, &WalkOpts::default(), 300).unwrap();
 
-        let (store, _report) =
-            InMemoryStore::from_cache(&vault, WalkOpts::default(), Freshness::PerFile, None, None);
+        let (store, _report) = InMemoryStore::from_cache(
+            &vault,
+            WalkOpts::default(),
+            Some(Freshness::PerFile),
+            None,
+            None,
+        );
 
         assert_file_word_count_row(&store);
     }
@@ -655,8 +678,13 @@ mod tests {
         let vault = VaultRoot::new(td.path().to_path_buf());
         cache::build_vault(&vault, &WalkOpts::default(), 300).unwrap();
 
-        let (cached_store, report) =
-            InMemoryStore::from_cache(&vault, WalkOpts::default(), Freshness::PerFile, None, None);
+        let (cached_store, report) = InMemoryStore::from_cache(
+            &vault,
+            WalkOpts::default(),
+            Some(Freshness::PerFile),
+            None,
+            None,
+        );
         assert_eq!(report.skipped, 0);
 
         let (live_store, _report) =
@@ -692,12 +720,17 @@ mod tests {
         let (scoped_store, _r) = InMemoryStore::from_cache(
             &vault,
             WalkOpts::default(),
-            Freshness::PerFile,
+            Some(Freshness::PerFile),
             None,
             Some(&scope),
         );
-        let (mut whole_store, _r) =
-            InMemoryStore::from_cache(&vault, WalkOpts::default(), Freshness::PerFile, None, None);
+        let (mut whole_store, _r) = InMemoryStore::from_cache(
+            &vault,
+            WalkOpts::default(),
+            Some(Freshness::PerFile),
+            None,
+            None,
+        );
         whole_store.retain_under(&scope);
 
         let mut scoped: Vec<&Record> = scoped_store.records().collect();
@@ -738,7 +771,7 @@ mod tests {
         let (store, _r) = InMemoryStore::from_cache(
             &vault,
             WalkOpts::default(),
-            Freshness::PerFile,
+            Some(Freshness::PerFile),
             None,
             Some(&scope),
         );
@@ -788,8 +821,13 @@ mod tests {
         write(&vault, "product/b.md", "---\nroadmap: q3\n---\n");
         cache::build_vault(&vault, &WalkOpts::default(), 300).unwrap();
 
-        let (store, _r) =
-            InMemoryStore::from_cache(&vault, WalkOpts::default(), Freshness::PerFile, None, None);
+        let (store, _r) = InMemoryStore::from_cache(
+            &vault,
+            WalkOpts::default(),
+            Some(Freshness::PerFile),
+            None,
+            None,
+        );
         assert_eq!(
             store.schema(),
             vec!["roadmap".to_string(), "status".to_string()],
@@ -805,8 +843,13 @@ mod tests {
         let vault = VaultRoot::new(td.path().to_path_buf());
         cache::build_vault(&vault, &WalkOpts::default(), 300).unwrap();
 
-        let (mut store, _report) =
-            InMemoryStore::from_cache(&vault, WalkOpts::default(), Freshness::PerFile, None, None);
+        let (mut store, _report) = InMemoryStore::from_cache(
+            &vault,
+            WalkOpts::default(),
+            Some(Freshness::PerFile),
+            None,
+            None,
+        );
         assert_eq!(
             store.records().next().unwrap().field(&["status".into()]),
             Value::Str("draft".into())
@@ -861,8 +904,13 @@ mod tests {
         let vault = VaultRoot::new(td.path().to_path_buf());
         cache::build_vault(&vault, &WalkOpts::default(), 300).unwrap();
 
-        let (mut store, _report) =
-            InMemoryStore::from_cache(&vault, WalkOpts::default(), Freshness::PerFile, None, None);
+        let (mut store, _report) = InMemoryStore::from_cache(
+            &vault,
+            WalkOpts::default(),
+            Some(Freshness::PerFile),
+            None,
+            None,
+        );
         assert_eq!(
             store.records().next().unwrap().field(&["status".into()]),
             Value::Str("draft".into())
@@ -900,18 +948,13 @@ mod tests {
 
         write(td.path(), "a.md", "---\nstatus: final\n---\n");
 
-        let (store, report) = InMemoryStore::from_cache(
-            &vault,
-            WalkOpts::default(),
-            Freshness::ForceCache,
-            None,
-            None,
-        );
+        let (store, report) =
+            InMemoryStore::from_cache(&vault, WalkOpts::default(), None, None, None);
         assert_eq!(report.skipped, 0);
         assert_eq!(
             store.records().next().unwrap().field(&["status".into()]),
             Value::Str("draft".into()),
-            "ForceCache must never re-read the changed file"
+            "trust-cache mode must never re-read the changed file"
         );
 
         let (_body, loaded, _warnings) = cache::load_cache(td.path()).unwrap();
@@ -924,7 +967,7 @@ mod tests {
         assert_eq!(
             persisted_status,
             Value::Str("draft".into()),
-            "ForceCache must never persist — the on-disk cache stays at the stale value"
+            "trust-cache mode must never persist — the on-disk cache stays at the stale value"
         );
     }
 
@@ -934,13 +977,13 @@ mod tests {
     /// in-process) must surface as exactly one warning naming both the
     /// directory and the offending `rel_path`, while a legitimate SIBLING
     /// directory's blob still loads normally. Critically, this must hold
-    /// under `Freshness::ForceCache`: its freshness pass never touches the
-    /// filesystem (`refresh_against_cache_scoped`'s `ForceCache` arm returns
-    /// an always-empty `LoadReport`), so `InMemoryStore::from_cache` has no
+    /// under trust-cache mode (`from_cache`'s `mode: None`): its freshness
+    /// pass never runs at all (`from_cache`'s `None` arm returns an
+    /// always-empty `LoadReport`), so `InMemoryStore::from_cache` has no
     /// OTHER chance to notice or report the loss — before this fix the
     /// poisoned directory's legitimate content vanished from every
-    /// `ForceCache` query with zero warning, permanently (nothing ever
-    /// re-scans it under `ForceCache`).
+    /// trust-cache query with zero warning, permanently (nothing ever
+    /// re-scans it under trust-cache mode).
     #[test]
     fn poisoned_blob_warns_and_survives_under_force_cache() {
         let td = TempDir::new().unwrap();
@@ -992,13 +1035,8 @@ mod tests {
         )
         .unwrap();
 
-        let (store, report) = InMemoryStore::from_cache(
-            &vault,
-            WalkOpts::default(),
-            Freshness::ForceCache,
-            None,
-            None,
-        );
+        let (store, report) =
+            InMemoryStore::from_cache(&vault, WalkOpts::default(), None, None, None);
 
         let statuses: Vec<Value> = store
             .records()
@@ -1032,8 +1070,13 @@ mod tests {
         assert!(cache::load_cache(td.path()).is_none());
 
         let vault = VaultRoot::new(td.path().to_path_buf());
-        let (cached_store, report) =
-            InMemoryStore::from_cache(&vault, WalkOpts::default(), Freshness::PerFile, None, None);
+        let (cached_store, report) = InMemoryStore::from_cache(
+            &vault,
+            WalkOpts::default(),
+            Some(Freshness::PerFile),
+            None,
+            None,
+        );
         assert_eq!(report.skipped, 0);
 
         let (live_store, _report) =
@@ -1177,7 +1220,7 @@ mod tests {
         let (store, report) = InMemoryStore::from_cache(
             &VaultRoot::new(td.path().to_path_buf()),
             WalkOpts::default(),
-            Freshness::PerFile,
+            Some(Freshness::PerFile),
             None,
             None,
         );
@@ -1200,7 +1243,7 @@ mod tests {
         let (_store, report2) = InMemoryStore::from_cache(
             &VaultRoot::new(td2.path().to_path_buf()),
             WalkOpts::default(),
-            Freshness::PerFile,
+            Some(Freshness::PerFile),
             None,
             None,
         );

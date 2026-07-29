@@ -123,7 +123,7 @@ pub fn execute<'a>(
 /// alone.
 ///
 /// `disk_reads_allowed` gates `file.body` (design W56): `false` under
-/// `Freshness::ForceCache`, where the whole query fails fast with
+/// `CacheMode::TrustCache` (`--force-cache`), where the whole query fails fast with
 /// [`ExecError::BodyUnavailable`] in strict mode when it references
 /// `file.body` (see [`references_body`]), or resolves it to `Value::Null`
 /// per row under `--lenient` (see [`read_body`]).
@@ -1587,7 +1587,7 @@ fn sorted_field_union(records: &[&Record]) -> Vec<String> {
 /// through to [`Record::file_attr`] (which is pure and can only return its
 /// `Null` sentinel for `Body` — see its doc comment): it's the one column
 /// that needs a real disk read, gated by `disk_reads_allowed` (design W56;
-/// `false` under `Freshness::ForceCache`) and capped by `max_file_bytes`
+/// `false` under `CacheMode::TrustCache`, i.e. `--force-cache`) and capped by `max_file_bytes`
 /// (security fix B8) — see [`read_body`]. `body_cache`, when `Some` (Task
 /// B10), memoizes that read for the record's current evaluation — see
 /// [`read_body_cached`].

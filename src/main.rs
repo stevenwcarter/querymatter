@@ -39,10 +39,10 @@ use chrono::{DateTime, Utc};
 use clap::{ArgMatches, CommandFactory, FromArgMatches};
 use directories::BaseDirs;
 
-use crate::cache::{CacheSummary, Freshness};
+use crate::cache::CacheSummary;
 use crate::cli::{
-    CacheAction, CacheArgs, Cli, Command, CompletionsArgs, ConfigAction, ConfigArgs, ExplainArgs,
-    InitArgs, QueryAction, QueryArgs,
+    CacheAction, CacheArgs, CacheMode, Cli, Command, CompletionsArgs, ConfigAction, ConfigArgs,
+    ExplainArgs, InitArgs, QueryAction, QueryArgs, RefreshScope,
 };
 use crate::config::Config;
 use crate::output::OutputSink;
@@ -911,9 +911,19 @@ fn build_session(
     dirs: &[PathBuf],
     wanted: Option<&BTreeSet<String>>,
 ) -> anyhow::Result<Session> {
-    cli.validate()?;
+    // The single fallible translation of the five raw cache flags (see
+    // `CacheMode`'s doc comment); everything below matches on this instead of
+    // re-deriving from `cli`. Called first, same as the deleted `validate()`
+    // was, so a bad flag combination still fails fast before any cache work.
+    let cache_mode = cli.cache_mode()?;
 
-    let wants_refresh = cli.refresh_all || !cli.refresh.is_empty();
+    let wants_refresh = matches!(
+        cache_mode,
+        CacheMode::Cached {
+            refresh: RefreshScope::All | RefreshScope::Subtrees(_),
+            ..
+        }
+    );
     let wanted = if wants_refresh { None } else { wanted };
 
     let cwd = env::current_dir().context("failed to determine the current directory")?;
@@ -930,76 +940,102 @@ fn build_session(
     let mut opts = settings.walk_opts();
     opts.ignore_files = cli.walk.ignore_files()?;
 
-    let vault = if cli.no_cache {
-        None
-    } else {
-        cache::find_vault(&cwd).map(VaultRoot::new)
-    };
-
-    let (store, report, session_vault) = match vault {
-        Some(vault) => {
-            // Subtree scoping (design W26 / spec §7): when the query names a
-            // subtree via positional `[DIRS]`, load ONLY that subtree from the
-            // cache instead of loading the whole vault and narrowing after.
-            // Gated on `wanted.is_some() && !dirs.is_empty()`:
-            //
-            // * `wanted.is_some()` is exactly the W17 push-down boundary
-            //   (spec §7.2). The REPL always passes `wanted = None` — its
-            //   store outlives a query and may later target a different
-            //   subtree, so it must stay whole-vault — and a `--refresh`/
-            //   `--refresh-all` run forces `wanted = None` above (its
-            //   post-load `RecordStore::refresh` rebuilds every slice from the
-            //   whole on-disk cache, which would undo a scoped load). Both
-            //   therefore fall through to the unchanged whole-vault load +
-            //   post-hoc `retain_under` path below: a refreshing run refreshes
-            //   the WHOLE vault (`--refresh-all`) or its named target
-            //   (`--refresh <path>`), then the RESULT is narrowed to `[DIRS]`
-            //   — no record the user asked to refresh is dropped.
-            // * A scoped load makes the store's schema the subtree's,
-            //   narrowing W12 validation to it (spec §7.3, an accepted, tested
-            //   behavior change).
-            //
-            // Correctness: `scope = None` always falls back to the proven
-            // whole-load + `retain_under` path, so gating here can only ever
-            // disable the optimization, never yield a wrong result.
-            let scope = match wanted {
-                Some(_) if !dirs.is_empty() => Some(canonicalize_dirs(dirs)?),
-                _ => None,
-            };
-            let (mut store, mut report) =
-                InMemoryStore::from_cache(&vault, opts, cli.freshness(), wanted, scope.as_deref());
-            // A forced refresh runs against the just-loaded cache; only its
-            // warnings need surfacing (the counts are informational and the
-            // store already reflects the refreshed records).
-            if cli.refresh_all {
-                report.warnings.extend(store.refresh(&vault, None).warnings);
-            } else {
-                for path in &cli.refresh {
-                    let target = cache::resolve_refresh_target(path, &vault)?;
-                    report
-                        .warnings
-                        .extend(store.refresh(&vault, Some(&target)).warnings);
-                }
-            }
-            // Spec §5: positional `[DIRS]` restrict a vault query to the named
-            // subtrees. When `scope` is `None` the vault was loaded whole (the
-            // REPL / refreshing path), so narrow here at slice granularity;
-            // when `scope` is `Some` the store was built already scoped and
-            // this is skipped. A dir entirely outside the vault matches no
-            // slice (its records are absent) — v1 does not live-scan
-            // outside-vault dirs, a known limitation.
-            if scope.is_none() && !dirs.is_empty() {
-                store.retain_under(&canonicalize_dirs(dirs)?);
-            }
-            (store, report, Some(vault))
-        }
-        None => {
-            anyhow::ensure!(
-                !cli.force_cache,
-                "--force-cache: no .querymatter cache found (run `querymatter init` first)"
-            );
+    // A single match on `cache_mode`: the no-vault-found error (`TrustCache`)
+    // and the live-scan fallback (`Cached` with no vault present) each live
+    // in exactly one arm below, rather than being re-derived from `cli`.
+    let (store, report, session_vault) = match &cache_mode {
+        CacheMode::Live => {
             let (store, report) = InMemoryStore::load(cli::canonicalize_roots(dirs)?, opts, wanted);
             (store, report, None)
+        }
+        CacheMode::Cached { freshness, refresh } => {
+            match cache::find_vault(&cwd).map(VaultRoot::new) {
+                Some(vault) => {
+                    // Subtree scoping (design W26 / spec §7): when the query
+                    // names a subtree via positional `[DIRS]`, load ONLY that
+                    // subtree from the cache instead of loading the whole
+                    // vault and narrowing after. Gated on `wanted.is_some()
+                    // && !dirs.is_empty()`:
+                    //
+                    // * `wanted.is_some()` is exactly the W17 push-down
+                    //   boundary (spec §7.2). The REPL always passes
+                    //   `wanted = None` — its store outlives a query and may
+                    //   later target a different subtree, so it must stay
+                    //   whole-vault — and a `--refresh`/`--refresh-all` run
+                    //   forces `wanted = None` above (its post-load
+                    //   `RecordStore::refresh` rebuilds every slice from the
+                    //   whole on-disk cache, which would undo a scoped
+                    //   load). Both therefore fall through to the unchanged
+                    //   whole-vault load + post-hoc `retain_under` path
+                    //   below: a refreshing run refreshes the WHOLE vault
+                    //   (`--refresh-all`) or its named target (`--refresh
+                    //   <path>`), then the RESULT is narrowed to `[DIRS]` —
+                    //   no record the user asked to refresh is dropped.
+                    // * A scoped load makes the store's schema the
+                    //   subtree's, narrowing W12 validation to it (spec
+                    //   §7.3, an accepted, tested behavior change).
+                    //
+                    // Correctness: `scope = None` always falls back to the
+                    // proven whole-load + `retain_under` path, so gating here
+                    // can only ever disable the optimization, never yield a
+                    // wrong result.
+                    let scope = match wanted {
+                        Some(_) if !dirs.is_empty() => Some(canonicalize_dirs(dirs)?),
+                        _ => None,
+                    };
+                    let (mut store, mut report) = InMemoryStore::from_cache(
+                        &vault,
+                        opts,
+                        Some(*freshness),
+                        wanted,
+                        scope.as_deref(),
+                    );
+                    // A forced refresh runs against the just-loaded cache;
+                    // only its warnings need surfacing (the counts are
+                    // informational and the store already reflects the
+                    // refreshed records).
+                    match refresh {
+                        RefreshScope::All => {
+                            report.warnings.extend(store.refresh(&vault, None).warnings);
+                        }
+                        RefreshScope::Subtrees(paths) => {
+                            for path in paths {
+                                let target = cache::resolve_refresh_target(path, &vault)?;
+                                report
+                                    .warnings
+                                    .extend(store.refresh(&vault, Some(&target)).warnings);
+                            }
+                        }
+                        RefreshScope::None => {}
+                    }
+                    // Spec §5: positional `[DIRS]` restrict a vault query to
+                    // the named subtrees. When `scope` is `None` the vault
+                    // was loaded whole (the REPL / refreshing path), so
+                    // narrow here at slice granularity; when `scope` is
+                    // `Some` the store was built already scoped and this is
+                    // skipped. A dir entirely outside the vault matches no
+                    // slice (its records are absent) — v1 does not live-scan
+                    // outside-vault dirs, a known limitation.
+                    if scope.is_none() && !dirs.is_empty() {
+                        store.retain_under(&canonicalize_dirs(dirs)?);
+                    }
+                    (store, report, Some(vault))
+                }
+                None => {
+                    let (store, report) =
+                        InMemoryStore::load(cli::canonicalize_roots(dirs)?, opts, wanted);
+                    (store, report, None)
+                }
+            }
+        }
+        CacheMode::TrustCache => {
+            let vault = cache::find_vault(&cwd).map(VaultRoot::new).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--force-cache: no .querymatter cache found (run `querymatter init` first)"
+                )
+            })?;
+            let (store, report) = InMemoryStore::from_cache(&vault, opts, None, wanted, None);
+            (store, report, Some(vault))
         }
     };
 
@@ -1016,9 +1052,9 @@ fn build_session(
     // `file.body` (design W56) is the one column a query can evaluate that
     // needs live disk access beyond the store already built above;
     // `--force-cache` promises zero such access for the whole run, so gate
-    // it here from the same `cli.freshness()` that decided how `store` was
+    // it here from the same `cache_mode` that decided how `store` was
     // loaded.
-    session.set_disk_reads_allowed(cli.freshness() != Freshness::ForceCache);
+    session.set_disk_reads_allowed(!matches!(cache_mode, CacheMode::TrustCache));
     // Seeds `--echo`'s initial state; the REPL's `.echo` dot-command can
     // still flip it live for the rest of the session (see `Session::echo`'s
     // doc comment).

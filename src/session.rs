@@ -35,9 +35,10 @@ pub struct Session {
     vault: Option<VaultRoot>,
     /// Whether a query may touch the filesystem beyond the store it was
     /// built with — gates `file.body` (design W56), `false` only under
-    /// `Freshness::ForceCache`. Fixed for this session's whole lifetime (set
-    /// once by [`Self::set_disk_reads_allowed`] right after construction,
-    /// from the CLI's freshness mode); unlike `.format`/`.style`/etc. there
+    /// `CacheMode::TrustCache` (`--force-cache`). Fixed for this session's
+    /// whole lifetime (set once by [`Self::set_disk_reads_allowed`] right
+    /// after construction, from the CLI's resolved cache mode); unlike
+    /// `.format`/`.style`/etc. there
     /// is no dot-command to change it mid-session. Defaults to `true`
     /// (unrestricted) so every existing [`Session::new`] call site — none of
     /// which cares about `--force-cache` — keeps its pre-W56 behavior.
@@ -59,7 +60,7 @@ impl Session {
     /// Builds a session over `store` with `settings`, keeping `fallback` —
     /// the resolution with the per-user config file removed but the vault
     /// layer kept — for `.unset`. Disk reads default to allowed; a caller
-    /// that built `store` under `Freshness::ForceCache` must follow up with
+    /// that built `store` under `CacheMode::TrustCache` must follow up with
     /// [`Self::set_disk_reads_allowed`].
     pub fn new(
         store: Box<dyn RecordStore>,
@@ -80,7 +81,7 @@ impl Session {
     /// Restricts (or permits) this session's queries from reading `file.body`
     /// off disk (see the `disk_reads_allowed` field's doc comment above).
     /// Called once by `main::build_session` right after construction, from
-    /// the CLI's resolved [`crate::cache::Freshness`]; never toggled
+    /// the CLI's resolved [`crate::cli::CacheMode`]; never toggled
     /// mid-session.
     pub fn set_disk_reads_allowed(&mut self, allowed: bool) {
         self.disk_reads_allowed = allowed;
@@ -1040,8 +1041,13 @@ mod tests {
         let vault = VaultRoot::new(td.path().to_path_buf());
         cache::build_vault(&vault, &WalkOpts::default(), 300).unwrap();
 
-        let (store, _report) =
-            InMemoryStore::from_cache(&vault, WalkOpts::default(), Freshness::PerFile, None, None);
+        let (store, _report) = InMemoryStore::from_cache(
+            &vault,
+            WalkOpts::default(),
+            Some(Freshness::PerFile),
+            None,
+            None,
+        );
         let mut session = Session::new(
             Box::new(store),
             Settings::default(),
@@ -1121,8 +1127,13 @@ mod tests {
         let original_mtime = fs::metadata(&a).unwrap().modified().unwrap();
         cache::build_vault(&vault, &WalkOpts::default(), 300).unwrap();
 
-        let (store, _report) =
-            InMemoryStore::from_cache(&vault, WalkOpts::default(), Freshness::PerFile, None, None);
+        let (store, _report) = InMemoryStore::from_cache(
+            &vault,
+            WalkOpts::default(),
+            Some(Freshness::PerFile),
+            None,
+            None,
+        );
         let mut session = Session::new(
             Box::new(store),
             Settings::default(),
@@ -1165,8 +1176,13 @@ mod tests {
         fs::write(vault.join("a.md"), "---\nstatus: draft\n---\n").unwrap();
         cache::build_vault(&vault, &WalkOpts::default(), 300).unwrap();
 
-        let (store, _report) =
-            InMemoryStore::from_cache(&vault, WalkOpts::default(), Freshness::PerFile, None, None);
+        let (store, _report) = InMemoryStore::from_cache(
+            &vault,
+            WalkOpts::default(),
+            Some(Freshness::PerFile),
+            None,
+            None,
+        );
         let mut session = Session::new(
             Box::new(store),
             Settings::default(),

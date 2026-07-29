@@ -589,9 +589,6 @@ pub enum Freshness {
     /// mtime unmoved is intentionally NOT picked up within the TTL window
     /// (design spec §4) — a documented tradeoff for speed on large vaults.
     Fast,
-    /// Trust the cache verbatim; no filesystem access at all. Erroring when
-    /// no cache exists is the caller's responsibility.
-    ForceCache,
 }
 
 /// The outcome of scanning one file for its frontmatter: mirrors
@@ -668,7 +665,7 @@ pub fn scan_file(dir: &DirPath, path: &FilePath, max_file_bytes: u64) -> ScanRes
 /// caller knows whether it's worth persisting via [`save_cache`]).
 ///
 /// `ttl_secs` is only consulted by [`Freshness::Fast`] (it's the manifest's
-/// per-DB TTL setting — design spec §3); `PerFile`/`ForceCache` ignore it.
+/// per-DB TTL setting — design spec §3); [`Freshness::PerFile`] ignores it.
 ///
 /// Timestamp bookkeeping alone (each `CachedDir`'s `scanned_at`, which
 /// always advances on a `PerFile`/`Fast` refresh) doesn't count toward
@@ -691,10 +688,14 @@ pub fn refresh_against_cache(
 /// O(vault) — scoping only the blob decode ([`load_cache_under`]) without
 /// scoping this walk would leave the whole-vault cost in place.
 ///
-/// The freshness *semantics* are untouched: `PerFile`/`Fast`/`ForceCache`
-/// behave exactly as unscoped, just over a smaller file set — unlike
-/// [`refresh_subtree`], which forces a full re-parse. `scope` of `None` is
-/// exactly [`refresh_against_cache`].
+/// The freshness *semantics* are untouched: `PerFile`/`Fast` behave exactly
+/// as unscoped, just over a smaller file set — unlike [`refresh_subtree`],
+/// which forces a full re-parse. `scope` of `None` is exactly
+/// [`refresh_against_cache`]. Trusting the cache verbatim with zero
+/// filesystem access (`--force-cache`) is no longer a `Freshness` mode at
+/// all — it's decided once in `main::build_session` and short-circuits
+/// before [`InMemoryStore::from_cache`](crate::store::InMemoryStore::from_cache)
+/// ever calls this function.
 pub fn refresh_against_cache_scoped(
     vault: &VaultRoot,
     cached: &[CachedDir],
@@ -704,7 +705,6 @@ pub fn refresh_against_cache_scoped(
     scope: Option<&[PathBuf]>,
 ) -> (Vec<CachedDir>, LoadReport, bool) {
     match mode {
-        Freshness::ForceCache => (cached.to_vec(), LoadReport::default(), false),
         Freshness::PerFile => refresh_per_file(vault, cached, opts, scope),
         Freshness::Fast => refresh_fast(vault, cached, opts, ttl_secs, scope),
     }
@@ -1789,31 +1789,10 @@ mod tests {
         assert!(changed, "adding/removing a file must count as changed");
     }
 
-    #[test]
-    fn force_cache_returns_cached_even_when_file_changed() {
-        let td = TempDir::new().unwrap();
-        write_file(td.path(), "a.md", "---\nstatus: draft\n---\n");
-        let cached = build_initial_cache(td.path());
-
-        write_file(td.path(), "a.md", "---\nstatus: final\n---\n");
-
-        let (refreshed, report, changed) = refresh_against_cache(
-            &VaultRoot::new(td.path().to_path_buf()),
-            &cached,
-            &WalkOpts::default(),
-            Freshness::ForceCache,
-            300,
-        );
-        assert_eq!(
-            cached_status(&refreshed, "a.md"),
-            Value::Str("draft".into()),
-            "--force-cache must never re-read the changed file"
-        );
-        assert!(!changed);
-        assert_eq!(report.loaded, 0);
-        assert_eq!(report.skipped, 0);
-        assert!(report.warnings.is_empty());
-    }
+    // The trust-cache short-circuit (formerly `Freshness::ForceCache`, now
+    // `InMemoryStore::from_cache`'s `mode: None`) no longer touches this
+    // function at all — see `store::tests::force_cache_mode_skips_persist_and_uses_stale_value`
+    // for its coverage.
 
     #[test]
     fn fast_skips_dir_with_unchanged_mtime_within_ttl() {
