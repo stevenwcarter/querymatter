@@ -12,7 +12,7 @@ use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::PathBuf;
 use std::time::SystemTime;
 
 use chrono::{DateTime, Duration, Months, NaiveDate, SecondsFormat, Utc};
@@ -22,6 +22,7 @@ use regex::Regex;
 
 use crate::frontmatter;
 use crate::model::{FileAttr, Record, Value, compare_values};
+use crate::paths::{FilePath, VaultRoot};
 use crate::query::ResultTable;
 use crate::query::ast::{
     Aggregate, BinOp, CmpOp, ColRef, DateUnit, Expr, Having, HavingLeaf, Literal, OrderKey,
@@ -1273,8 +1274,8 @@ fn eval_group_expr(rows: &[&Record], expr: &Expr, ctx: EvalCtx<'_>) -> Value {
 /// evaluation context in [`eval_group_expr`]'s zero-row fallback.
 fn empty_record() -> Record {
     Record::new(
-        Path::new(""),
-        Path::new(""),
+        &VaultRoot::new(PathBuf::new()),
+        &FilePath::new(PathBuf::new()),
         IndexMap::new(),
         SystemTime::UNIX_EPOCH,
         0,
@@ -2310,8 +2311,8 @@ mod tests {
             m.insert((*k).to_string(), v.clone());
         }
         Record::new(
-            Path::new(root),
-            Path::new(path),
+            &VaultRoot::new(Path::new(root).to_path_buf()),
+            &FilePath::new(Path::new(path).to_path_buf()),
             m,
             SystemTime::UNIX_EPOCH,
             0,
@@ -3866,8 +3867,8 @@ mod agg_tests {
         m.insert("status".into(), Value::Str(status.into()));
         m.insert("prd".into(), Value::Str(prd.into()));
         Record::new(
-            Path::new("s"),
-            Path::new(path),
+            &VaultRoot::new(Path::new("s").to_path_buf()),
+            &FilePath::new(Path::new(path).to_path_buf()),
             m,
             SystemTime::UNIX_EPOCH,
             0,
@@ -3888,8 +3889,8 @@ mod agg_tests {
         m.insert("status".into(), Value::Str(status.into()));
         m.insert("n".into(), n);
         Record::new(
-            Path::new("s"),
-            Path::new(path),
+            &VaultRoot::new(Path::new("s").to_path_buf()),
+            &FilePath::new(Path::new(path).to_path_buf()),
             m,
             SystemTime::UNIX_EPOCH,
             0,
@@ -4612,7 +4613,14 @@ mod agg_tests {
             for (k, v) in kv {
                 fields.insert((*k).to_string(), v.clone());
             }
-            Record::new(dir, &path, fields, SystemTime::UNIX_EPOCH, 0, 0)
+            Record::new(
+                &VaultRoot::new(dir.to_path_buf()),
+                &FilePath::new(path),
+                fields,
+                SystemTime::UNIX_EPOCH,
+                0,
+                0,
+            )
         }
 
         /// Test 1 (brief): `WHERE file.body LIKE '%TODO%'` matches a fixture

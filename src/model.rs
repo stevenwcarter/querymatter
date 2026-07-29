@@ -4,6 +4,8 @@ use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use crate::paths::{FilePath, VaultRoot};
+
 /// A dynamically-typed value read from Markdown YAML frontmatter.
 ///
 /// This is the common currency for query evaluation: frontmatter fields are
@@ -255,8 +257,8 @@ impl Record {
     /// [`crate::frontmatter::extract`]), likewise already computed by the
     /// caller.
     pub fn new(
-        root: &Path,
-        path: &Path,
+        root: &VaultRoot,
+        path: &FilePath,
         fields: IndexMap<String, Value>,
         mtime: SystemTime,
         size: u64,
@@ -624,8 +626,8 @@ mod record_tests {
         let mut f = IndexMap::new();
         f.insert("status".to_string(), Value::Str("draft".into()));
         Record::new(
-            Path::new("samples"),
-            Path::new("samples/plans/DCP-459.md"),
+            &VaultRoot::new(Path::new("samples").to_path_buf()),
+            &FilePath::new(Path::new("samples/plans/DCP-459.md").to_path_buf()),
             f,
             SystemTime::UNIX_EPOCH,
             0,
@@ -648,8 +650,8 @@ mod record_tests {
         use std::time::Duration;
         let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_609_459_200);
         let r = Record::new(
-            Path::new("v"),
-            Path::new("v/a.md"),
+            &VaultRoot::new(Path::new("v").to_path_buf()),
+            &FilePath::new(Path::new("v/a.md").to_path_buf()),
             IndexMap::new(),
             t,
             42,
@@ -664,8 +666,8 @@ mod record_tests {
     #[test]
     fn file_attr_word_count() {
         let r = Record::new(
-            Path::new("v"),
-            Path::new("v/a.md"),
+            &VaultRoot::new(Path::new("v").to_path_buf()),
+            &FilePath::new(Path::new("v/a.md").to_path_buf()),
             IndexMap::new(),
             SystemTime::UNIX_EPOCH,
             0,
@@ -680,8 +682,8 @@ mod record_tests {
         // with verbatim (both real producers always pass an already
         // canonicalized/absolute path — see the field's doc comment).
         let r = Record::new(
-            Path::new("/vault"),
-            Path::new("/vault/plans/a.md"),
+            &VaultRoot::new(Path::new("/vault").to_path_buf()),
+            &FilePath::new(Path::new("/vault/plans/a.md").to_path_buf()),
             IndexMap::new(),
             SystemTime::UNIX_EPOCH,
             0,
@@ -711,8 +713,8 @@ mod record_tests {
         let mut f = IndexMap::new();
         f.insert("estimate".to_string(), Value::Map(inner));
         let r = Record::new(
-            Path::new("v"),
-            Path::new("v/a.md"),
+            &VaultRoot::new(Path::new("v").to_path_buf()),
+            &FilePath::new(Path::new("v/a.md").to_path_buf()),
             f,
             SystemTime::UNIX_EPOCH,
             0,

@@ -11,6 +11,7 @@ use anyhow::Context;
 use crate::cache;
 use crate::config::{self, Config, ConfigKey};
 use crate::output::OutputSink;
+use crate::paths::VaultRoot;
 use crate::query::{self, ResultTable};
 use crate::render::{self, Format, Output, TableStyle};
 use crate::settings::{Resolved, Settings, Source};
@@ -31,7 +32,7 @@ pub struct Session {
     /// The `.querymatter` vault this session's store is backed by, when it
     /// is cache-backed. `None` for a live (no-cache) session, in which case
     /// [`refresh`](Self::refresh) falls back to an in-memory-only reload.
-    vault: Option<PathBuf>,
+    vault: Option<VaultRoot>,
     /// Whether a query may touch the filesystem beyond the store it was
     /// built with — gates `file.body` (design W56), `false` only under
     /// `Freshness::ForceCache`. Fixed for this session's whole lifetime (set
@@ -64,7 +65,7 @@ impl Session {
         store: Box<dyn RecordStore>,
         settings: Settings,
         fallback: Settings,
-        vault: Option<PathBuf>,
+        vault: Option<VaultRoot>,
     ) -> Self {
         Session {
             store,
@@ -1036,20 +1037,16 @@ mod tests {
         let td = TempDir::new().unwrap();
         let a_path = td.path().join("a.md");
         fs::write(&a_path, "---\nstatus: draft\n---\n").unwrap();
-        cache::build_vault(td.path(), &WalkOpts::default(), 300).unwrap();
+        let vault = VaultRoot::new(td.path().to_path_buf());
+        cache::build_vault(&vault, &WalkOpts::default(), 300).unwrap();
 
-        let (store, _report) = InMemoryStore::from_cache(
-            td.path(),
-            WalkOpts::default(),
-            Freshness::PerFile,
-            None,
-            None,
-        );
+        let (store, _report) =
+            InMemoryStore::from_cache(&vault, WalkOpts::default(), Freshness::PerFile, None, None);
         let mut session = Session::new(
             Box::new(store),
             Settings::default(),
             Settings::default(),
-            Some(td.path().to_path_buf()),
+            Some(vault),
         );
 
         fs::write(&a_path, "---\nstatus: final\n---\n").unwrap();
@@ -1117,7 +1114,7 @@ mod tests {
     #[test]
     fn refresh_subtree_with_vault_reparses_that_subtree() {
         let td = TempDir::new().unwrap();
-        let vault = fs::canonicalize(td.path()).unwrap();
+        let vault = VaultRoot::new(fs::canonicalize(td.path()).unwrap());
         let a = vault.join("plans/a.md");
         fs::create_dir_all(a.parent().unwrap()).unwrap();
         fs::write(&a, "---\nstatus: draft\n---\n").unwrap();
@@ -1164,7 +1161,7 @@ mod tests {
     #[test]
     fn refresh_subtree_unresolvable_path_warns_and_does_not_crash() {
         let td = TempDir::new().unwrap();
-        let vault = fs::canonicalize(td.path()).unwrap();
+        let vault = VaultRoot::new(fs::canonicalize(td.path()).unwrap());
         fs::write(vault.join("a.md"), "---\nstatus: draft\n---\n").unwrap();
         cache::build_vault(&vault, &WalkOpts::default(), 300).unwrap();
 

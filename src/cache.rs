@@ -23,6 +23,7 @@ use crate::discover::{self, WalkOpts};
 use crate::frontmatter::{self, Extract};
 use crate::model::{Record, Value};
 use crate::parallel;
+use crate::paths::{DirPath, FilePath, VaultRoot};
 use crate::store::LoadReport;
 
 /// The on-disk directory (relative to a vault root) holding `manifest.bin`
@@ -63,7 +64,7 @@ pub struct CachedFile {
 /// and when it was scanned.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CachedDir {
-    pub dir: PathBuf,
+    pub dir: DirPath,
     pub scanned_at: SystemTime,
     pub dir_mtime: SystemTime,
     pub files: Vec<CachedFile>,
@@ -223,7 +224,7 @@ pub fn save_cache(vault_dir: &Path, dirs: &[CachedDir], ttl_secs: u64) -> anyhow
         write_atomic(&blob_path, &bytes)
             .with_context(|| format!("writing {}", blob_path.display()))?;
         entries.push(ManifestEntry {
-            dir: dir.dir.clone(),
+            dir: dir.dir.to_path_buf(),
             scanned_at: dir.scanned_at,
             dir_mtime: dir.dir_mtime,
             blob,
@@ -503,7 +504,7 @@ fn stat_file(path: &Path) -> io::Result<(SystemTime, u64)> {
 /// a [`ScanResult::Warning`] naming it, exactly like an unreadable file or
 /// invalid frontmatter, rather than handed to `fs::read_to_string` — which
 /// would otherwise buffer the whole file (however large) into memory.
-pub fn scan_file(dir: &Path, path: &Path, max_file_bytes: u64) -> ScanResult {
+pub fn scan_file(dir: &DirPath, path: &FilePath, max_file_bytes: u64) -> ScanResult {
     let (mtime, size) = match stat_file(path) {
         Ok(stat) => stat,
         Err(err) => return ScanResult::Warning(format!("{}: {err}", path.display())),
@@ -547,7 +548,7 @@ pub fn scan_file(dir: &Path, path: &Path, max_file_bytes: u64) -> ScanResult {
 /// always advances on a `PerFile`/`Fast` refresh) doesn't count toward
 /// "changed" — only actual directory/file membership, stats, or fields do.
 pub fn refresh_against_cache(
-    vault: &Path,
+    vault: &VaultRoot,
     cached: &[CachedDir],
     opts: &WalkOpts,
     mode: Freshness,
@@ -569,7 +570,7 @@ pub fn refresh_against_cache(
 /// [`refresh_subtree`], which forces a full re-parse. `scope` of `None` is
 /// exactly [`refresh_against_cache`].
 pub fn refresh_against_cache_scoped(
-    vault: &Path,
+    vault: &VaultRoot,
     cached: &[CachedDir],
     opts: &WalkOpts,
     mode: Freshness,
@@ -588,10 +589,12 @@ pub fn refresh_against_cache_scoped(
 /// directly at the vault root, given as a relative single-component path).
 /// Shared by every function that groups discovered files by their
 /// containing directory.
-fn file_dir(vault: &Path, path: &Path) -> PathBuf {
-    path.parent()
+fn file_dir(vault: &VaultRoot, path: &FilePath) -> DirPath {
+    let dir = path
+        .parent()
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| vault.to_path_buf())
+        .unwrap_or_else(|| vault.to_path_buf());
+    DirPath::new(dir)
 }
 
 /// The accurate per-file freshness check (see [`Freshness::PerFile`]).
@@ -602,7 +605,7 @@ fn file_dir(vault: &Path, path: &Path) -> PathBuf {
 /// exactly the order the old serial `for path in discover(...)` loop
 /// produced, regardless of which worker finished first.
 fn refresh_per_file(
-    vault: &Path,
+    vault: &VaultRoot,
     cached: &[CachedDir],
     opts: &WalkOpts,
     scope: Option<&[PathBuf]>,
@@ -622,15 +625,16 @@ fn refresh_per_file(
         .filter(|path| in_scope(path, scope))
         .collect();
     let outcomes = parallel::map_paths(paths, |path| {
-        let dir = file_dir(vault, path);
+        let file_path = FilePath::new(path.to_path_buf());
+        let dir = file_dir(vault, &file_path);
         let previous = cached_by_path.get(path).copied();
-        refresh_one_file(&dir, path, previous, opts.max_file_bytes)
+        refresh_one_file(&dir, &file_path, previous, opts.max_file_bytes)
     });
 
     let mut report = LoadReport::default();
     let mut by_dir: BTreeMap<PathBuf, Vec<CachedFile>> = BTreeMap::new();
     for (path, outcome) in outcomes {
-        let dir = file_dir(vault, &path);
+        let dir = file_dir(vault, &FilePath::new(path)).to_path_buf();
         if let Some(file) = fold_refresh_outcome(outcome, &mut report) {
             by_dir.entry(dir).or_default().push(file);
         }
@@ -641,7 +645,7 @@ fn refresh_per_file(
         .map(|(dir, files)| {
             let dir_mtime = stat_dir_mtime(&dir, &mut report);
             CachedDir {
-                dir,
+                dir: DirPath::new(dir),
                 scanned_at: SystemTime::now(),
                 dir_mtime,
                 files,
@@ -680,8 +684,8 @@ enum RefreshOutcome {
 /// since the last scan cannot newly exhaust memory here — it only takes
 /// effect the next time this file actually falls through to [`scan_file`].
 fn refresh_one_file(
-    dir: &Path,
-    path: &Path,
+    dir: &DirPath,
+    path: &FilePath,
     previous: Option<&CachedFile>,
     max_file_bytes: u64,
 ) -> RefreshOutcome {
@@ -739,14 +743,16 @@ fn stat_dir_mtime(dir: &Path, report: &mut LoadReport) -> SystemTime {
 /// threads (sorted back to that directory's original file order — the same
 /// order [`discover`] found them in — before building its [`CachedDir`]).
 fn refresh_fast(
-    vault: &Path,
+    vault: &VaultRoot,
     cached: &[CachedDir],
     opts: &WalkOpts,
     ttl_secs: u64,
     scope: Option<&[PathBuf]>,
 ) -> (Vec<CachedDir>, LoadReport, bool) {
-    let cached_by_dir: BTreeMap<PathBuf, &CachedDir> =
-        cached.iter().map(|dir| (dir.dir.clone(), dir)).collect();
+    let cached_by_dir: BTreeMap<PathBuf, &CachedDir> = cached
+        .iter()
+        .map(|dir| (dir.dir.to_path_buf(), dir))
+        .collect();
     let cached_by_path: BTreeMap<PathBuf, &CachedFile> = cached
         .iter()
         .flat_map(|cached_dir| {
@@ -762,10 +768,8 @@ fn refresh_fast(
         if !in_scope(&path, scope) {
             continue;
         }
-        paths_by_dir
-            .entry(file_dir(vault, &path))
-            .or_default()
-            .push(path);
+        let dir = file_dir(vault, &FilePath::new(path.clone())).to_path_buf();
+        paths_by_dir.entry(dir).or_default().push(path);
     }
 
     let now = SystemTime::now();
@@ -785,16 +789,22 @@ fn refresh_fast(
                 return (*previous).clone();
             }
 
+            let dir_path = DirPath::new(dir);
             let outcomes = parallel::map_paths(paths, |path| {
                 let previous = cached_by_path.get(path).copied();
-                refresh_one_file(&dir, path, previous, opts.max_file_bytes)
+                refresh_one_file(
+                    &dir_path,
+                    &FilePath::new(path.to_path_buf()),
+                    previous,
+                    opts.max_file_bytes,
+                )
             });
             let files: Vec<CachedFile> = outcomes
                 .into_iter()
                 .filter_map(|(_, outcome)| fold_refresh_outcome(outcome, &mut report))
                 .collect();
             CachedDir {
-                dir,
+                dir: dir_path,
                 scanned_at: now,
                 dir_mtime: current_mtime,
                 files,
@@ -820,7 +830,7 @@ fn content_equal(a: &[CachedDir], b: &[CachedDir]) -> bool {
                 ..dir
             })
             .collect();
-        normalized.sort_by(|x, y| x.dir.cmp(&y.dir));
+        normalized.sort_by(|x, y| x.dir.as_path().cmp(y.dir.as_path()));
         normalized
     }
     normalize(a) == normalize(b)
@@ -842,7 +852,7 @@ fn content_equal(a: &[CachedDir], b: &[CachedDir]) -> bool {
 /// goal is to reject traversal in the *stored* data, not resolve it.
 /// `starts_with` is a belt-and-suspenders check on top of the component
 /// scan, not the primary defense.
-fn contained_path(dir: &Path, rel_path: &str) -> Option<PathBuf> {
+fn contained_path(dir: &DirPath, rel_path: &str) -> Option<PathBuf> {
     let mut normalized = PathBuf::new();
     for component in Path::new(rel_path).components() {
         match component {
@@ -893,7 +903,7 @@ type RecordsByDir = Vec<(PathBuf, Vec<Record>, BTreeSet<String>)>;
 /// fields never contribute to the returned field-name union either, since it
 /// is treated as untrusted, not merely stale.
 pub fn records_from(
-    root: &Path,
+    root: &VaultRoot,
     dirs: &[CachedDir],
     wanted: Option<&BTreeSet<String>>,
 ) -> (RecordsByDir, LoadReport) {
@@ -927,7 +937,7 @@ pub fn records_from(
                     };
                     Some(Record::new(
                         root,
-                        &path,
+                        &FilePath::new(path),
                         fields,
                         file.mtime,
                         file.size,
@@ -935,7 +945,7 @@ pub fn records_from(
                     ))
                 })
                 .collect();
-            (cached_dir.dir.clone(), records, field_names)
+            (cached_dir.dir.to_path_buf(), records, field_names)
         })
         .collect();
     (entries, report)
@@ -946,7 +956,7 @@ pub fn records_from(
 /// grouped into [`CachedDir`]s and persisted via [`save_cache`] with the
 /// given `ttl_secs`. Returns a [`LoadReport`] summarizing what was
 /// loaded/skipped, so the caller can print an `init` summary.
-pub fn build_vault(base: &Path, opts: &WalkOpts, ttl_secs: u64) -> anyhow::Result<LoadReport> {
+pub fn build_vault(base: &VaultRoot, opts: &WalkOpts, ttl_secs: u64) -> anyhow::Result<LoadReport> {
     let (dirs, report, _changed) =
         refresh_against_cache(base, &[], opts, Freshness::PerFile, ttl_secs);
     save_cache(base, &dirs, ttl_secs)?;
@@ -1019,7 +1029,7 @@ pub fn cache_summary(vault_dir: &Path) -> anyhow::Result<CacheSummary> {
 /// appended. Directories outside `subtree` are left untouched. The caller
 /// persists the result via [`save_cache`].
 pub fn refresh_subtree(
-    vault: &Path,
+    vault: &VaultRoot,
     cached: &mut Vec<CachedDir>,
     subtree: &Path,
     opts: &WalkOpts,
@@ -1032,12 +1042,13 @@ pub fn refresh_subtree(
         if !path.starts_with(subtree) {
             continue;
         }
-        let dir = file_dir(vault, &path);
+        let file_path = FilePath::new(path);
+        let dir = file_dir(vault, &file_path);
         // `previous: None` forces `refresh_one_file` straight to `scan_file`
         // for every file, ignoring any cached (mtime, size) shortcut.
-        let outcome = refresh_one_file(&dir, &path, None, opts.max_file_bytes);
+        let outcome = refresh_one_file(&dir, &file_path, None, opts.max_file_bytes);
         if let Some(file) = fold_refresh_outcome(outcome, &mut report) {
-            by_dir.entry(dir).or_default().push(file);
+            by_dir.entry(dir.to_path_buf()).or_default().push(file);
         }
     }
 
@@ -1046,7 +1057,7 @@ pub fn refresh_subtree(
         .map(|(dir, files)| {
             let dir_mtime = stat_dir_mtime(&dir, &mut report);
             let cached_dir = CachedDir {
-                dir: dir.clone(),
+                dir: DirPath::new(dir.clone()),
                 scanned_at: now,
                 dir_mtime,
                 files,
@@ -1055,14 +1066,14 @@ pub fn refresh_subtree(
         })
         .collect();
 
-    cached.retain(|dir| !dir.dir.starts_with(subtree) || refreshed.contains_key(&dir.dir));
+    cached.retain(|dir| !dir.dir.starts_with(subtree) || refreshed.contains_key(dir.dir.as_path()));
     for dir in cached.iter_mut() {
-        if let Some(fresh) = refreshed.get(&dir.dir) {
+        if let Some(fresh) = refreshed.get(dir.dir.as_path()) {
             *dir = fresh.clone();
         }
     }
     for (path, fresh) in refreshed {
-        if !cached.iter().any(|dir| dir.dir == path) {
+        if !cached.iter().any(|dir| dir.dir.as_path() == path.as_path()) {
             cached.push(fresh);
         }
     }
@@ -1089,7 +1100,7 @@ mod tests {
             Value::List(vec![Value::Str("a".into())]),
         );
         CachedDir {
-            dir: PathBuf::from("/v/plans"),
+            dir: DirPath::new(PathBuf::from("/v/plans")),
             scanned_at: UNIX_EPOCH + Duration::from_secs(1000),
             dir_mtime: UNIX_EPOCH + Duration::from_secs(900),
             files: vec![CachedFile {
@@ -1106,7 +1117,7 @@ mod tests {
     /// distinct filesystem paths (blob names are derived from the path).
     fn sample_dir_at(dir: PathBuf) -> CachedDir {
         CachedDir {
-            dir,
+            dir: DirPath::new(dir),
             ..sample_dir()
         }
     }
@@ -1115,6 +1126,33 @@ mod tests {
         let d = sample_dir();
         let bytes = encode(&d);
         assert_eq!(decode::<CachedDir>(&bytes), Some(d));
+    }
+    /// Pin: `CachedDir { dir: DirPath, .. }` must encode byte-identically to
+    /// the pre-T1 shape with a plain `PathBuf`, so existing caches decode
+    /// and `SCHEMA_VERSION` stays 3.
+    #[test]
+    fn cached_dir_bincode_layout_unchanged_by_dirpath_newtype() {
+        #[derive(serde::Serialize)]
+        struct OldCachedDir<'a> {
+            dir: &'a Path,
+            scanned_at: SystemTime,
+            dir_mtime: SystemTime,
+            files: &'a [CachedFile],
+        }
+        let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let new = CachedDir {
+            dir: DirPath::new(PathBuf::from("notes/projects")),
+            scanned_at: t,
+            dir_mtime: t,
+            files: vec![],
+        };
+        let old = OldCachedDir {
+            dir: Path::new("notes/projects"),
+            scanned_at: t,
+            dir_mtime: t,
+            files: &[],
+        };
+        assert_eq!(encode(&new), encode(&old));
     }
     #[test]
     fn manifest_header_roundtrips() {
@@ -1296,7 +1334,11 @@ mod tests {
         save_cache(td.path(), &[good.clone(), bad.clone()], 300).unwrap();
 
         let (body, _) = load_cache(td.path()).unwrap();
-        let bad_entry = body.dirs.iter().find(|e| e.dir == bad.dir).unwrap();
+        let bad_entry = body
+            .dirs
+            .iter()
+            .find(|e| e.dir.as_path() == bad.dir.as_path())
+            .unwrap();
         fs::write(
             td.path().join(".querymatter").join(&bad_entry.blob),
             b"not a valid bincode blob",
@@ -1451,8 +1493,9 @@ mod tests {
         );
         write_file(td.path(), "small.md", "---\nstatus: draft\n---\n");
 
-        let big = td.path().join("big.md");
-        match scan_file(td.path(), &big, 1000) {
+        let dir = DirPath::new(td.path().to_path_buf());
+        let big = FilePath::new(td.path().join("big.md"));
+        match scan_file(&dir, &big, 1000) {
             ScanResult::Warning(msg) => assert!(
                 msg.contains("big.md"),
                 "warning must name the oversized file, got: {msg}"
@@ -1460,9 +1503,9 @@ mod tests {
             other => panic!("expected a size-cap Warning, got {other:?}"),
         }
 
-        let small = td.path().join("small.md");
+        let small = FilePath::new(td.path().join("small.md"));
         assert!(matches!(
-            scan_file(td.path(), &small, 1000),
+            scan_file(&dir, &small, 1000),
             ScanResult::Cached(_)
         ));
     }
@@ -1471,8 +1514,14 @@ mod tests {
     /// against it — i.e. a first-ever scan, expressed via the same
     /// [`refresh_against_cache`] under test rather than a separate helper.
     fn build_initial_cache(vault: &Path) -> Vec<CachedDir> {
-        let (dirs, _report, _changed) =
-            refresh_against_cache(vault, &[], &WalkOpts::default(), Freshness::PerFile, 300);
+        let vault_root = VaultRoot::new(vault.to_path_buf());
+        let (dirs, _report, _changed) = refresh_against_cache(
+            &vault_root,
+            &[],
+            &WalkOpts::default(),
+            Freshness::PerFile,
+            300,
+        );
         dirs
     }
 
@@ -1520,7 +1569,7 @@ mod tests {
         set_mtime(&a_path, original_mtime);
 
         let (refreshed, report, _changed) = refresh_against_cache(
-            td.path(),
+            &VaultRoot::new(td.path().to_path_buf()),
             &cached,
             &WalkOpts::default(),
             Freshness::PerFile,
@@ -1551,7 +1600,7 @@ mod tests {
         set_mtime(&a_path, original_mtime + Duration::from_secs(120));
 
         let (refreshed, report, _changed) = refresh_against_cache(
-            td.path(),
+            &VaultRoot::new(td.path().to_path_buf()),
             &cached,
             &WalkOpts::default(),
             Freshness::PerFile,
@@ -1575,7 +1624,7 @@ mod tests {
         write_file(td.path(), "b.md", "---\nstatus: draft\n---\n");
 
         let (refreshed, _report, changed) = refresh_against_cache(
-            td.path(),
+            &VaultRoot::new(td.path().to_path_buf()),
             &cached,
             &WalkOpts::default(),
             Freshness::PerFile,
@@ -1594,7 +1643,7 @@ mod tests {
         write_file(td.path(), "a.md", "---\nstatus: final\n---\n");
 
         let (refreshed, report, changed) = refresh_against_cache(
-            td.path(),
+            &VaultRoot::new(td.path().to_path_buf()),
             &cached,
             &WalkOpts::default(),
             Freshness::ForceCache,
@@ -1633,7 +1682,7 @@ mod tests {
         }
 
         let (refreshed, report, changed) = refresh_against_cache(
-            td.path(),
+            &VaultRoot::new(td.path().to_path_buf()),
             &cached,
             &WalkOpts::default(),
             Freshness::Fast,
@@ -1666,7 +1715,7 @@ mod tests {
         write_file(td.path(), "b.md", "---\nstatus: draft\n---\n");
 
         let (refreshed, report, changed) = refresh_against_cache(
-            td.path(),
+            &VaultRoot::new(td.path().to_path_buf()),
             &cached,
             &WalkOpts::default(),
             Freshness::Fast,
@@ -1689,7 +1738,12 @@ mod tests {
         write_file(td.path(), "plans/a.md", "---\nstatus: draft\n---\n");
         write_file(td.path(), "product/b.md", "---\nstatus: shipped\n---\n");
 
-        let report = build_vault(td.path(), &WalkOpts::default(), 300).unwrap();
+        let report = build_vault(
+            &VaultRoot::new(td.path().to_path_buf()),
+            &WalkOpts::default(),
+            300,
+        )
+        .unwrap();
         assert_eq!(report.loaded, 2);
         assert_eq!(report.skipped, 0);
 
@@ -1710,7 +1764,12 @@ mod tests {
         write_file(td.path(), "plans/b.md", "---\nstatus: final\n---\n");
         write_file(td.path(), "product/c.md", "---\nstatus: shipped\n---\n");
 
-        build_vault(td.path(), &WalkOpts::default(), 300).unwrap();
+        build_vault(
+            &VaultRoot::new(td.path().to_path_buf()),
+            &WalkOpts::default(),
+            300,
+        )
+        .unwrap();
 
         let s = cache_summary(td.path()).unwrap();
         assert_eq!(s.file_count, 3);
@@ -1740,7 +1799,7 @@ mod tests {
         write_file(td.path(), "product/b.md", "---\nstatus: final\n---\n");
 
         let report = refresh_subtree(
-            td.path(),
+            &VaultRoot::new(td.path().to_path_buf()),
             &mut cached,
             &td.path().join("plans"),
             &WalkOpts::default(),
@@ -1773,7 +1832,8 @@ mod tests {
         write_file(td.path(), "plans/a.md", "---\nstatus: draft\n---\n");
 
         let cached = build_initial_cache(td.path());
-        let (entries, _report) = records_from(td.path(), &cached, None);
+        let (entries, _report) =
+            records_from(&VaultRoot::new(td.path().to_path_buf()), &cached, None);
         let cached_records: Vec<Record> = entries
             .into_iter()
             .flat_map(|(_, records, _field_names)| records)
@@ -1818,13 +1878,14 @@ mod tests {
             word_count: 0,
         };
         let cached_dir = CachedDir {
-            dir: vault.to_path_buf(),
+            dir: DirPath::new(vault.to_path_buf()),
             scanned_at: UNIX_EPOCH,
             dir_mtime: UNIX_EPOCH,
             files: vec![malicious, legitimate],
         };
 
-        let (entries, report) = records_from(vault, &[cached_dir], None);
+        let (entries, report) =
+            records_from(&VaultRoot::new(vault.to_path_buf()), &[cached_dir], None);
         let records: Vec<Record> = entries
             .into_iter()
             .flat_map(|(_, records, _field_names)| records)
@@ -1865,7 +1926,7 @@ mod tests {
         let vault = td.path();
 
         let cached_dir = CachedDir {
-            dir: vault.to_path_buf(),
+            dir: DirPath::new(vault.to_path_buf()),
             scanned_at: UNIX_EPOCH,
             dir_mtime: UNIX_EPOCH,
             files: vec![CachedFile {
@@ -1877,7 +1938,8 @@ mod tests {
             }],
         };
 
-        let (entries, report) = records_from(vault, &[cached_dir], None);
+        let (entries, report) =
+            records_from(&VaultRoot::new(vault.to_path_buf()), &[cached_dir], None);
         let records: Vec<Record> = entries
             .into_iter()
             .flat_map(|(_, records, _field_names)| records)
@@ -1899,7 +1961,7 @@ mod tests {
         let vault = td.path();
 
         let cached_dir = CachedDir {
-            dir: vault.to_path_buf(),
+            dir: DirPath::new(vault.to_path_buf()),
             scanned_at: UNIX_EPOCH,
             dir_mtime: UNIX_EPOCH,
             files: vec![CachedFile {
@@ -1911,7 +1973,8 @@ mod tests {
             }],
         };
 
-        let (entries, report) = records_from(vault, &[cached_dir], None);
+        let (entries, report) =
+            records_from(&VaultRoot::new(vault.to_path_buf()), &[cached_dir], None);
         let records: Vec<Record> = entries
             .into_iter()
             .flat_map(|(_, records, _field_names)| records)
@@ -1929,7 +1992,7 @@ mod tests {
         dirs.iter()
             .map(|d| {
                 (
-                    d.dir.clone(),
+                    d.dir.to_path_buf(),
                     d.files.iter().map(|f| f.rel_path.clone()).collect(),
                 )
             })
@@ -1963,13 +2026,18 @@ mod tests {
     /// checking the parallel code against a copy of itself. The shape
     /// matches [`dirs_snapshot`]'s so the two can be compared directly.
     fn expected_scan_shape(dir: &Path) -> (Vec<(PathBuf, Vec<String>)>, Vec<String>) {
+        let vault_root = VaultRoot::new(dir.to_path_buf());
         let mut by_dir: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
         let mut warnings = Vec::new();
         for path in discover::discover(dir, &WalkOpts::default()) {
-            let parent = file_dir(dir, &path);
-            match scan_file(&parent, &path, WalkOpts::default().max_file_bytes) {
+            let file_path = FilePath::new(path);
+            let parent = file_dir(&vault_root, &file_path);
+            match scan_file(&parent, &file_path, WalkOpts::default().max_file_bytes) {
                 ScanResult::Cached(file) => {
-                    by_dir.entry(parent).or_default().push(file.rel_path);
+                    by_dir
+                        .entry(parent.to_path_buf())
+                        .or_default()
+                        .push(file.rel_path);
                 }
                 ScanResult::NoFrontmatter => {}
                 ScanResult::Warning(msg) => warnings.push(msg),
@@ -1993,7 +2061,7 @@ mod tests {
         let (expected_by_dir, expected_warnings) = expected_scan_shape(td.path());
 
         let (dirs, report, _changed) = refresh_against_cache(
-            td.path(),
+            &VaultRoot::new(td.path().to_path_buf()),
             &[],
             &WalkOpts::default(),
             Freshness::PerFile,
@@ -2022,7 +2090,7 @@ mod tests {
         write_scan_fixture(td.path(), 20);
 
         let (first, _, _) = refresh_against_cache(
-            td.path(),
+            &VaultRoot::new(td.path().to_path_buf()),
             &[],
             &WalkOpts::default(),
             Freshness::PerFile,
@@ -2031,7 +2099,7 @@ mod tests {
         let baseline = dirs_snapshot(&first);
         for _ in 0..4 {
             let (dirs, _, _) = refresh_against_cache(
-                td.path(),
+                &VaultRoot::new(td.path().to_path_buf()),
                 &[],
                 &WalkOpts::default(),
                 Freshness::PerFile,
@@ -2061,8 +2129,13 @@ mod tests {
         write_scan_fixture(td.path(), 20);
         let (expected_by_dir, expected_warnings) = expected_scan_shape(td.path());
 
-        let (dirs, report, _changed) =
-            refresh_against_cache(td.path(), &[], &WalkOpts::default(), Freshness::Fast, 300);
+        let (dirs, report, _changed) = refresh_against_cache(
+            &VaultRoot::new(td.path().to_path_buf()),
+            &[],
+            &WalkOpts::default(),
+            Freshness::Fast,
+            300,
+        );
 
         assert_eq!(
             dirs_snapshot(&dirs),
@@ -2085,12 +2158,22 @@ mod tests {
         let td = TempDir::new().unwrap();
         write_scan_fixture(td.path(), 20);
 
-        let (first, _, _) =
-            refresh_against_cache(td.path(), &[], &WalkOpts::default(), Freshness::Fast, 300);
+        let (first, _, _) = refresh_against_cache(
+            &VaultRoot::new(td.path().to_path_buf()),
+            &[],
+            &WalkOpts::default(),
+            Freshness::Fast,
+            300,
+        );
         let baseline = dirs_snapshot(&first);
         for _ in 0..4 {
-            let (dirs, _, _) =
-                refresh_against_cache(td.path(), &[], &WalkOpts::default(), Freshness::Fast, 300);
+            let (dirs, _, _) = refresh_against_cache(
+                &VaultRoot::new(td.path().to_path_buf()),
+                &[],
+                &WalkOpts::default(),
+                Freshness::Fast,
+                300,
+            );
             assert_eq!(
                 dirs_snapshot(&dirs),
                 baseline,

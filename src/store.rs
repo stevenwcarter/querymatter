@@ -9,6 +9,7 @@ use crate::cache::{self, CachedDir, CachedFile, Freshness, ScanResult};
 use crate::discover::{self, WalkOpts};
 use crate::model::{FileAttr, Record};
 use crate::parallel;
+use crate::paths::{DirPath, FilePath, VaultRoot};
 
 /// Summary of a load/reload operation: how many files became records, how
 /// many were skipped (no valid frontmatter, or unreadable), and a
@@ -85,7 +86,7 @@ pub trait RecordStore {
     /// implementation is backed by an on-disk cache. Callable through
     /// `Box<dyn RecordStore>`, this is what the REPL's `.refresh`/
     /// `.refresh-all` and the CLI's `--refresh`/`--refresh-all` dispatch to.
-    fn refresh(&mut self, vault: &Path, subtree: Option<&Path>) -> LoadReport;
+    fn refresh(&mut self, vault: &VaultRoot, subtree: Option<&Path>) -> LoadReport;
 }
 
 /// A [`RecordStore`] that keeps every loaded record in memory, partitioned
@@ -117,7 +118,8 @@ impl InMemoryStore {
         };
         let mut report = LoadReport::default();
         for root in roots {
-            let (records, field_names, slice_report) = scan_root(&root, &store.opts, wanted);
+            let vault_root = VaultRoot::new(root.clone());
+            let (records, field_names, slice_report) = scan_root(&vault_root, &store.opts, wanted);
             report.merge(slice_report);
             store.slices.push(DirSlice {
                 root,
@@ -171,7 +173,7 @@ impl InMemoryStore {
     /// memory for a correct result and leaves cache maintenance to the
     /// whole-vault path. Hence the save below stays gated on `scope.is_none()`.
     pub fn from_cache(
-        vault: &Path,
+        vault: &VaultRoot,
         opts: WalkOpts,
         mode: Freshness,
         wanted: Option<&BTreeSet<String>>,
@@ -290,7 +292,7 @@ impl InMemoryStore {
         by_dir
             .into_iter()
             .map(|(dir, files)| CachedDir {
-                dir,
+                dir: DirPath::new(dir),
                 scanned_at: SystemTime::UNIX_EPOCH,
                 dir_mtime: SystemTime::UNIX_EPOCH,
                 files,
@@ -309,7 +311,7 @@ impl InMemoryStore {
 /// `wanted` is forwarded straight to [`cache::records_from`] — see its doc
 /// comment for what it prunes and why `schema()` stays complete regardless.
 fn slices_from_cached(
-    vault: &Path,
+    vault: &VaultRoot,
     dirs: &[CachedDir],
     wanted: Option<&BTreeSet<String>>,
 ) -> (Vec<DirSlice>, LoadReport) {
@@ -348,7 +350,8 @@ impl RecordStore for InMemoryStore {
     /// always passes `wanted = None` to [`scan_root`] — push-down never
     /// applies to a store that outlives a single query.
     fn reload_dir(&mut self, root: &Path) -> LoadReport {
-        let (records, field_names, report) = scan_root(root, &self.opts, None);
+        let vault_root = VaultRoot::new(root.to_path_buf());
+        let (records, field_names, report) = scan_root(&vault_root, &self.opts, None);
         if let Some(slice) = self.slices.iter_mut().find(|slice| slice.root == root) {
             slice.records = records;
             slice.field_names = field_names;
@@ -395,7 +398,7 @@ impl RecordStore for InMemoryStore {
     /// not a later refresh — see
     /// [`cached_dirs_from_slices`](InMemoryStore::cached_dirs_from_slices)'s
     /// doc comment for why that invariant matters here.
-    fn refresh(&mut self, vault: &Path, subtree: Option<&Path>) -> LoadReport {
+    fn refresh(&mut self, vault: &VaultRoot, subtree: Option<&Path>) -> LoadReport {
         let (mut cached, ttl_secs) = match cache::load_cache(vault) {
             Some((body, dirs)) => (dirs, body.ttl_secs),
             None => (self.cached_dirs_from_slices(), DEFAULT_TTL_SECS),
@@ -441,13 +444,21 @@ impl RecordStore for InMemoryStore {
 /// every key seen in a parsed file's frontmatter, before pruning — so a
 /// caller can retain it as the store's true schema regardless of `wanted`.
 fn scan_root(
-    root: &Path,
+    root: &VaultRoot,
     opts: &WalkOpts,
     wanted: Option<&BTreeSet<String>>,
 ) -> (Vec<Record>, BTreeSet<String>, LoadReport) {
     let paths = discover::discover(root, opts);
+    // `store::scan_root` legitimately scans every file directly against the
+    // vault root rather than each file's immediate parent — see
+    // `DirPath::from_root`'s doc comment.
+    let dir = DirPath::from_root(root);
     let scanned = parallel::map_paths(paths, |path| {
-        cache::scan_file(root, path, opts.max_file_bytes)
+        cache::scan_file(
+            &dir,
+            &FilePath::new(path.to_path_buf()),
+            opts.max_file_bytes,
+        )
     });
 
     let mut records = Vec::new();
@@ -468,7 +479,10 @@ fn scan_root(
                         .filter(|(name, _)| set.contains(name))
                         .collect(),
                 };
-                records.push(Record::new(root, &path, fields, mtime, size, word_count));
+                let file_path = FilePath::new(path);
+                records.push(Record::new(
+                    root, &file_path, fields, mtime, size, word_count,
+                ));
                 report.loaded += 1;
             }
             ScanResult::NoFrontmatter => {}
@@ -547,15 +561,11 @@ mod tests {
     fn from_cache_exposes_file_mtime_and_size() {
         let td = TempDir::new().unwrap();
         write(td.path(), "a.md", "---\nstatus: draft\n---\n");
-        cache::build_vault(td.path(), &WalkOpts::default(), 300).unwrap();
+        let vault = VaultRoot::new(td.path().to_path_buf());
+        cache::build_vault(&vault, &WalkOpts::default(), 300).unwrap();
 
-        let (store, _report) = InMemoryStore::from_cache(
-            td.path(),
-            WalkOpts::default(),
-            Freshness::PerFile,
-            None,
-            None,
-        );
+        let (store, _report) =
+            InMemoryStore::from_cache(&vault, WalkOpts::default(), Freshness::PerFile, None, None);
 
         assert_file_size_and_mtime_row(&store);
     }
@@ -600,15 +610,11 @@ mod tests {
     fn from_cache_exposes_file_word_count() {
         let td = TempDir::new().unwrap();
         write(td.path(), "a.md", WORD_COUNT_FIXTURE_BODY);
-        cache::build_vault(td.path(), &WalkOpts::default(), 300).unwrap();
+        let vault = VaultRoot::new(td.path().to_path_buf());
+        cache::build_vault(&vault, &WalkOpts::default(), 300).unwrap();
 
-        let (store, _report) = InMemoryStore::from_cache(
-            td.path(),
-            WalkOpts::default(),
-            Freshness::PerFile,
-            None,
-            None,
-        );
+        let (store, _report) =
+            InMemoryStore::from_cache(&vault, WalkOpts::default(), Freshness::PerFile, None, None);
 
         assert_file_word_count_row(&store);
     }
@@ -618,15 +624,11 @@ mod tests {
         let td = TempDir::new().unwrap();
         write(td.path(), "plans/a.md", "---\nstatus: draft\n---\n");
         write(td.path(), "product/b.md", "---\nstatus: shipped\n---\n");
-        cache::build_vault(td.path(), &WalkOpts::default(), 300).unwrap();
+        let vault = VaultRoot::new(td.path().to_path_buf());
+        cache::build_vault(&vault, &WalkOpts::default(), 300).unwrap();
 
-        let (cached_store, report) = InMemoryStore::from_cache(
-            td.path(),
-            WalkOpts::default(),
-            Freshness::PerFile,
-            None,
-            None,
-        );
+        let (cached_store, report) =
+            InMemoryStore::from_cache(&vault, WalkOpts::default(), Freshness::PerFile, None, None);
         assert_eq!(report.skipped, 0);
 
         let (live_store, _report) =
@@ -651,7 +653,7 @@ mod tests {
     #[test]
     fn scoped_load_matches_whole_vault_then_retain() {
         let td = TempDir::new().unwrap();
-        let vault = fs::canonicalize(td.path()).unwrap();
+        let vault = VaultRoot::new(fs::canonicalize(td.path()).unwrap());
         write(&vault, "plans/a.md", "---\nstatus: draft\n---\n");
         write(&vault, "plans/nested/b.md", "---\nstatus: synced\n---\n");
         write(&vault, "product/c.md", "---\nstatus: shipped\n---\n");
@@ -698,7 +700,7 @@ mod tests {
     #[test]
     fn scoped_schema_is_subtree_only() {
         let td = TempDir::new().unwrap();
-        let vault = fs::canonicalize(td.path()).unwrap();
+        let vault = VaultRoot::new(fs::canonicalize(td.path()).unwrap());
         write(&vault, "plans/a.md", "---\nstatus: draft\n---\n");
         // `roadmap` exists ONLY under product/.
         write(&vault, "product/b.md", "---\nroadmap: q3\n---\n");
@@ -753,7 +755,7 @@ mod tests {
     #[test]
     fn unscoped_load_keeps_full_vault_schema() {
         let td = TempDir::new().unwrap();
-        let vault = fs::canonicalize(td.path()).unwrap();
+        let vault = VaultRoot::new(fs::canonicalize(td.path()).unwrap());
         write(&vault, "plans/a.md", "---\nstatus: draft\n---\n");
         write(&vault, "product/b.md", "---\nroadmap: q3\n---\n");
         cache::build_vault(&vault, &WalkOpts::default(), 300).unwrap();
@@ -772,15 +774,11 @@ mod tests {
     fn refresh_picks_up_edits_and_persists() {
         let td = TempDir::new().unwrap();
         write(td.path(), "a.md", "---\nstatus: draft\n---\n");
-        cache::build_vault(td.path(), &WalkOpts::default(), 300).unwrap();
+        let vault = VaultRoot::new(td.path().to_path_buf());
+        cache::build_vault(&vault, &WalkOpts::default(), 300).unwrap();
 
-        let (mut store, _report) = InMemoryStore::from_cache(
-            td.path(),
-            WalkOpts::default(),
-            Freshness::PerFile,
-            None,
-            None,
-        );
+        let (mut store, _report) =
+            InMemoryStore::from_cache(&vault, WalkOpts::default(), Freshness::PerFile, None, None);
         assert_eq!(
             store.records().next().unwrap().field(&["status".into()]),
             Value::Str("draft".into())
@@ -791,7 +789,7 @@ mod tests {
         // if mtime resolution doesn't tick between the two writes.
         write(td.path(), "a.md", "---\nstatus: in-progress\n---\n");
 
-        let report = store.refresh(td.path(), None);
+        let report = store.refresh(&vault, None);
         assert_eq!(report.skipped, 0);
 
         assert_eq!(
@@ -832,15 +830,11 @@ mod tests {
         let content_a = "---\nstatus: draft\n---\n";
         write(td.path(), "a.md", content_a);
         let original_mtime = fs::metadata(&a_path).unwrap().modified().unwrap();
-        cache::build_vault(td.path(), &WalkOpts::default(), 300).unwrap();
+        let vault = VaultRoot::new(td.path().to_path_buf());
+        cache::build_vault(&vault, &WalkOpts::default(), 300).unwrap();
 
-        let (mut store, _report) = InMemoryStore::from_cache(
-            td.path(),
-            WalkOpts::default(),
-            Freshness::PerFile,
-            None,
-            None,
-        );
+        let (mut store, _report) =
+            InMemoryStore::from_cache(&vault, WalkOpts::default(), Freshness::PerFile, None, None);
         assert_eq!(
             store.records().next().unwrap().field(&["status".into()]),
             Value::Str("draft".into())
@@ -860,7 +854,7 @@ mod tests {
             .set_modified(original_mtime)
             .unwrap();
 
-        let report = store.refresh(td.path(), None);
+        let report = store.refresh(&vault, None);
         assert_eq!(report.skipped, 0);
         assert_eq!(
             store.records().next().unwrap().field(&["status".into()]),
@@ -873,12 +867,13 @@ mod tests {
     fn force_cache_mode_skips_persist_and_uses_stale_value() {
         let td = TempDir::new().unwrap();
         write(td.path(), "a.md", "---\nstatus: draft\n---\n");
-        cache::build_vault(td.path(), &WalkOpts::default(), 300).unwrap();
+        let vault = VaultRoot::new(td.path().to_path_buf());
+        cache::build_vault(&vault, &WalkOpts::default(), 300).unwrap();
 
         write(td.path(), "a.md", "---\nstatus: final\n---\n");
 
         let (store, report) = InMemoryStore::from_cache(
-            td.path(),
+            &vault,
             WalkOpts::default(),
             Freshness::ForceCache,
             None,
@@ -913,13 +908,9 @@ mod tests {
         // No cache::build_vault call: no .querymatter/manifest.bin exists yet.
         assert!(cache::load_cache(td.path()).is_none());
 
-        let (cached_store, report) = InMemoryStore::from_cache(
-            td.path(),
-            WalkOpts::default(),
-            Freshness::PerFile,
-            None,
-            None,
-        );
+        let vault = VaultRoot::new(td.path().to_path_buf());
+        let (cached_store, report) =
+            InMemoryStore::from_cache(&vault, WalkOpts::default(), Freshness::PerFile, None, None);
         assert_eq!(report.skipped, 0);
 
         let (live_store, _report) =
@@ -955,7 +946,7 @@ mod tests {
 
         write(td.path(), "a.md", "---\nstatus: in-progress\n---\n");
 
-        let report = store.refresh(td.path(), None);
+        let report = store.refresh(&VaultRoot::new(td.path().to_path_buf()), None);
         assert_eq!(report.skipped, 0);
 
         assert_eq!(
@@ -994,7 +985,7 @@ mod tests {
         // can only come through intact if the fallback's starting point
         // (this store's own slices) still carried every field.
         let plans = td.path().join("plans");
-        store.refresh(td.path(), Some(&plans));
+        store.refresh(&VaultRoot::new(td.path().to_path_buf()), Some(&plans));
 
         let prd = store
             .records()
@@ -1028,7 +1019,7 @@ mod tests {
         );
 
         let plans = td.path().join("plans");
-        store.refresh(td.path(), Some(&plans));
+        store.refresh(&VaultRoot::new(td.path().to_path_buf()), Some(&plans));
 
         let has_prd = store
             .records()
@@ -1061,7 +1052,7 @@ mod tests {
         assert!(cache::load_cache(td.path()).is_none());
 
         let (store, report) = InMemoryStore::from_cache(
-            td.path(),
+            &VaultRoot::new(td.path().to_path_buf()),
             WalkOpts::default(),
             Freshness::PerFile,
             None,
@@ -1084,7 +1075,7 @@ mod tests {
         assert!(cache::load_cache(td2.path()).is_none());
 
         let (_store, report2) = InMemoryStore::from_cache(
-            td2.path(),
+            &VaultRoot::new(td2.path().to_path_buf()),
             WalkOpts::default(),
             Freshness::PerFile,
             None,
@@ -1220,8 +1211,10 @@ mod tests {
         // parallel code against a copy of itself.
         let mut expected_paths = Vec::new();
         let mut expected_warnings = Vec::new();
+        let dir = DirPath::new(td.path().to_path_buf());
         for path in discover::discover(td.path(), &WalkOpts::default()) {
-            match cache::scan_file(td.path(), &path, WalkOpts::default().max_file_bytes) {
+            let file_path = FilePath::new(path.clone());
+            match cache::scan_file(&dir, &file_path, WalkOpts::default().max_file_bytes) {
                 ScanResult::Cached(_) => expected_paths.push(path),
                 ScanResult::NoFrontmatter => {}
                 ScanResult::Warning(msg) => expected_warnings.push(msg),

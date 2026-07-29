@@ -17,6 +17,7 @@ mod gitignore;
 pub mod model;
 mod output;
 mod parallel;
+mod paths;
 mod queries;
 pub mod query;
 pub mod render;
@@ -45,6 +46,7 @@ use crate::cli::{
 };
 use crate::config::Config;
 use crate::output::OutputSink;
+use crate::paths::VaultRoot;
 use crate::query::ast::SelectExpr;
 use crate::session::{Session, split_statements};
 use crate::settings::Settings;
@@ -379,8 +381,10 @@ fn run_init(args: &InitArgs, config: &Config, matches: &ArgMatches) -> anyhow::R
     // command line (IMPORTANT 1).
     discover::validate_excludes(&settings.exclude.value)?;
 
-    let base = fs::canonicalize(&target)
-        .with_context(|| format!("cannot access directory {}", target.display()))?;
+    let base = VaultRoot::new(
+        fs::canonicalize(&target)
+            .with_context(|| format!("cannot access directory {}", target.display()))?,
+    );
 
     let mut opts = settings.walk_opts();
     opts.ignore_files = args.walk.ignore_files()?;
@@ -479,11 +483,11 @@ fn prompt_add_gitignore(root: &Path) -> anyhow::Result<()> {
 /// verdict.
 fn run_explain(args: &ExplainArgs, config: &Config, matches: &ArgMatches) -> anyhow::Result<()> {
     let cwd = env::current_dir().context("failed to determine the current directory")?;
-    let root = match cache::find_vault(&cwd) {
+    let root = VaultRoot::new(match cache::find_vault(&cwd) {
         Some(vault) => vault,
         None => fs::canonicalize(&cwd)
             .with_context(|| format!("cannot access directory {}", cwd.display()))?,
-    };
+    });
     // Discovered from `root` — the same vault-or-cwd `explain` scans against
     // below — rather than `cwd`, so a vault-rooted `.querymatter.toml` is
     // found even when `explain` is invoked from a subdirectory of the vault.
@@ -931,7 +935,7 @@ fn build_session(
     let vault = if cli.no_cache {
         None
     } else {
-        cache::find_vault(&cwd)
+        cache::find_vault(&cwd).map(VaultRoot::new)
     };
 
     let (store, report, session_vault) = match vault {
