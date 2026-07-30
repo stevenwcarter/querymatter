@@ -144,6 +144,10 @@ fn lower_grouping(
                 "DISTINCT combined with GROUP BY"
             }));
         }
+        // Struct-literal fields evaluate in the order written here, not
+        // declaration order: `having` before `order_by` is load-bearing for
+        // error precedence when both clauses are invalid — HAVING's error
+        // must win.
         return Ok(Grouping::Grouped {
             having: lower_having(having, &keys, select_items)?,
             order_by: lower_grouped_order_by(order_by, aliases, &keys)?,
@@ -2046,10 +2050,25 @@ mod tests {
     }
     #[test]
     fn having_without_group_by_is_unsupported() {
-        assert!(matches!(
-            parse("SELECT status HAVING count(*) > 1"),
-            Err(ParseError::Unsupported(_))
-        ));
+        // "HAVING requires GROUP BY" is raised from two call sites:
+        // `lower_grouping`'s fully-ungrouped path (no GROUP BY, no aggregate
+        // select item) and `lower_having`'s implicit-single-group path (an
+        // aggregate select item groups every row into one group, but there
+        // are no keys for HAVING to filter against). Pin the exact text at
+        // both so the two sites can't silently drift apart.
+        let ungrouped = parse("SELECT status HAVING count(*) > 1").unwrap_err();
+        assert!(matches!(ungrouped, ParseError::Unsupported(_)));
+        assert_eq!(
+            ungrouped.to_string(),
+            "unsupported query feature: HAVING requires GROUP BY"
+        );
+
+        let implicit_group = parse("SELECT count(*) HAVING count(*) > 1").unwrap_err();
+        assert!(matches!(implicit_group, ParseError::Unsupported(_)));
+        assert_eq!(
+            implicit_group.to_string(),
+            "unsupported query feature: HAVING requires GROUP BY"
+        );
     }
     #[test]
     fn having_resolves_an_aggregate_select_alias() {
@@ -2143,7 +2162,12 @@ mod tests {
     }
     #[test]
     fn distinct_with_group_by_is_rejected() {
-        assert!(parse("SELECT DISTINCT status, count(*) GROUP BY status").is_err());
+        let err = parse("SELECT DISTINCT status, count(*) GROUP BY status").unwrap_err();
+        assert!(matches!(err, ParseError::Unsupported(_)));
+        assert_eq!(
+            err.to_string(),
+            "unsupported query feature: DISTINCT combined with GROUP BY"
+        );
     }
     #[test]
     fn distinct_with_implicit_aggregate_grouping_is_rejected() {

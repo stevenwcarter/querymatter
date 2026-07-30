@@ -2296,6 +2296,24 @@ fn init_with_hand_written_invalid_exclude_glob_exits_nonzero() {
         .stderr(predicates::str::contains("[plans/**"));
 }
 
+/// Pins a third sanctioned behavior change alongside the two above: making
+/// `Settings::resolve` fallible means `config list` (and `config get`, which
+/// shares the same call) now also route through the exclude-glob validation
+/// instead of silently rendering as if a hand-edited bad pattern were absent.
+/// Nothing else pinned this decision, so a later refactor could revert it
+/// with an otherwise-green suite.
+#[test]
+fn config_list_with_hand_written_invalid_exclude_glob_fails_naming_the_pattern() {
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "exclude = [\"[plans/**\"]\n");
+    qm(home.path())
+        .args(["config", "list"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("invalid exclude glob"))
+        .stderr(predicates::str::contains("[plans/**"));
+}
+
 /// RECOMMENDED 5: the spec's first named invariant ("`.querymatterignore`
 /// remains the project-local exclusion mechanism... both apply") was
 /// untested — a config-supplied `exclude` and the cwd `.querymatterignore`
