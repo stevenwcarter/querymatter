@@ -2998,6 +2998,15 @@ fn query_save_rejects_a_bad_name() {
         .assert()
         .failure()
         .stderr(predicates::str::contains("has space"));
+
+    // A rejected save must not persist anything — `QueryName::from_str`
+    // rejects before `save_named_query` ever loads/inserts/writes
+    // `queries.toml`, matching `query_save_rejects_a_query_that_fails_to_parse`.
+    qm(home.path())
+        .args(["query", "list"])
+        .assert()
+        .success()
+        .stdout(predicates::str::is_empty());
 }
 
 /// A name collision on `save` overwrites — last-write-wins, like `config set`.
