@@ -22,7 +22,7 @@ use globset::Glob;
 use indexmap::IndexMap;
 
 use crate::frontmatter;
-use crate::model::{FileAttr, Record, Value, compare_values};
+use crate::model::{FileAttr, Record, Value, ValueKey, compare_values};
 use crate::paths::{FilePath, VaultRoot};
 use crate::query::ResultTable;
 use crate::query::ast::{
@@ -661,14 +661,15 @@ fn bounded_top_k<T>(items: Vec<T>, n: usize, cmp: impl Fn(&T, &T) -> Ordering) -
 /// Drops duplicate projected rows in place for `SELECT DISTINCT`, keeping
 /// each row's first occurrence.
 ///
-/// A row is keyed on its cells' [`Value::to_cmp_string`] — the same
-/// non-`Value` conversion `count(distinct col)` keys on, since `Value` has
-/// no `Eq`/`Hash` — collected per-row rather than joined into one string, so
-/// that e.g. cells `("ab", "c")` and `("a", "bc")` never collide.
+/// A row is keyed on its cells' [`ValueKey`]s — the same canonical key
+/// `GROUP BY` ([`group_rows`]) and `count(distinct col)`
+/// ([`AggState::CountDistinct`]) hash on — collected per-row rather than
+/// joined into one key, so that e.g. cells `("ab", "c")` and `("a", "bc")`
+/// never collide.
 fn dedup_rows(rows: &mut Vec<ProjectedRow<'_>>) {
-    let mut seen: HashSet<Vec<String>> = HashSet::new();
+    let mut seen: HashSet<Vec<ValueKey>> = HashSet::new();
     rows.retain(|(_, row, _)| {
-        let key: Vec<String> = row.iter().map(Value::to_cmp_string).collect();
+        let key: Vec<ValueKey> = row.iter().map(ValueKey::from).collect();
         seen.insert(key)
     });
 }
@@ -964,25 +965,15 @@ struct Group<'a> {
 /// first-appearance order (the caller sorts for determinism afterward).
 ///
 /// Buckets are found via a `HashMap` keyed on each row's group-by cells,
-/// mapping to the bucket's index in `groups`. Each cell is turned into a
-/// `String` by [`hashable_cell_key`] and the per-cell keys are collected into
-/// a `Vec<String>` rather than joined into one string — this preserves two
-/// boundaries a naive key would lose. Cross-column: e.g. `("ab", "c")` and
-/// `("a", "bc")` never collide, since each cell is hashed separately (same
-/// rationale as [`dedup_rows`]). Cross-variant: e.g. `Value::Int(1)` and
-/// `Value::Str("1")`, or `Value::Null` and `Value::Str("")`, stay in separate
-/// groups even though [`Value::to_cmp_string`] displays them identically,
-/// because [`hashable_cell_key`] also folds in the cell's `Value` variant —
-/// matching the type-distinctness a structural `Vec<Value>` `PartialEq`
-/// comparison would give. [`hashable_cell_key`] also matches that structural
-/// comparison's two other quirks: a `Value::List` cell keys on its elements
-/// recursively rather than `to_cmp_string()`'s lossy `", "`-joined form (so
-/// `[a, b]` and `["a, b"]` land in different groups, like `main`'s `Vec<Value>`
-/// `==` would), and a `Value::Float` cell normalizes `-0.0` to `0.0` before
-/// keying (so `0.0` and `-0.0` land in the SAME group, like `f64`'s `==`).
-/// This keeps bucketing near-linear in `records.len()` even for
-/// high-cardinality group-by columns; a per-row linear scan of existing
-/// groups would be quadratic.
+/// mapping to the bucket's index in `groups`. Each cell becomes a [`ValueKey`]
+/// and the per-cell keys are collected into a `Vec<ValueKey>` rather than
+/// folded into one — so e.g. cells `("ab", "c")` and `("a", "bc")` never
+/// collide, since each cell is keyed separately (same rationale as
+/// [`dedup_rows`]). [`ValueKey`]'s own doc covers the per-cell semantics:
+/// variant-tagged (so `Int(1)` and `Str("1")` stay in separate groups),
+/// structural for `List`/`Map`, and `-0.0`-normalizing. This keeps bucketing
+/// near-linear in `records.len()` even for high-cardinality group-by columns;
+/// a per-row linear scan of existing groups would be quadratic.
 ///
 /// An empty `group_by` means "aggregate over everything": every record —
 /// including none at all — falls into the single group keyed by `[]`, so a
@@ -1000,7 +991,7 @@ fn group_rows<'a>(
         }];
     }
     let mut groups: Vec<Group<'a>> = Vec::new();
-    let mut index: HashMap<Vec<String>, usize> = HashMap::new();
+    let mut index: HashMap<Vec<ValueKey>, usize> = HashMap::new();
     for &record in records {
         let key: Vec<Value> = group_by
             .iter()
@@ -1009,7 +1000,7 @@ fn group_rows<'a>(
             // repeated-reference within a single record to memoize.
             .map(|col| resolve_col(record, col, disk_reads_allowed, max_file_bytes, None))
             .collect();
-        let hash_key: Vec<String> = key.iter().map(hashable_cell_key).collect();
+        let hash_key: Vec<ValueKey> = key.iter().map(ValueKey::from).collect();
         match index.entry(hash_key) {
             Entry::Occupied(entry) => groups[*entry.get()].rows.push(record),
             Entry::Vacant(entry) => {
@@ -1022,82 +1013,6 @@ fn group_rows<'a>(
         }
     }
     groups
-}
-
-/// The `HashMap` key for one `GROUP BY` cell, built to agree exactly with
-/// `main`'s structural `Vec<Value>` `PartialEq` over a group-by tuple —
-/// including its two non-obvious cases, `List` and `Float`.
-///
-/// A scalar (`Null`/`Bool`/`Int`/`Str`) keys on its [`Value::variant_name`],
-/// a `\u{1}` separator (which can't appear in a variant name), then its
-/// [`Value::to_cmp_string`] form. The variant prefix is what makes the key
-/// type-distinct: `to_cmp_string()` alone is [`Value::display`], which is
-/// lossy across variants (`Int(1)` and `Str("1")` both display `"1"`; `Null`
-/// and `Str("")` both display `""`), so hashing on it directly would
-/// silently merge groups that structural equality keeps apart.
-///
-/// `Float(f)` normalizes `-0.0` to `0.0` before keying, since `f64`'s
-/// `PartialEq` (and so `Value`'s derived one) treats them as equal —
-/// `to_cmp_string()` alone would key them `"-0"` and `"0"`, splitting one
-/// structural group into two.
-///
-/// `List(items)` recurses into each element's own `hashable_cell_key`
-/// rather than using [`Value::to_cmp_string`]'s `", "`-joined `display()`
-/// form: that join is lossy the same way string concatenation always is —
-/// `[Str("a"), Str("b")]` and `[Str("a, b")]` both display `"a, b"`, so
-/// hashing the joined string would merge two structurally-distinct lists
-/// into one group. Each element's key is instead length-prefixed
-/// (`"<byte-len>\u{1}<key>"`) before being appended, which is what makes the
-/// concatenation collision-free regardless of what characters an element's
-/// own key contains: decoding never needs to guess where one element's key
-/// ends and the next begins.
-///
-/// `Map(entries)` recurses the same way, for the same reason — its compact
-/// `{k: v}` `to_cmp_string()` form is just as lossy as `List`'s `", "` join
-/// (`{a: "x", b: "y"}` and a single-key `{a: "x, b: y"}` both render `{a: x,
-/// b: y}`). Both the field name and its recursively-keyed value are
-/// length-prefixed before being appended, so concatenation stays unambiguous
-/// regardless of what characters a name or nested key contains. Unlike
-/// `List`, the entries are sorted by key first: `IndexMap`'s `PartialEq` (and
-/// so `Value`'s derived one) is order-insensitive — `{a: 1, b: 2}` and `{b:
-/// 2, a: 1}` are structurally equal — so without sorting, two insertion
-/// orders of the same map would hash to different keys and wrongly split one
-/// group into two. `List`/`Vec` equality is order-sensitive, which is why
-/// its arm above does not sort.
-fn hashable_cell_key(value: &Value) -> String {
-    match value {
-        Value::List(items) => {
-            let mut key = String::from("List");
-            for item in items {
-                let element = hashable_cell_key(item);
-                key.push('\u{1}');
-                key.push_str(&element.len().to_string());
-                key.push('\u{1}');
-                key.push_str(&element);
-            }
-            key
-        }
-        Value::Float(f) => {
-            let normalized = if *f == 0.0 { 0.0 } else { *f };
-            format!("Float\u{1}{normalized}")
-        }
-        Value::Map(entries) => {
-            let mut pairs: Vec<(&String, &Value)> = entries.iter().collect();
-            pairs.sort_by(|a, b| a.0.cmp(b.0)); // order-insensitive map equality -> sort
-            let mut key = String::from("Map");
-            for (name, v) in pairs {
-                let element = hashable_cell_key(v);
-                for part in [name.as_str(), element.as_str()] {
-                    key.push('\u{1}');
-                    key.push_str(&part.len().to_string());
-                    key.push('\u{1}');
-                    key.push_str(part);
-                }
-            }
-            key
-        }
-        _ => format!("{}\u{1}{}", value.variant_name(), value.to_cmp_string()),
-    }
 }
 
 /// Orders two group-key tuples element-wise via [`order_cmp`] (always
@@ -1195,11 +1110,13 @@ enum AggState<'a> {
     /// `count(col)` — counts only `col`'s non-null values.
     Count { col: &'a ColRef, count: i64 },
     /// `count(distinct col)` — the distinct non-null values seen, keyed by
-    /// [`Value::to_cmp_string`] (matching [`Value`] equality for the
-    /// purposes of this count).
+    /// [`ValueKey`], the same canonical key `GROUP BY` ([`group_rows`]) and
+    /// `SELECT DISTINCT` ([`dedup_rows`]) hash on. A `BTreeSet` (rather than a
+    /// `HashSet`) only because [`ValueKey`] is `Ord` and this needs no more
+    /// than membership plus a length.
     CountDistinct {
         col: &'a ColRef,
-        seen: BTreeSet<String>,
+        seen: BTreeSet<ValueKey>,
     },
     /// `sum(col)` — the running total of `col`'s numeric-coercible values;
     /// `NULL` and non-numeric values are both skipped (mirroring
@@ -1283,7 +1200,7 @@ impl<'a> AggState<'a> {
             AggState::CountDistinct { col, seen } => {
                 let value = resolve_col(record, col, disk_reads_allowed, max_file_bytes, None);
                 if !value.is_null() {
-                    seen.insert(value.to_cmp_string());
+                    seen.insert(ValueKey::from(&value));
                 }
             }
             AggState::Sum { col, sum } => {
@@ -4287,8 +4204,8 @@ mod agg_tests {
         // "1", and `Null`/`Str("")` both "". A hash key built from
         // `Value::to_cmp_string()` alone (display, lossy across variants)
         // would collapse these into 2 groups; the previous structural
-        // `Vec<Value>` `PartialEq` key — and the fixed hash key — keep all 4
-        // apart.
+        // `Vec<Value>` `PartialEq` key — and `ValueKey`'s variant tag — keep
+        // all 4 apart.
         let rows = [
             rec_n("s/a.md", "x", Value::Int(1)),
             rec_n("s/b.md", "x", Value::Str("1".into())),
@@ -4301,18 +4218,17 @@ mod agg_tests {
         assert!(t.rows.iter().all(|row| row[1] == Value::Int(1)));
     }
 
-    /// Characterization of the THREE distinctness paths over ONE mixed-type
-    /// column, pinned before T8 unifies them.
+    /// The THREE distinctness paths, pinned over ONE mixed-type column: they
+    /// now agree, because [`group_rows`], [`dedup_rows`], and
+    /// [`AggState::CountDistinct`] all key on [`ValueKey`].
     ///
-    /// `GROUP BY` keys on `hashable_cell_key` (variant-tagged, `-0.0`
-    /// normalized to `0.0`), while `SELECT DISTINCT` and `count(distinct col)`
-    /// key on the bare `Value::to_cmp_string()` display form — so today the
-    /// three paths disagree about which of the same six cells are "the same
-    /// value", in both directions: display merges `Int(1)` with `Str("1")` and
-    /// `Null` with `Str("")` (which `GROUP BY` keeps apart), and splits
-    /// `Float(-0.0)` from `Float(0.0)` (which `GROUP BY` merges).
-    ///
-    /// Every assertion below states whether T8 changes it.
+    /// Before T8 they did not. `GROUP BY` keyed on a variant-tagged encoding
+    /// while `SELECT DISTINCT` and `count(distinct col)` keyed on the bare
+    /// [`Value::to_cmp_string`] display form, which disagreed in both
+    /// directions on these same six cells: display merged `Int(1)` with
+    /// `Str("1")` and `Null` with `Str("")` (which `GROUP BY` kept apart), and
+    /// split `Float(-0.0)` from `Float(0.0)` (which `GROUP BY` merged). Each
+    /// assertion below records what T8 changed.
     #[test]
     fn mixed_type_column_keys_across_group_by_distinct_and_count_distinct() {
         let rows = [
@@ -4324,9 +4240,9 @@ mod agg_tests {
             rec_n("s/f.md", "x", Value::Float(0.0)),
         ];
 
-        // UNCHANGED by T8 — `ValueKey` mirrors `hashable_cell_key` exactly:
-        // five groups, with only the two floats sharing one. (Group order is
-        // `compare_key_tuple`'s: NULL last, and the numerically-equal
+        // UNCHANGED by T8 — `ValueKey` mirrors the encoding `GROUP BY` already
+        // used: five groups, with only the two floats sharing one. (Group
+        // order is `compare_key_tuple`'s: NULL last, and the numerically-equal
         // `Int(1)`/`Str("1")` tie broken by first appearance.)
         let q = parse("SELECT n, count(*) AS c GROUP BY n").unwrap();
         let grouped = execute(&q, rows.iter(), false).unwrap();
@@ -4343,59 +4259,63 @@ mod agg_tests {
             grouped.rows
         );
 
-        // WILL CHANGE with T8.
+        // CHANGED by T8: was 4 rows — `[Int(1)], [Null], [Float(-0.0)],
+        // [Float(0.0)]` — under the display key. Now 5, agreeing cell-for-cell
+        // with the five GROUP BY groups above: `Str("1")` and `Str("")` are no
+        // longer swallowed by `Int(1)` and `Null`, and the two zeros collapse
+        // into their first occurrence.
         let q = parse("SELECT DISTINCT n").unwrap();
         let distinct = execute(&q, rows.iter(), false).unwrap();
         assert_eq!(
             distinct.rows,
             vec![
                 vec![Value::Int(1)],
+                vec![Value::Str("1".into())],
                 vec![Value::Null],
+                vec![Value::Str("".into())],
                 vec![Value::Float(-0.0)],
-                vec![Value::Float(0.0)],
             ],
             "distinct: {:?}",
             distinct.rows
         );
-        // The two float rows are structurally `==` (`0.0 == -0.0`), so pin
-        // their *display* keys too — that's what makes the split above
-        // visible, and it is exactly what T8 will merge away.
+        // `Float(-0.0)` and `Float(0.0)` are structurally `==`, so the row
+        // assertion above can't tell them apart — pin the surviving float
+        // cell's *display* form to prove exactly one of them is left, and that
+        // it's the first-scanned one (`dedup_rows` keeps first occurrences).
         assert_eq!(
             distinct
                 .rows
                 .iter()
                 .map(|row| row[0].display())
                 .collect::<Vec<_>>(),
-            vec!["1", "", "-0", "0"]
+            vec!["1", "1", "", "", "-0"]
         );
 
-        // The count happens to be T8-STABLE at 4, but for different reasons
-        // on either side of the change: today `{"1", "", "-0", "0"}` (the
-        // `Int(1)`/`Str("1")` pair merged, the two zeros split), afterwards
-        // `{Int(1), Str("1"), Str(""), Float(0.0)}` (that pair split, the
-        // zeros merged). The float-free subset below is what makes the
-        // change show up as a count.
+        // T8-STABLE at 4, but for different reasons on either side of the
+        // change: before, `{"1", "", "-0", "0"}` (the `Int(1)`/`Str("1")` pair
+        // merged, the two zeros split); now `{Int(1), Str("1"), Str(""),
+        // Float(0.0)}` (that pair split, the zeros merged). The float-free
+        // subset below is what makes the change show up as a count.
         let q = parse("SELECT count(distinct n) AS d").unwrap();
         let counted = execute(&q, rows.iter(), false).unwrap();
         assert_eq!(counted.rows, vec![vec![Value::Int(4)]]);
 
-        // WILL CHANGE with T8: today the display key counts `Int(1)` and
+        // CHANGED by T8: was 2 — the display key counted `Int(1)` and
         // `Str("1")` as one value and `Str("")` as another (the `Null` row is
-        // skipped by every `count(distinct)`), so 2; afterwards all three
+        // skipped by every `count(distinct)`, before and after). Now all three
         // non-null cells are distinct, so 3.
         let no_floats = &rows[..4];
         let q = parse("SELECT count(distinct n) AS d").unwrap();
         let counted = execute(&q, no_floats.iter(), false).unwrap();
-        assert_eq!(counted.rows, vec![vec![Value::Int(2)]]);
+        assert_eq!(counted.rows, vec![vec![Value::Int(3)]]);
     }
 
     /// MUST-FIX #3 (Finding A) characterization: `main`'s GROUP BY key is a
     /// structural `Vec<Value>` `PartialEq`, under which `[Str("a"),
     /// Str("b")]` and `[Str("a, b")]` are different — even though
     /// `Value::display()`'s `", "`-join renders both `"a, b"`, which would
-    /// merge them into one group if `hashable_cell_key` still hashed a
-    /// list's `to_cmp_string()` directly instead of recursing into its
-    /// elements.
+    /// merge them into one group if [`ValueKey`]'s `List` arm keyed a list's
+    /// `to_cmp_string()` directly instead of recursing into its elements.
     #[test]
     fn group_by_list_column_distinguishes_structurally_different_lists() {
         let rows = [
@@ -4421,9 +4341,9 @@ mod agg_tests {
 
     /// MUST-FIX #3 (Finding A) characterization: `f64`'s `PartialEq` (and so
     /// `Value`'s derived one) treats `0.0 == -0.0`, so `main`'s structural
-    /// GROUP BY key puts them in the SAME group — which `hashable_cell_key`
-    /// would miss without normalizing `-0.0` away, since `"-0"` and `"0"`
-    /// are different strings.
+    /// GROUP BY key puts them in the SAME group — which [`ValueKey`] would
+    /// miss without normalizing `-0.0` away, since the two have different
+    /// `to_bits()` (and different `"-0"`/`"0"` display forms).
     #[test]
     fn group_by_float_column_treats_positive_and_negative_zero_as_one_group() {
         let rows = [
@@ -4443,12 +4363,12 @@ mod agg_tests {
         assert_eq!(t.rows[0][1], Value::Int(2));
     }
 
-    /// M1 characterization: a `Value::Map` cell used to fall through the
-    /// wildcard arm and key on its compact `{k: v}` `to_cmp_string()` form,
-    /// which is lossy the same way `List`'s `", "` join was — `{a: "x", b:
-    /// "y"}` and the single-key `{a: "x, b: y"}` both compact-render `{a: x,
-    /// b: y}`. The structural `Map` arm recurses per-entry instead, so these
-    /// two structurally-different maps must land in different groups.
+    /// M1 characterization: a `Value::Map` cell used to be keyed on its
+    /// compact `{k: v}` `to_cmp_string()` form, which is lossy the same way
+    /// `List`'s `", "` join was — `{a: "x", b: "y"}` and the single-key
+    /// `{a: "x, b: y"}` both compact-render `{a: x, b: y}`. [`ValueKey`]'s
+    /// `Map` arm recurses per-entry instead, so these two
+    /// structurally-different maps must land in different groups.
     #[test]
     fn group_by_map_column_distinguishes_structurally_different_maps() {
         let mut two_entries = IndexMap::new();
@@ -4478,8 +4398,8 @@ mod agg_tests {
     /// M1 characterization: `IndexMap`'s `PartialEq` (and so `Value`'s
     /// derived one) is order-insensitive, so two maps with the same entries
     /// in different insertion order are structurally equal and must land in
-    /// the SAME group — which `hashable_cell_key`'s `Map` arm achieves by
-    /// sorting entries by key before building the key string.
+    /// the SAME group — which [`ValueKey`]'s `Map` arm achieves by sorting its
+    /// entries by key.
     #[test]
     fn group_by_map_column_is_order_insensitive() {
         let mut ab = IndexMap::new();

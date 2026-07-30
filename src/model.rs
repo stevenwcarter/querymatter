@@ -106,6 +106,82 @@ impl Value {
     }
 }
 
+/// The canonical "do these two cells count as the same value" key — the ONE
+/// encoding `GROUP BY`, `SELECT DISTINCT`, and `count(distinct col)` all hash
+/// on, so the three can no longer drift apart on a mixed-type column.
+///
+/// [`Value`] itself can't be the key: it holds an `f64`, so it has neither
+/// `Eq` nor `Hash`. This is its structural, variant-tagged stand-in — built by
+/// the one [`From<&Value>`] below — under which `Int(1)` never collides with
+/// `Str("1")` and `Null` never collides with `Str("")`, unlike the
+/// [`Value::to_cmp_string`] display form (which renders both pairs
+/// identically, and which stays behind for its real job: ordering).
+///
+/// Two deliberate departures from a plain structural [`Value`] `PartialEq`,
+/// both inherited from the encodings this type replaced:
+///
+/// - `-0.0` is normalized to `0.0`, matching `f64`'s own `0.0 == -0.0`.
+/// - Every `NaN` keys equal to every other `NaN`, where `f64::PartialEq` says
+///   a `NaN` differs even from itself. Reflexivity is what `Eq`/`Hash` require
+///   of a hash key, so a `NaN` cell groups with itself rather than spawning a
+///   fresh bucket per row.
+///
+/// Keys are process-local — never serialized, so their encoding is free to
+/// change.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ValueKey {
+    Null,
+    Bool(bool),
+    Int(i64),
+    /// `f64::to_bits` after normalizing `-0.0` to `0.0`.
+    Float(u64),
+    Str(String),
+    /// Order-sensitive, matching `Vec`'s equality (so `[a, b]` and `["a, b"]`
+    /// are different keys, unlike their shared `", "`-joined display form).
+    List(Vec<ValueKey>),
+    /// Key-sorted, so the two insertion orders of a structurally equal map
+    /// produce one key (matching `IndexMap`'s order-insensitive equality).
+    Map(Vec<(String, ValueKey)>),
+    Date(NaiveDate),
+    DateTime(DateTime<Utc>),
+}
+
+impl From<&Value> for ValueKey {
+    fn from(value: &Value) -> Self {
+        match value {
+            Value::Null => ValueKey::Null,
+            Value::Bool(b) => ValueKey::Bool(*b),
+            Value::Int(i) => ValueKey::Int(*i),
+            Value::Float(f) => {
+                // Fold both of `f64`'s equality quirks away before hashing the
+                // bits: `-0.0` into `0.0` (which `f64` calls equal), and every
+                // `NaN` payload into one canonical `NaN` (which `f64` calls
+                // unequal, including to itself).
+                let normalized = if f.is_nan() {
+                    f64::NAN
+                } else if *f == 0.0 {
+                    0.0
+                } else {
+                    *f
+                };
+                ValueKey::Float(normalized.to_bits())
+            }
+            Value::Str(s) => ValueKey::Str(s.clone()),
+            Value::List(items) => ValueKey::List(items.iter().map(ValueKey::from).collect()),
+            Value::Map(map) => {
+                let mut entries: Vec<(String, ValueKey)> = map
+                    .iter()
+                    .map(|(name, v)| (name.clone(), ValueKey::from(v)))
+                    .collect();
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                ValueKey::Map(entries)
+            }
+            Value::Date(d) => ValueKey::Date(*d),
+            Value::DateTime(dt) => ValueKey::DateTime(*dt),
+        }
+    }
+}
+
 /// Compact, deterministic string for a `Value` used when a `Map` (or a map
 /// nested in one) is rendered flat (table/CSV): lists render WITH brackets,
 /// maps with braces, map keys sorted. This is intentionally different from
@@ -462,6 +538,66 @@ mod tests {
         assert_eq!(Value::Int(10).display(), "10");
         assert_eq!(Value::Bool(true).display(), "true");
         assert_eq!(Value::Float(1.5).display(), "1.5");
+    }
+    #[test]
+    fn value_key_is_variant_tagged_and_structural() {
+        let key = |v: &Value| ValueKey::from(v);
+        // The two collisions `Value::display` (and so `to_cmp_string`) has,
+        // which every hashing caller relies on this key to avoid.
+        assert_ne!(key(&Value::Int(1)), key(&Value::Str("1".into())));
+        assert_ne!(key(&Value::Null), key(&Value::Str("".into())));
+        // Lists are order-sensitive and don't flatten into their join.
+        let ab = Value::List(vec![Value::Str("a".into()), Value::Str("b".into())]);
+        let ba = Value::List(vec![Value::Str("b".into()), Value::Str("a".into())]);
+        let joined = Value::List(vec![Value::Str("a, b".into())]);
+        assert_ne!(key(&ab), key(&ba));
+        assert_ne!(key(&ab), key(&joined));
+        assert_eq!(key(&ab), key(&ab.clone()));
+    }
+    #[test]
+    fn value_key_of_map_is_insertion_order_insensitive() {
+        let map = |pairs: &[(&str, i64)]| {
+            let mut m = IndexMap::new();
+            for (k, v) in pairs {
+                m.insert((*k).to_string(), Value::Int(*v));
+            }
+            Value::Map(m)
+        };
+        // `IndexMap`'s equality ignores insertion order, so the key must too.
+        assert_eq!(
+            ValueKey::from(&map(&[("a", 1), ("b", 2)])),
+            ValueKey::from(&map(&[("b", 2), ("a", 1)]))
+        );
+        assert_ne!(
+            ValueKey::from(&map(&[("a", 1), ("b", 2)])),
+            ValueKey::from(&map(&[("a", 2), ("b", 1)]))
+        );
+    }
+    #[test]
+    fn value_key_normalizes_float_zero_and_nan() {
+        // `0.0 == -0.0` in `f64`, so they must key equal…
+        assert_eq!(
+            ValueKey::from(&Value::Float(0.0)),
+            ValueKey::from(&Value::Float(-0.0))
+        );
+        // …while a `NaN`, which `f64` calls unequal even to itself, must key
+        // equal to itself (`Eq`/`Hash` need reflexivity) regardless of which
+        // payload or sign bit produced it — otherwise every `NaN` row would
+        // open its own group.
+        assert_eq!(
+            ValueKey::from(&Value::Float(f64::NAN)),
+            ValueKey::from(&Value::Float(-f64::NAN))
+        );
+        let odd_payload_nan = f64::from_bits(f64::NAN.to_bits() | 0x7);
+        assert!(odd_payload_nan.is_nan());
+        assert_eq!(
+            ValueKey::from(&Value::Float(f64::NAN)),
+            ValueKey::from(&Value::Float(odd_payload_nan))
+        );
+        assert_ne!(
+            ValueKey::from(&Value::Float(f64::NAN)),
+            ValueKey::from(&Value::Float(0.0))
+        );
     }
     #[test]
     fn as_number_coerces_numeric_strings() {

@@ -64,7 +64,10 @@ SELECT [DISTINCT] cols [AS alias] [FROM 'glob'] [WHERE ...] [GROUP BY ...] [HAVI
   col)`, `min`, `max`, `sum`, `avg`, `group_concat`. `SELECT DISTINCT` drops
   duplicate output rows (after projection, before `ORDER BY`); it cannot be
   combined with `GROUP BY` or with an aggregate (either way the query already
-  yields one row per group).
+  yields one row per group). Two cells count as duplicates only when they hold
+  the same value *of the same type*, so on a mixed-type field `1` and `'1'`
+  (and a missing value vs. an empty string) stay apart — `SELECT DISTINCT`,
+  `count(distinct col)`, and `GROUP BY` all apply that one rule.
 - **Scalar expressions** — usable in `SELECT` and on either side of a `WHERE`
   comparison: arithmetic `+ - * / %`, string concat `||`, and the functions
   `lower(s)`, `upper(s)` (both Unicode-aware, not ASCII-only), `length(s)`,
