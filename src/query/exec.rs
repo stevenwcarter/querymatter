@@ -4301,6 +4301,94 @@ mod agg_tests {
         assert!(t.rows.iter().all(|row| row[1] == Value::Int(1)));
     }
 
+    /// Characterization of the THREE distinctness paths over ONE mixed-type
+    /// column, pinned before T8 unifies them.
+    ///
+    /// `GROUP BY` keys on `hashable_cell_key` (variant-tagged, `-0.0`
+    /// normalized to `0.0`), while `SELECT DISTINCT` and `count(distinct col)`
+    /// key on the bare `Value::to_cmp_string()` display form — so today the
+    /// three paths disagree about which of the same six cells are "the same
+    /// value", in both directions: display merges `Int(1)` with `Str("1")` and
+    /// `Null` with `Str("")` (which `GROUP BY` keeps apart), and splits
+    /// `Float(-0.0)` from `Float(0.0)` (which `GROUP BY` merges).
+    ///
+    /// Every assertion below states whether T8 changes it.
+    #[test]
+    fn mixed_type_column_keys_across_group_by_distinct_and_count_distinct() {
+        let rows = [
+            rec_n("s/a.md", "x", Value::Int(1)),
+            rec_n("s/b.md", "x", Value::Str("1".into())),
+            rec_n("s/c.md", "x", Value::Null),
+            rec_n("s/d.md", "x", Value::Str("".into())),
+            rec_n("s/e.md", "x", Value::Float(-0.0)),
+            rec_n("s/f.md", "x", Value::Float(0.0)),
+        ];
+
+        // UNCHANGED by T8 — `ValueKey` mirrors `hashable_cell_key` exactly:
+        // five groups, with only the two floats sharing one. (Group order is
+        // `compare_key_tuple`'s: NULL last, and the numerically-equal
+        // `Int(1)`/`Str("1")` tie broken by first appearance.)
+        let q = parse("SELECT n, count(*) AS c GROUP BY n").unwrap();
+        let grouped = execute(&q, rows.iter(), false).unwrap();
+        assert_eq!(
+            grouped.rows,
+            vec![
+                vec![Value::Str("".into()), Value::Int(1)],
+                vec![Value::Float(-0.0), Value::Int(2)],
+                vec![Value::Int(1), Value::Int(1)],
+                vec![Value::Str("1".into()), Value::Int(1)],
+                vec![Value::Null, Value::Int(1)],
+            ],
+            "grouped: {:?}",
+            grouped.rows
+        );
+
+        // WILL CHANGE with T8.
+        let q = parse("SELECT DISTINCT n").unwrap();
+        let distinct = execute(&q, rows.iter(), false).unwrap();
+        assert_eq!(
+            distinct.rows,
+            vec![
+                vec![Value::Int(1)],
+                vec![Value::Null],
+                vec![Value::Float(-0.0)],
+                vec![Value::Float(0.0)],
+            ],
+            "distinct: {:?}",
+            distinct.rows
+        );
+        // The two float rows are structurally `==` (`0.0 == -0.0`), so pin
+        // their *display* keys too — that's what makes the split above
+        // visible, and it is exactly what T8 will merge away.
+        assert_eq!(
+            distinct
+                .rows
+                .iter()
+                .map(|row| row[0].display())
+                .collect::<Vec<_>>(),
+            vec!["1", "", "-0", "0"]
+        );
+
+        // The count happens to be T8-STABLE at 4, but for different reasons
+        // on either side of the change: today `{"1", "", "-0", "0"}` (the
+        // `Int(1)`/`Str("1")` pair merged, the two zeros split), afterwards
+        // `{Int(1), Str("1"), Str(""), Float(0.0)}` (that pair split, the
+        // zeros merged). The float-free subset below is what makes the
+        // change show up as a count.
+        let q = parse("SELECT count(distinct n) AS d").unwrap();
+        let counted = execute(&q, rows.iter(), false).unwrap();
+        assert_eq!(counted.rows, vec![vec![Value::Int(4)]]);
+
+        // WILL CHANGE with T8: today the display key counts `Int(1)` and
+        // `Str("1")` as one value and `Str("")` as another (the `Null` row is
+        // skipped by every `count(distinct)`), so 2; afterwards all three
+        // non-null cells are distinct, so 3.
+        let no_floats = &rows[..4];
+        let q = parse("SELECT count(distinct n) AS d").unwrap();
+        let counted = execute(&q, no_floats.iter(), false).unwrap();
+        assert_eq!(counted.rows, vec![vec![Value::Int(2)]]);
+    }
+
     /// MUST-FIX #3 (Finding A) characterization: `main`'s GROUP BY key is a
     /// structural `Vec<Value>` `PartialEq`, under which `[Str("a"),
     /// Str("b")]` and `[Str("a, b")]` are different — even though
