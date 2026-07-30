@@ -23,7 +23,7 @@ use rustyline::{Context as RlContext, Editor, Helper, Highlighter, Hinter, Valid
 use crate::config::ConfigKey;
 use crate::model::{FileAttr, Value};
 use crate::output::OutputSink;
-use crate::queries::{self, Queries};
+use crate::queries::{self, Queries, QueryName};
 use crate::render::{Format, TableStyle};
 use crate::session::{FieldStat, Session, Statement, Terminator, split_statements};
 use crate::store::LoadReport;
@@ -132,6 +132,13 @@ pub enum DotCommand {
     /// `.query <word>` where `<word>` is neither `run` nor `list`, carrying
     /// the offending word so the error can name it rather than the command.
     BadQueryAction(String),
+    /// `.query run <name>` / `.query save <name> [...]` where `<name>` fails
+    /// `QueryName::from_str` — carrying the rendered
+    /// [`crate::queries::InvalidQueryName`] message (not the error itself,
+    /// since [`DotCommand`] derives `Clone`/`PartialEq` and `InvalidQueryName`
+    /// derives neither) so the reported text is byte-identical to the same
+    /// rejection at the CLI/`save_named_query` write boundary.
+    BadQueryName(String),
     /// `.quit` / `.exit` — leave the REPL.
     Quit,
     /// `.format <name>` where `<name>` is not a known [`Format`], carrying the
@@ -160,13 +167,13 @@ pub enum DotCommand {
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueryCmd {
     /// `.query run <name>` — run a saved query in-session.
-    Run(String),
+    Run(QueryName),
     /// `.query list` — list every saved query's name and SQL.
     List,
     /// `.query save <name> [sql]` — persist `sql` under `name` (see
     /// [`crate::queries`]), or, when omitted (`None`), the last
     /// successfully-run statement of this session.
-    Save(String, Option<String>),
+    Save(QueryName, Option<String>),
 }
 
 /// Accumulates raw input lines into complete SQL statements, splitting on a
@@ -323,17 +330,24 @@ pub fn parse_dot(line: &str) -> DotCommand {
                 DotCommand::Query(QueryCmd::List)
             }
             Some(action) if action.eq_ignore_ascii_case("run") => match words.next() {
-                Some(name) => DotCommand::Query(QueryCmd::Run(name.to_string())),
+                Some(name) => match name.parse::<QueryName>() {
+                    Ok(name) => DotCommand::Query(QueryCmd::Run(name)),
+                    Err(err) => DotCommand::BadQueryName(err.to_string()),
+                },
                 None => DotCommand::MissingArg("query"),
             },
             Some(action) if action.eq_ignore_ascii_case("save") => match words.next() {
-                Some(name) => {
-                    // SQL is everything after `query save <name>`, taken
-                    // verbatim (may be absent) — like `.set`'s value capture,
-                    // so a multi-word/multi-clause SQL survives untouched.
-                    let sql = rest_after_key(rest, 3);
-                    DotCommand::Query(QueryCmd::Save(name.to_string(), sql))
-                }
+                Some(name) => match name.parse::<QueryName>() {
+                    Ok(name) => {
+                        // SQL is everything after `query save <name>`, taken
+                        // verbatim (may be absent) — like `.set`'s value
+                        // capture, so a multi-word/multi-clause SQL survives
+                        // untouched.
+                        let sql = rest_after_key(rest, 3);
+                        DotCommand::Query(QueryCmd::Save(name, sql))
+                    }
+                    Err(err) => DotCommand::BadQueryName(err.to_string()),
+                },
                 None => DotCommand::MissingArg("query"),
             },
             Some(action) => DotCommand::BadQueryAction(action.to_string()),
@@ -629,6 +643,7 @@ fn dispatch_dot(
                  .query save <name> [sql])"
             );
         }
+        DotCommand::BadQueryName(msg) => eprintln!("querymatter: {msg}"),
         DotCommand::Settings => println!("{}", session.settings().rows()),
         DotCommand::Set(key, value) => report_set(session.persist_set(key, &value), key),
         DotCommand::Unset(key) => report_unset(session.persist_unset(key), key),
@@ -676,7 +691,7 @@ fn dispatch_query(
     last_sql: Option<&str>,
 ) -> DotOutcome {
     if let QueryCmd::Save(name, sql) = cmd {
-        return dispatch_query_save(&name, sql, last_sql);
+        return dispatch_query_save(name.as_ref(), sql, last_sql);
     }
     match queries::load() {
         Ok(saved) => run_query_cmd(cmd, &saved, session, sink),
@@ -741,7 +756,7 @@ fn resolve_save_sql(sql: Option<String>, last_sql: Option<&str>) -> Option<Strin
 fn run_query_cmd(cmd: QueryCmd, saved: &Queries, session: &Session, sink: &mut OutputSink) {
     match cmd {
         QueryCmd::List => print!("{}", query_list_lines(saved)),
-        QueryCmd::Run(name) => match queries::get(saved, &name) {
+        QueryCmd::Run(name) => match queries::get(saved, name.as_ref()) {
             Some(sql) => {
                 for statement in split_statements(sql) {
                     run_statement(session, &statement, sink);
@@ -1573,13 +1588,13 @@ mod tests {
     fn query_run_and_list_parse() {
         assert_eq!(
             parse_dot(".query run stale"),
-            DotCommand::Query(QueryCmd::Run("stale".to_string()))
+            DotCommand::Query(QueryCmd::Run("stale".parse().unwrap()))
         );
         assert_eq!(parse_dot(".query list"), DotCommand::Query(QueryCmd::List));
         // Case-insensitive on the action word, matching every other dot-command.
         assert_eq!(
             parse_dot(".query RUN stale"),
-            DotCommand::Query(QueryCmd::Run("stale".to_string()))
+            DotCommand::Query(QueryCmd::Run("stale".parse().unwrap()))
         );
     }
 
@@ -1587,11 +1602,34 @@ mod tests {
     fn parses_query_save_with_and_without_sql() {
         assert_eq!(
             parse_dot(".query save stale SELECT status"),
-            DotCommand::Query(QueryCmd::Save("stale".into(), Some("SELECT status".into())))
+            DotCommand::Query(QueryCmd::Save(
+                "stale".parse().unwrap(),
+                Some("SELECT status".into())
+            ))
         );
         assert_eq!(
             parse_dot(".query save stale"),
-            DotCommand::Query(QueryCmd::Save("stale".into(), None))
+            DotCommand::Query(QueryCmd::Save("stale".parse().unwrap(), None))
+        );
+    }
+
+    /// `.query run`/`.query save` with a name that fails
+    /// `QueryName::from_str` is `BadQueryName`, carrying the exact same
+    /// message text [`crate::queries::InvalidQueryName`]'s `Display` would
+    /// produce — pinned so the REPL and CLI can never drift apart on this
+    /// wording. `split_whitespace` tokenizing means the offending name must
+    /// be a single word to exercise this (an actual space just splits into
+    /// two words); a stray `!` is enough to trip the character class.
+    #[test]
+    fn query_run_and_save_reject_a_bad_name() {
+        let want = "invalid query name \"bad!name\" (expected letters, digits, '_', or '-' only)";
+        assert_eq!(
+            parse_dot(".query run bad!name"),
+            DotCommand::BadQueryName(want.to_string())
+        );
+        assert_eq!(
+            parse_dot(".query save bad!name SELECT status"),
+            DotCommand::BadQueryName(want.to_string())
         );
     }
 
@@ -1699,7 +1737,7 @@ mod tests {
         session.reload();
 
         let mut saved = Queries::default();
-        queries::set(&mut saved, "stale-plans", "SELECT status").unwrap();
+        queries::set(&mut saved, "stale-plans".parse().unwrap(), "SELECT status");
 
         let (schema, query_names) = helper_snapshot(&session, &saved);
         assert_eq!(schema, vec!["prd".to_string(), "status".to_string()]);
@@ -1799,15 +1837,14 @@ mod tests {
         let mut saved = Queries::default();
         queries::set(
             &mut saved,
-            "both",
+            "both".parse().unwrap(),
             "SELECT status WHERE status = 'draft';\nSELECT status WHERE status = 'synced'",
-        )
-        .unwrap();
+        );
 
         let out_path = td.path().join("out.txt");
         let mut sink = OutputSink::open_file(&out_path).unwrap();
         run_query_cmd(
-            QueryCmd::Run("both".to_string()),
+            QueryCmd::Run("both".parse().unwrap()),
             &saved,
             &session,
             &mut sink,
@@ -1839,7 +1876,7 @@ mod tests {
         let out_path = td.path().join("out.txt");
         let mut sink = OutputSink::open_file(&out_path).unwrap();
         run_query_cmd(
-            QueryCmd::Run("nope".to_string()),
+            QueryCmd::Run("nope".parse().unwrap()),
             &saved,
             &session,
             &mut sink,
@@ -1858,8 +1895,8 @@ mod tests {
     #[test]
     fn query_list_lines_names_every_saved_query() {
         let mut saved = Queries::default();
-        queries::set(&mut saved, "zeta", "SELECT 1").unwrap();
-        queries::set(&mut saved, "alpha", "SELECT 2").unwrap();
+        queries::set(&mut saved, "zeta".parse().unwrap(), "SELECT 1");
+        queries::set(&mut saved, "alpha".parse().unwrap(), "SELECT 2");
         assert_eq!(
             query_list_lines(&saved),
             "alpha\tSELECT 2\nzeta\tSELECT 1\n"

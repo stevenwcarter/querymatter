@@ -11,32 +11,78 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, ensure};
+use anyhow::Context;
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
 use crate::cache::write_atomic;
+
+/// A saved-query name, valid by construction: `FromStr` is the ONLY public
+/// constructor and carries the former `is_valid_name` rule.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct QueryName(String);
+
+/// Rejection carrying the exact message `queries::set` used to produce.
+#[derive(Debug, thiserror::Error)]
+#[error("invalid query name {0:?} (expected letters, digits, '_', or '-' only)")]
+pub struct InvalidQueryName(String);
+
+impl std::str::FromStr for QueryName {
+    type Err = InvalidQueryName;
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        let valid = !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        if valid {
+            Ok(QueryName(name.to_string()))
+        } else {
+            Err(InvalidQueryName(name.to_string()))
+        }
+    }
+}
+
+impl std::fmt::Display for QueryName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl AsRef<str> for QueryName {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+impl std::borrow::Borrow<str> for QueryName {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
 
 /// The persisted saved queries, as read from and written to `queries.toml`:
 /// a flat map of name to SQL text.
 ///
 /// `#[serde(transparent)]` makes the file itself just `name = "sql"` lines at
 /// the top level, rather than nesting the map under a wrapper key.
+/// `Deserialize` stays non-validating (`QueryName`'s derived, transparent
+/// impl) deliberately — a hand-edited `queries.toml` with an odd name still
+/// loads exactly as before; only the write boundaries ([`set`], via
+/// `QueryName::from_str`) reject one.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct Queries(BTreeMap<String, String>);
+pub struct Queries(BTreeMap<QueryName, String>);
 
 impl Queries {
     /// Every saved name, in sorted order.
     pub fn names(&self) -> impl Iterator<Item = &str> {
-        self.0.keys().map(String::as_str)
+        self.0.keys().map(QueryName::as_ref)
     }
 
     /// Every saved `(name, sql)` pair, in name-sorted order.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
         self.0
             .iter()
-            .map(|(name, sql)| (name.as_str(), sql.as_str()))
+            .map(|(name, sql)| (name.as_ref(), sql.as_str()))
     }
 }
 
@@ -99,16 +145,12 @@ pub fn save_to(path: &Path, queries: &Queries) -> anyhow::Result<()> {
         .with_context(|| format!("cannot write queries file {}", path.display()))
 }
 
-/// Saves `sql` under `name` in `queries`, validating `name` first: a rejected
-/// name leaves `queries` untouched. Overwrites any existing SQL already saved
-/// under the same name (last-write-wins), like [`crate::config::set`].
-pub fn set(queries: &mut Queries, name: &str, sql: &str) -> anyhow::Result<()> {
-    ensure!(
-        is_valid_name(name),
-        "invalid query name {name:?} (expected letters, digits, '_', or '-' only)"
-    );
-    queries.0.insert(name.to_string(), sql.to_string());
-    Ok(())
+/// Saves `sql` under `name` in `queries`. `name` is already valid by
+/// construction (`QueryName::from_str` is its only constructor), so this is
+/// infallible. Overwrites any existing SQL already saved under the same name
+/// (last-write-wins), like [`crate::config::set`].
+pub fn set(queries: &mut Queries, name: QueryName, sql: &str) {
+    queries.0.insert(name, sql.to_string());
 }
 
 /// Removes `name` from `queries`, returning whether it had actually been
@@ -123,16 +165,6 @@ pub fn get<'a>(queries: &'a Queries, name: &str) -> Option<&'a str> {
     queries.0.get(name).map(String::as_str)
 }
 
-/// Whether `name` matches the allowed saved-query name pattern
-/// (`^[A-Za-z0-9_-]+$`) — checked by hand rather than pulling in a compiled
-/// regex for so small and fixed a character class.
-fn is_valid_name(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,16 +175,29 @@ mod tests {
         let td = tempdir().unwrap();
         let p = td.path().join("queries.toml");
         let mut q = Queries::default();
-        set(&mut q, "stale", "SELECT file.name WHERE status='draft'").unwrap();
+        set(
+            &mut q,
+            "stale".parse().unwrap(),
+            "SELECT file.name WHERE status='draft'",
+        );
         save_to(&p, &q).unwrap();
         assert_eq!(load_from(&p).unwrap(), q);
+
+        // Wire-shape pin: queries.toml stays flat `name = "sql"` lines — the
+        // QueryName newtype must be invisible in the serialized form.
+        let toml_text = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            toml_text.contains("stale = "),
+            "expected flat top-level key, got:\n{toml_text}"
+        );
     }
 
+    /// The character-class rule formerly checked by `set` on every write now
+    /// lives entirely in `QueryName::from_str`, its only constructor.
     #[test]
-    fn rejects_bad_name() {
-        let mut q = Queries::default();
-        assert!(set(&mut q, "has space", "SELECT 1").is_err());
-        assert!(set(&mut q, "ok-name_1", "SELECT 1").is_ok());
+    fn query_name_rejects_bad_chars_and_accepts_good_ones() {
+        assert!("has space".parse::<QueryName>().is_err());
+        assert!("ok-name_1".parse::<QueryName>().is_ok());
     }
 
     #[test]
@@ -167,29 +212,18 @@ mod tests {
         assert!(load_from(&p).unwrap_err().to_string().contains("q.toml"));
     }
 
-    /// A rejected `set` (a bad name) must not mutate `queries` — mirrors
-    /// `config::set`'s same guarantee.
-    #[test]
-    fn rejected_set_leaves_queries_untouched() {
-        let mut q = Queries::default();
-        set(&mut q, "kept", "SELECT 1").unwrap();
-        let before = q.clone();
-        assert!(set(&mut q, "bad name", "SELECT 2").is_err());
-        assert_eq!(q, before);
-    }
-
     #[test]
     fn set_overwrites_an_existing_name_last_write_wins() {
         let mut q = Queries::default();
-        set(&mut q, "stale", "SELECT 1").unwrap();
-        set(&mut q, "stale", "SELECT 2").unwrap();
+        set(&mut q, "stale".parse().unwrap(), "SELECT 1");
+        set(&mut q, "stale".parse().unwrap(), "SELECT 2");
         assert_eq!(get(&q, "stale"), Some("SELECT 2"));
     }
 
     #[test]
     fn remove_reports_whether_the_name_was_present() {
         let mut q = Queries::default();
-        set(&mut q, "stale", "SELECT 1").unwrap();
+        set(&mut q, "stale".parse().unwrap(), "SELECT 1");
         assert!(remove(&mut q, "stale"));
         assert!(
             !remove(&mut q, "stale"),
@@ -206,8 +240,8 @@ mod tests {
     #[test]
     fn names_and_iter_are_name_sorted() {
         let mut q = Queries::default();
-        set(&mut q, "zeta", "SELECT 1").unwrap();
-        set(&mut q, "alpha", "SELECT 2").unwrap();
+        set(&mut q, "zeta".parse().unwrap(), "SELECT 1");
+        set(&mut q, "alpha".parse().unwrap(), "SELECT 2");
         assert_eq!(q.names().collect::<Vec<_>>(), vec!["alpha", "zeta"]);
         assert_eq!(
             q.iter().collect::<Vec<_>>(),

@@ -47,6 +47,7 @@ use crate::cli::{
 use crate::config::Config;
 use crate::output::OutputSink;
 use crate::paths::VaultRoot;
+use crate::queries::QueryName;
 use crate::query::ast::SelectExpr;
 use crate::session::{Session, split_statements};
 use crate::settings::Settings;
@@ -751,17 +752,23 @@ fn run_query_action(action: &QueryAction) -> anyhow::Result<ExitCode> {
 /// Validates and persists `sql` under `name` in the user's saved-queries
 /// file: rejects `sql` up front (naming the parse error), so a saved query
 /// can never be a broken one that only fails later at `query run`, then
-/// rejects `name` per [`queries::set`]'s allowed-character rule, then loads
-/// the current file, inserts (overwriting any existing SQL already saved
-/// under the same name), and saves it back.
+/// rejects `name` per [`QueryName`]'s allowed-character rule, then loads the
+/// current file, inserts (overwriting any existing SQL already saved under
+/// the same name), and saves it back.
 ///
 /// Shared by the CLI's `query save` ([`run_query_action`]'s `Save` arm) and
 /// the REPL's `.query save` ([`repl`]'s dispatch), so the two surfaces can
-/// never validate or persist differently.
+/// never validate or persist differently — this is the write boundary
+/// `QueryName::from_str` guards, independent of whichever caller already
+/// holds a validated `QueryName` (the REPL's `.query save` lowering parses
+/// early too, so its `QueryCmd::Save` can't even be constructed with a bad
+/// name; re-parsing an already-valid name here is cheap and keeps this the
+/// single funnel that can never disagree with a future caller).
 pub(crate) fn save_named_query(name: &str, sql: &str) -> anyhow::Result<PathBuf> {
     query::parse(sql).with_context(|| format!("failed to parse query: {sql}"))?;
+    let name: QueryName = name.parse()?;
     let mut saved = queries::load()?;
-    queries::set(&mut saved, name, sql)?;
+    queries::set(&mut saved, name, sql);
     queries::save(&saved)
 }
 
